@@ -1,0 +1,9 @@
+target
+.git
+.env
+.env.*
+.DS_Store
+shadow-data
+fills.jsonl
+*.log
+node_modules

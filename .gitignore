@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+.env
+.env.*
+!.env.example
+secrets.*
+.firecrawl/
+node_modules/
+dist/
+__pycache__/
+
+.playwright-mcp/
+*.png
+
+shadow-data/
+.worktrees/

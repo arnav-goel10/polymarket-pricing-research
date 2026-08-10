@@ -1,0 +1,1903 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BTC 5m · Polymarket Quant Desk</title>
+    <style>
+      :root {
+        --bg: #0a0e14;
+        --panel: #111722;
+        --line: #1e2733;
+        --ink: #d7e0ea;
+        --dim: #6b7c8f;
+        --up: #36d399;
+        --down: #f87272;
+        --warn: #fbbd23;
+        --accent: #4aa8ff;
+        --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: var(--mono);
+        font-size: 13px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 18px;
+        border-bottom: 1px solid var(--line);
+      }
+      header h1 {
+        font-size: 14px;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        margin: 0;
+      }
+      header h1 span {
+        color: var(--accent);
+      }
+      .pill {
+        padding: 3px 10px;
+        border-radius: 20px;
+        font-size: 11px;
+        border: 1px solid var(--line);
+        color: var(--dim);
+      }
+      .pill.paper {
+        color: var(--down);
+        border-color: var(--down);
+      }
+      .pill.shadow {
+        color: var(--warn);
+        border-color: var(--warn);
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr 1fr;
+        gap: 14px;
+        padding: 16px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 14px 16px;
+      }
+      .panel h2 {
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 1.4px;
+        color: var(--dim);
+        margin: 0 0 12px;
+        font-weight: 600;
+      }
+      .big {
+        font-size: 42px;
+        font-weight: 700;
+        letter-spacing: -1px;
+        line-height: 1;
+      }
+      .sub {
+        color: var(--dim);
+        font-size: 12px;
+        margin-top: 6px;
+      }
+      .row {
+        display: flex;
+        justify-content: space-between;
+        padding: 5px 0;
+        border-bottom: 1px dashed var(--line);
+      }
+      .row:last-child {
+        border-bottom: none;
+      }
+      .row .k {
+        color: var(--dim);
+      }
+      .bar {
+        height: 7px;
+        background: var(--line);
+        border-radius: 4px;
+        overflow: hidden;
+        margin-top: 4px;
+      }
+      .bar > i {
+        display: block;
+        height: 100%;
+        background: var(--accent);
+      }
+      .model {
+        margin-bottom: 9px;
+      }
+      .model .top {
+        display: flex;
+        justify-content: space-between;
+        font-size: 12px;
+      }
+      .tiles {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .papergate {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr 0.9fr;
+        gap: 10px;
+      }
+      .paper-metrics {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(120px, 1fr));
+        gap: 10px;
+        margin-top: 12px;
+      }
+      .gate-status {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 10px;
+      }
+      .gate-status strong {
+        font-size: 20px;
+        letter-spacing: 0;
+      }
+      .gate-status strong.ok {
+        color: var(--up);
+      }
+      .gate-status strong.block {
+        color: var(--down);
+      }
+      .gate-reason {
+        color: var(--dim);
+        line-height: 1.35;
+      }
+      .tile {
+        background: #0d141d;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 9px 11px;
+      }
+      .tile .v {
+        font-size: 18px;
+        font-weight: 600;
+      }
+      .tile .l {
+        color: var(--dim);
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+      }
+      .countdown {
+        font-size: 30px;
+        font-weight: 700;
+        color: var(--accent);
+      }
+      .banner {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 12px 16px;
+        margin: 0 16px 16px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--dim);
+      }
+      .dot.ok {
+        background: var(--up);
+      }
+      .dot.block {
+        background: var(--down);
+      }
+      button {
+        font-family: var(--mono);
+        font-size: 12px;
+        padding: 7px 16px;
+        border-radius: 7px;
+        border: 1px solid var(--line);
+        background: #0d141d;
+        color: var(--ink);
+        cursor: pointer;
+      }
+      button.arm {
+        border-color: var(--up);
+        color: var(--up);
+      }
+      button.kill {
+        border-color: var(--down);
+        color: var(--down);
+      }
+      button:hover {
+        background: #161f2b;
+      }
+      .edge.pos {
+        color: var(--up);
+      }
+      .edge.neg {
+        color: var(--down);
+      }
+      .spacer {
+        flex: 1;
+      }
+      .muted {
+        color: var(--dim);
+      }
+      .tab {
+        cursor: pointer;
+        user-select: none;
+      }
+      .tab.active {
+        color: var(--accent);
+        border-color: var(--accent);
+      }
+      .pause-btn {
+        padding: 3px 12px;
+        border-radius: 20px;
+        font-size: 11px;
+        font-family: var(--mono);
+        cursor: pointer;
+        user-select: none;
+        border: 1px solid var(--dim);
+        background: transparent;
+        color: var(--dim);
+        transition:
+          color 0.15s,
+          border-color 0.15s;
+      }
+      .pause-btn:hover {
+        color: var(--warn);
+        border-color: var(--warn);
+      }
+      .pause-btn.paused {
+        color: var(--warn);
+        border-color: var(--warn);
+      }
+      table.trades {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      table.trades th,
+      table.trades td {
+        text-align: left;
+        padding: 5px 8px;
+        border-bottom: 1px solid var(--line);
+        white-space: nowrap;
+      }
+      table.trades th {
+        color: var(--dim);
+        position: sticky;
+        top: 0;
+        background: var(--panel);
+      }
+      .win {
+        color: var(--up);
+      }
+      .loss {
+        color: var(--down);
+      }
+      /* ---- OFI gauge ---- */
+      .gauge {
+        position: relative;
+        height: 14px;
+        background: var(--line);
+        border-radius: 7px;
+        overflow: hidden;
+        margin-top: 6px;
+      }
+      .gauge .mid {
+        position: absolute;
+        left: 50%;
+        top: 0;
+        bottom: 0;
+        width: 1px;
+        background: var(--dim);
+        z-index: 2;
+      }
+      .gauge i {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        display: block;
+      }
+      /* ---- near-close alert ---- */
+      .nearclose {
+        display: none;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 16px;
+        margin: 0 16px 12px;
+        border-radius: 10px;
+        border: 1px solid var(--warn);
+        background: rgba(251, 189, 35, 0.08);
+        color: var(--warn);
+        font-weight: 600;
+      }
+      .nearclose.on {
+        display: flex;
+        animation: pulse 1.2s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.55;
+        }
+      }
+      /* ---- badges ---- */
+      .badge {
+        display: inline-block;
+        padding: 1px 7px;
+        border-radius: 5px;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.4px;
+        border: 1px solid var(--line);
+        margin-left: 6px;
+      }
+      .badge.yes {
+        color: var(--up);
+        border-color: var(--up);
+      }
+      .badge.no {
+        color: var(--down);
+        border-color: var(--down);
+      }
+      .badge.tight {
+        color: var(--accent);
+        border-color: var(--accent);
+      }
+      .badge.fade {
+        color: var(--warn);
+        border-color: var(--warn);
+      }
+      /* ---- filter bar ---- */
+      .filters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+      .chip {
+        padding: 3px 10px;
+        border-radius: 14px;
+        font-size: 11px;
+        border: 1px solid var(--line);
+        color: var(--dim);
+        cursor: pointer;
+        user-select: none;
+      }
+      .chip.on {
+        color: var(--accent);
+        border-color: var(--accent);
+        background: rgba(74, 168, 255, 0.08);
+      }
+      .filters .sep {
+        color: var(--line);
+        margin: 0 2px;
+      }
+      table.trades th.sortable {
+        cursor: pointer;
+      }
+      table.trades th.sortable:hover {
+        color: var(--ink);
+      }
+      /* ---- strategy cards ---- */
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+        gap: 14px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 14px 16px;
+      }
+      .card .name {
+        font-size: 14px;
+        font-weight: 600;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+      .card .metric {
+        display: flex;
+        justify-content: space-between;
+        font-size: 12px;
+        padding: 3px 0;
+      }
+      .card .metric .k {
+        color: var(--dim);
+      }
+      .wrbar {
+        height: 6px;
+        background: var(--line);
+        border-radius: 3px;
+        overflow: hidden;
+        margin: 3px 0 8px;
+      }
+      .wrbar > i {
+        display: block;
+        height: 100%;
+        background: var(--up);
+      }
+      .dualbar {
+        display: flex;
+        height: 22px;
+        border-radius: 5px;
+        overflow: hidden;
+        margin: 6px 0;
+        background: #0d141d;
+        border: 1px solid var(--line);
+      }
+      .dualbar > div {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 10px;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+      }
+      @media (max-width: 980px) {
+        .papergate {
+          grid-template-columns: 1fr;
+        }
+        .paper-metrics {
+          grid-template-columns: repeat(2, minmax(120px, 1fr));
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>BTC <span>5m</span> · Prediction Market Research Lab</h1>
+      <div>
+        <span class="pill tab active" id="tab-paper" onclick="showTab('paper')"
+          >Dry Run</span
+        >
+        <span
+          class="pill tab"
+          id="tab-strategies"
+          onclick="showTab('strategies')"
+          >Strategies</span
+        >
+        <span class="pill tab" id="tab-history" onclick="showTab('history')"
+          >History</span
+        >
+        <span id="conn" class="pill">connecting…</span>
+        <span id="mode" class="pill shadow">SHADOW</span>
+        <button id="pause-btn" onclick="togglePause()" class="pause-btn">
+          ⏸ Pause
+        </button>
+      </div>
+    </header>
+
+    <div id="view-history" style="display: none; padding: 16px">
+      <div class="panel">
+        <h2>Trade History · every closed strategy trade</h2>
+        <div class="filters" id="filt-strat">
+          <span class="muted" style="font-size: 11px">strategy:</span>
+          <span class="chip on" data-strat="all">all</span>
+        </div>
+        <div class="filters">
+          <span class="muted" style="font-size: 11px">mode:</span>
+          <span class="chip on" data-mode="all">all</span>
+          <span class="chip" data-mode="hold">hold</span>
+          <span class="chip" data-mode="active">active</span>
+          <span class="chip" data-mode="conv">conv</span>
+          <span class="chip" data-mode="dry-run">dry-run</span>
+          <span class="sep">|</span>
+          <span class="muted" style="font-size: 11px">outcome:</span>
+          <span class="chip on" data-out="all">all</span>
+          <span class="chip" data-out="win">win</span>
+          <span class="chip" data-out="loss">loss</span>
+          <span class="sep">|</span>
+          <span class="muted" style="font-size: 11px">side:</span>
+          <span class="chip on" data-side="all">all</span>
+          <span class="chip" data-side="YES">YES</span>
+          <span class="chip" data-side="NO">NO</span>
+        </div>
+        <div class="sub" id="hist-summary" style="margin-bottom: 10px"></div>
+        <div id="trades-table" style="max-height: 66vh; overflow-y: auto"></div>
+      </div>
+    </div>
+
+    <div id="view-strategies" style="display: none; padding: 16px">
+      <div class="cards" id="strategy-cards"></div>
+    </div>
+
+    <div id="view-paper">
+      <div class="banner">
+        <span id="riskdot" class="dot"></span>
+        <span>RISK: <b id="risk">—</b></span>
+        <span class="muted">|</span>
+        <span class="muted"
+          >disagreement <b id="disagree" class="muted">—</b></span
+        >
+        <span class="muted">|</span>
+        <span class="muted"
+          >edge bar <b id="edgebar">—</b> <span id="edgetyp"></span
+        ></span>
+        <div class="spacer"></div>
+        <span class="muted"
+          >resolved <b id="resolved">0</b> · Brier <b id="brier">—</b> · shadow
+          fills <b id="fills">0</b> · notional <b id="notional">$0</b></span
+        >
+        <button class="arm" onclick="ctl('enable_dry_run')">ENABLE DRY RUN</button>
+        <button onclick="ctl('disable_dry_run')">DISABLE</button>
+        <button class="kill" onclick="ctl('kill')">STOP</button>
+      </div>
+
+      <div class="nearclose" id="nearclose">
+        <span class="dot" style="background: var(--warn)"></span>
+        <span id="nearclose-txt"
+          >NEAR CLOSE — research: edge peaks in the final 60–90s</span
+        >
+      </div>
+
+      <div
+        id="paper-gate-panel"
+        class="grid"
+        style="grid-template-columns: 1fr; padding-bottom: 0"
+      >
+        <div class="panel">
+          <h2>Dry-run evaluation gate · simulation only</h2>
+          <div class="papergate">
+            <div class="tile">
+              <div class="gate-status">
+                <span id="papergate-dot" class="dot"></span>
+                <strong id="papergate-status">—</strong>
+              </div>
+              <div class="gate-reason" id="papergate-reason">—</div>
+            </div>
+            <div class="tile">
+              <div class="row">
+                <span class="k">strategy</span><span id="paper-strategy">—</span>
+              </div>
+              <div class="row">
+                <span class="k">simulation</span><span id="paper-order-type">—</span>
+              </div>
+              <div class="row">
+                <span class="k">paper budget</span><span id="paper-size">—</span>
+              </div>
+              <div class="row">
+                <span class="k">enabled</span><span id="paper-enabled">—</span>
+              </div>
+            </div>
+            <div class="tile">
+              <div class="row">
+                <span class="k">edge now</span><span id="paper-edge">—</span>
+              </div>
+              <div class="row">
+                <span class="k">required edge</span><span id="paper-floor">—</span>
+              </div>
+              <div class="row">
+                <span class="k">spread + buffers</span
+                ><span id="paper-buffers">—</span>
+              </div>
+              <div class="row">
+                <span class="k">feeds</span><span id="paper-feeds">—</span>
+              </div>
+            </div>
+          </div>
+          <div class="paper-metrics">
+            <div class="tile">
+              <div class="l">paper equity</div>
+              <div class="v" id="paper-equity">—</div>
+            </div>
+            <div class="tile">
+              <div class="l">unrealized</div>
+              <div class="v" id="paper-unrealized">—</div>
+            </div>
+            <div class="tile">
+              <div class="l">realized</div>
+              <div class="v" id="paper-realized">—</div>
+            </div>
+            <div class="tile">
+              <div class="l">max drawdown</div>
+              <div class="v" id="paper-mdd">—</div>
+            </div>
+            <div class="tile">
+              <div class="l">current position</div>
+              <div class="v" id="paper-position">—</div>
+            </div>
+            <div class="tile">
+              <div class="l">fills / wins</div>
+              <div class="v" id="paper-fills">—</div>
+            </div>
+          </div>
+          <div class="sub" style="margin-top: 10px">
+            entry <b id="paper-entry">—</b> · mark <b id="paper-mark">—</b> ·
+            notional <b id="paper-notional">—</b> · last fill
+            <b id="paper-last-fill">—</b>
+          </div>
+          <canvas
+            id="chart-paper"
+            width="1200"
+            height="220"
+            style="width: 100%; height: 220px; margin-top: 12px"
+          ></canvas>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="panel">
+          <h2>Fair Value · P(Up)</h2>
+          <div class="big" id="ensemble">—</div>
+          <div class="sub">
+            reference mean of <span id="nmodels">0</span> models · per-model
+            strategies below
+          </div>
+          <div style="margin-top: 16px" id="models"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Window</h2>
+          <div class="countdown" id="countdown">—</div>
+          <div class="sub">time to resolve</div>
+          <div style="margin-top: 14px">
+            <div class="row">
+              <span class="k">spot (Chainlink)</span><span id="spot">—</span>
+            </div>
+            <div class="row">
+              <span class="k">reference S₀</span><span id="s0">—</span>
+            </div>
+            <div class="row">
+              <span class="k">move vs S₀</span><span id="move">—</span>
+            </div>
+            <div class="row">
+              <span class="k">market</span><span id="market">—</span>
+            </div>
+            <div class="row">
+              <span class="k">YES token</span><span id="yes">—</span>
+            </div>
+            <div class="row">
+              <span class="k">NO token</span><span id="no">—</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Book &amp; Edge</h2>
+          <div class="row">
+            <span class="k">best bid</span><span id="bid">—</span>
+          </div>
+          <div class="row">
+            <span class="k">best ask</span><span id="ask">—</span>
+          </div>
+          <div class="row">
+            <span class="k">edge</span><span id="edge" class="edge">—</span>
+          </div>
+          <div class="row">
+            <span class="k">side</span><span id="side">—</span>
+          </div>
+          <div class="row">
+            <span class="k">depth</span><span id="depth">—</span>
+          </div>
+          <div class="row">
+            <span class="k">spread</span><span id="spread">—</span>
+          </div>
+          <div class="row">
+            <span class="k">book age</span><span id="bookage">—</span>
+          </div>
+          <div class="row">
+            <span class="k">signal</span><span id="booksignal">—</span>
+          </div>
+          <div class="sub" id="booknote" style="margin-top: 10px"></div>
+        </div>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1fr; padding-top: 0">
+        <div class="panel">
+          <h2>Signals</h2>
+          <div class="tiles">
+            <div class="tile">
+              <div class="l">σ annualized</div>
+              <div class="v" id="sigma">—</div>
+            </div>
+            <div class="tile">
+              <div class="l">realized skew</div>
+              <div class="v" id="skew">—</div>
+            </div>
+            <div class="tile">
+              <div class="l">realized kurtosis</div>
+              <div class="v" id="kurt">—</div>
+            </div>
+            <div class="tile">
+              <div class="l">lead-lag (Binance→CL)</div>
+              <div class="v" id="leadlag">—</div>
+            </div>
+            <div class="tile" style="grid-column: 1 / -1">
+              <div class="l">
+                order-flow imbalance (Binance top-of-book) ·
+                <span id="ofi-val" class="muted">—</span>
+              </div>
+              <div class="gauge">
+                <span class="mid"></span>
+                <i id="ofi-bar"></i>
+              </div>
+              <div
+                class="sub"
+                style="
+                  display: flex;
+                  justify-content: space-between;
+                  margin-top: 3px;
+                  font-size: 10px;
+                "
+              >
+                <span>← ask-heavy (down pressure)</span>
+                <span>bid-heavy (up pressure) →</span>
+              </div>
+            </div>
+            <div class="tile">
+              <div class="l">Chainlink age</div>
+              <div class="v" id="clage">—</div>
+            </div>
+            <div class="tile">
+              <div class="l">Binance age</div>
+              <div class="v" id="bnage">—</div>
+            </div>
+          </div>
+          <div class="sub" style="margin-top: 12px">
+            latency <b id="latency">—</b> · last simulation error
+            <b id="ordererr">—</b>
+          </div>
+          <div class="sub" style="margin-top: 4px">
+            learned recalibration (calibrated strat):
+            <b id="platt">learning…</b>
+          </div>
+        </div>
+      </div>
+
+      <div
+        class="grid"
+        style="grid-template-columns: 1fr 1fr 1fr; padding-top: 0"
+      >
+        <div class="panel">
+          <h2>Paper P&amp;L · Hold to Resolution (late-window gated)</h2>
+          <div id="strategies"></div>
+        </div>
+        <div class="panel">
+          <h2>
+            Paper P&amp;L · Active Taker (buy cheap / sell rich / inverse)
+          </h2>
+          <div id="strategies-active"></div>
+        </div>
+        <div class="panel">
+          <h2>
+            Paper P&amp;L · Convergence (enter on gap, take profit at fair)
+          </h2>
+          <div id="strategies-convergence"></div>
+        </div>
+      </div>
+
+      <div
+        class="grid"
+        style="grid-template-columns: 1fr 1fr 1fr; padding-top: 0"
+      >
+        <div class="panel">
+          <h2>P&amp;L Curve · Hold</h2>
+          <canvas
+            id="chart-hold"
+            width="540"
+            height="200"
+            style="width: 100%; height: 200px"
+          ></canvas>
+          <div id="legend-hold" class="sub" style="margin-top: 8px"></div>
+        </div>
+        <div class="panel">
+          <h2>P&amp;L Curve · Active Taker</h2>
+          <canvas
+            id="chart-active"
+            width="540"
+            height="200"
+            style="width: 100%; height: 200px"
+          ></canvas>
+          <div id="legend-active" class="sub" style="margin-top: 8px"></div>
+        </div>
+        <div class="panel">
+          <h2>P&amp;L Curve · Convergence</h2>
+          <canvas
+            id="chart-convergence"
+            width="540"
+            height="200"
+            style="width: 100%; height: 200px"
+          ></canvas>
+          <div
+            id="legend-convergence"
+            class="sub"
+            style="margin-top: 8px"
+          ></div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+      const pct = (x) => (100 * x).toFixed(1) + "%";
+      const age = (x) => (x == null ? "—" : x + "ms");
+      const short = (x) =>
+        !x ? "—" : x.length > 18 ? x.slice(0, 9) + "…" + x.slice(-6) : x;
+      const usd = (x) =>
+        "$" + Number(x).toLocaleString(undefined, { maximumFractionDigits: 2 });
+      const yesNo = (x) => (x ? "yes" : "no");
+      const riskReason = (risk) => {
+        if (!risk) return "unknown";
+        const m = String(risk).match(/^Block\((.*)\)$/);
+        return m ? m[1] : risk;
+      };
+
+      async function ctl(action) {
+        let token = sessionStorage.getItem("polyControlToken");
+        if (!token) {
+          token = prompt("Enter the dashboard control token for this session:");
+          if (!token) return false;
+          sessionStorage.setItem("polyControlToken", token);
+        }
+        const response = await fetch("/control", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ action }),
+        });
+        if (!response.ok) {
+          if (response.status === 401) sessionStorage.removeItem("polyControlToken");
+          alert(response.status === 404 ? "Dashboard controls are disabled." : "Control request was rejected.");
+          return false;
+        }
+        return true;
+      }
+
+      let _paused = false;
+      async function togglePause() {
+        const requested = !_paused;
+        if (!(await ctl(requested ? "pause" : "resume"))) return;
+        _paused = requested;
+        // Optimistic UI update — WebSocket will confirm on next tick
+        const btn = $("pause-btn");
+        btn.textContent = _paused ? "▶ Resume" : "⏸ Pause";
+        btn.classList.toggle("paused", _paused);
+      }
+
+      // Build a model row with safe DOM methods (no innerHTML). `weights` is the
+      // learned blend_dyn weight per component (name -> fraction).
+      function modelRow(m, weights) {
+        const wrap = document.createElement("div");
+        wrap.className = "model";
+        const top = document.createElement("div");
+        top.className = "top";
+        const name = document.createElement("span");
+        name.className = "muted";
+        name.textContent = m.name;
+        const val = document.createElement("span");
+        // Show the LEARNED dynamic-blend weight for each component (incl. calibrated).
+        const w = weights ? weights[m.name] : undefined;
+        val.textContent =
+          pct(m.p_yes) +
+          (w != null ? " · w " + pct(w) : "") +
+          (m.brier != null ? " · B " + m.brier.toFixed(3) : "");
+        top.append(name, val);
+        const bar = document.createElement("div");
+        bar.className = "bar";
+        const fill = document.createElement("i");
+        fill.style.width = Math.max(0, Math.min(100, 100 * m.p_yes)) + "%";
+        bar.append(fill);
+        wrap.append(top, bar);
+        // Hover on blend_dyn → full learned-weight breakdown across components.
+        if (m.name === "blend_dyn" && weights) {
+          const parts = Object.entries(weights)
+            .sort((a, b) => b[1] - a[1])
+            .map(([n, wt]) => `${n} ${pct(wt)}`);
+          wrap.title = "dynamic weights — " + parts.join("  ·  ");
+          wrap.style.cursor = "help";
+        }
+        return wrap;
+      }
+
+      function strategyRow(s) {
+        const row = document.createElement("div");
+        row.className = "row";
+        const left = document.createElement("span");
+        left.className = "k";
+        left.textContent = s.name;
+        if (s.open_side) {
+          const b = document.createElement("span");
+          b.className = "badge " + (s.open_side === "YES" ? "yes" : "no");
+          b.textContent = s.open_side + " @" + pct(s.open_entry);
+          left.appendChild(b);
+        }
+        const right = document.createElement("span");
+        const winRate = s.trades
+          ? ((100 * s.wins) / s.trades).toFixed(0) + "%"
+          : "—";
+        const paper = s.realized_pnl + (s.unrealized || 0);
+        right.textContent =
+          usd(paper) +
+          " · " +
+          s.trades +
+          " win " +
+          winRate +
+          " · MDD " +
+          usd(-(s.max_drawdown || 0));
+        right.style.color = paper >= 0 ? "var(--up)" : "var(--down)";
+        row.append(left, right);
+        return row;
+      }
+
+      function activeRow(s) {
+        const row = document.createElement("div");
+        row.className = "row";
+        const left = document.createElement("span");
+        left.className = "k";
+        left.textContent =
+          s.name + (s.position ? " · pos " + s.position.toFixed(0) : " · flat");
+        const right = document.createElement("span");
+        const paper = s.realized_pnl + (s.unrealized || 0);
+        right.textContent =
+          usd(paper) +
+          " · " +
+          s.trades +
+          " trades · MDD " +
+          usd(-(s.max_drawdown || 0));
+        right.style.color = paper >= 0 ? "var(--up)" : "var(--down)";
+        row.append(left, right);
+        return row;
+      }
+
+      function renderDryRunGate(s) {
+        const spreadBuffer = Math.max(0, Number(s.spread || 0));
+        const latencyBuffer = Math.max(0, Number(s.dry_run_latency_edge_buffer || 0));
+        const profitBuffer = Math.max(0, Number(s.dry_run_min_profit_buffer || 0));
+        const bufferFloor = spreadBuffer + latencyBuffer + profitBuffer;
+        const required = Number(s.dry_run_edge_floor || 0);
+        const edge = s.edge == null ? null : Number(s.edge);
+        const edgePass = edge != null && edge >= required;
+        const riskAllow = s.risk === "Allow";
+        const dryRunEnabled =
+          s.mode === "DryRun" && s.dry_run_enabled && !s.paused && !s.killed;
+        const ready =
+          dryRunEnabled &&
+          s.dry_run_clean_window &&
+          s.dry_run_market_in_sync &&
+          !s.dry_run_attempted_this_window &&
+          riskAllow &&
+          edgePass;
+
+        $("papergate-dot").className = "dot " + (ready ? "ok" : "block");
+        $("papergate-status").className = ready ? "ok" : "block";
+        $("papergate-status").textContent = ready ? "READY TO SIMULATE" : "WAITING";
+
+        const reasons = [];
+        if (s.mode !== "DryRun") reasons.push("mode is " + s.mode);
+        if (!s.dry_run_enabled) reasons.push("dry run is disabled");
+        if (s.paused) reasons.push("paused");
+        if (s.killed) reasons.push("stopped");
+        if (!s.dry_run_clean_window) reasons.push("window is warming up or unanchored");
+        if (!s.dry_run_market_in_sync) reasons.push("market slug/token sync not confirmed");
+        if (s.dry_run_attempted_this_window) reasons.push("already attempted this market window");
+        if (!riskAllow) reasons.push("risk: " + riskReason(s.risk));
+        if (edge == null) reasons.push("no executable edge from current book");
+        else if (!edgePass) {
+          reasons.push("edge " + pct(edge) + " below required " + pct(required));
+        }
+        if (!reasons.length) reasons.push("all paper gates clear; next eligible tick may be simulated");
+        $("papergate-reason").textContent = reasons.join(" · ");
+
+        $("paper-strategy").textContent = s.dry_run_strategy || "—";
+        $("paper-order-type").textContent = s.dry_run_kind || "—";
+        $("paper-size").textContent = usd(s.dry_run_size_usd || 0);
+        $("paper-enabled").textContent =
+          yesNo(dryRunEnabled) + " · pending external orders 0";
+        $("paper-edge").textContent = edge == null ? "—" : pct(edge);
+        $("paper-edge").style.color =
+          edge == null ? "var(--dim)" : edgePass ? "var(--up)" : "var(--down)";
+        $("paper-floor").textContent = pct(required);
+        $("paper-buffers").textContent =
+          pct(bufferFloor) +
+          " = spread " +
+          pct(spreadBuffer) +
+          " + latency " +
+          pct(latencyBuffer) +
+          " + profit " +
+          pct(profitBuffer);
+        $("paper-feeds").textContent =
+          "book " +
+          age(s.book_age_millis) +
+          " · CL " +
+          age(s.chainlink_age_millis) +
+          " · BN " +
+          age(s.binance_age_millis);
+      }
+
+      function drawDryRunPnlChart(points) {
+        const cv = $("chart-paper");
+        const ctx = cv.getContext("2d");
+        const W = cv.width;
+        const H = cv.height;
+        const pad = 30;
+        ctx.clearRect(0, 0, W, H);
+        if (!points || points.length < 2) {
+          ctx.fillStyle = "#6b7c8f";
+          ctx.font = "13px monospace";
+          ctx.fillText("waiting for paper equity samples…", pad, H / 2);
+          return;
+        }
+        const vals = points.map((p) => Number(p.equity || 0));
+        let lo = Math.min(0, ...vals);
+        let hi = Math.max(0, ...vals);
+        if (Math.abs(hi - lo) < 0.01) {
+          hi += 0.01;
+          lo -= 0.01;
+        }
+        const tMin = points[0].t_millis;
+        const tMax = points[points.length - 1].t_millis;
+        const x = (t) => pad + ((t - tMin) / ((tMax - tMin) || 1)) * (W - 2 * pad);
+        const y = (v) => H - pad - ((v - lo) / (hi - lo)) * (H - 2 * pad);
+
+        ctx.strokeStyle = "#1e2733";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pad, y(0));
+        ctx.lineTo(W - pad, y(0));
+        ctx.stroke();
+
+        ctx.strokeStyle = "#36d399";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        points.forEach((p, i) => {
+          const px = x(p.t_millis);
+          const py = y(Number(p.equity || 0));
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        });
+        ctx.stroke();
+
+        ctx.fillStyle = "#6b7c8f";
+        ctx.font = "12px monospace";
+        ctx.fillText(usd(hi), 4, pad);
+        ctx.fillText(usd(lo), 4, H - pad);
+      }
+
+      function renderDryRunPnl(s) {
+        const equity = Number(s.dry_run_equity || 0);
+        const unrealized = Number(s.dry_run_unrealized_pnl || 0);
+        const realized = Number(s.dry_run_realized_pnl || 0);
+        const mdd = Number(s.dry_run_max_drawdown || 0);
+        $("paper-equity").textContent = usd(equity);
+        $("paper-unrealized").textContent = usd(unrealized);
+        $("paper-realized").textContent = usd(realized);
+        $("paper-mdd").textContent = usd(-mdd);
+        $("paper-position").textContent =
+          s.dry_run_position_side && s.dry_run_position_shares > 0
+            ? `${s.dry_run_position_side} ${Number(s.dry_run_position_shares).toFixed(3)}`
+            : "flat";
+        $("paper-fills").textContent =
+          `${s.dry_run_trade_count || 0} / ${s.dry_run_win_count || 0}`;
+        $("paper-entry").textContent =
+          s.dry_run_avg_entry == null ? "—" : pct(s.dry_run_avg_entry);
+        $("paper-mark").textContent =
+          s.dry_run_mark_price == null ? "—" : pct(s.dry_run_mark_price);
+        $("paper-notional").textContent = usd(s.dry_run_notional || 0);
+        $("paper-last-fill").textContent =
+          (s.dry_run_last_fill_status || "—") +
+          (s.dry_run_last_fill_price == null ? "" : " @ " + pct(s.dry_run_last_fill_price));
+        ["paper-equity", "paper-unrealized", "paper-realized"].forEach((id) => {
+          const el = $(id);
+          const val =
+            id === "paper-equity" ? equity : id === "paper-unrealized" ? unrealized : realized;
+          el.style.color = val >= 0 ? "var(--up)" : "var(--down)";
+        });
+        $("paper-mdd").style.color = mdd > 0 ? "var(--down)" : "var(--ink)";
+        drawDryRunPnlChart(s.dry_run_pnl_curve || []);
+      }
+
+      function render(s) {
+        $("paper-gate-panel").style.display = s.mode === "DryRun" ? "" : "none";
+        $("ensemble").textContent = pct(s.ensemble_p_yes);
+        $("nmodels").textContent = s.models.length;
+        $("mode").textContent = s.mode === "DryRun" ? "DRY RUN" : s.mode.toUpperCase();
+        $("mode").className = "pill " + (s.mode === "DryRun" ? "paper" : "shadow");
+        _paused = !!s.paused; // keep local state in sync with server
+        const btn = $("pause-btn");
+        btn.textContent = s.paused ? "▶ Resume" : "⏸ Pause";
+        btn.classList.toggle("paused", !!s.paused);
+        renderDryRunGate(s);
+        renderDryRunPnl(s);
+
+        const box = $("models");
+        const blendW = Object.fromEntries(s.blend_weights || []);
+        box.replaceChildren(...s.models.map((m) => modelRow(m, blendW)));
+
+        $("countdown").textContent = s.seconds_remaining + "s";
+        $("spot").textContent = usd(s.spot);
+        $("s0").textContent =
+          usd(s.s0) + (s.s0_anchored ? "" : " ~approx (warming up)");
+        $("s0").style.color = s.s0_anchored ? "var(--ink)" : "var(--warn)";
+        const mv = s.spot - s.s0;
+        const mvEl = $("move");
+        mvEl.textContent = (mv >= 0 ? "+" : "") + mv.toFixed(2);
+        mvEl.style.color = mv >= 0 ? "var(--up)" : "var(--down)";
+
+        $("bid").textContent = s.best_bid != null ? pct(s.best_bid) : "—";
+        $("ask").textContent = s.best_ask != null ? pct(s.best_ask) : "—";
+        const eEl = $("edge");
+        if (s.edge != null) {
+          eEl.textContent = (s.edge >= 0 ? "+" : "") + pct(s.edge);
+          eEl.className = "edge " + (s.edge >= 0 ? "pos" : "neg");
+        } else {
+          eEl.textContent = "—";
+          eEl.className = "edge";
+        }
+        $("side").textContent = s.edge_side || "—";
+        $("depth").textContent =
+          s.book_depth != null ? Number(s.book_depth).toFixed(1) : "—";
+        $("spread").textContent = s.spread != null ? pct(s.spread) : "—";
+        $("bookage").textContent = age(s.book_age_millis);
+        $("booknote").textContent =
+          s.best_bid == null
+            ? "no current order book — waiting for market discovery or POLY_TOKEN_ID"
+            : "";
+        $("market").textContent = s.market_slug || "—";
+        $("yes").textContent = short(s.yes_token_id);
+        $("no").textContent = short(s.no_token_id);
+
+        $("sigma").textContent = (100 * s.sigma_annual).toFixed(0) + "%";
+        $("skew").textContent = s.skew.toFixed(2);
+        $("kurt").textContent = s.kurt.toFixed(2);
+        $("leadlag").textContent = s.lead_lag_steps + " steps";
+        $("clage").textContent = age(s.chainlink_age_millis);
+        $("bnage").textContent = age(s.binance_age_millis);
+        // Binance feed staleness warning (>5s stale = signal dead).
+        const bnStale =
+          s.binance_age_millis != null && s.binance_age_millis > 5000;
+        $("bnage").style.color = bnStale ? "var(--down)" : "var(--ink)";
+
+        // ---- OFI gauge ----
+        const imb = s.book_imbalance || 0;
+        $("ofi-val").textContent = (imb >= 0 ? "+" : "") + imb.toFixed(3);
+        const bar = $("ofi-bar");
+        const half = Math.min(Math.abs(imb), 1) * 50; // % width from center
+        if (imb >= 0) {
+          bar.style.left = "50%";
+          bar.style.width = half + "%";
+          bar.style.background = "var(--up)";
+        } else {
+          bar.style.left = 50 - half + "%";
+          bar.style.width = half + "%";
+          bar.style.background = "var(--down)";
+        }
+
+        // ---- near-close alert (research: edge peaks final 60–90s) ----
+        const nc = $("nearclose");
+        if (
+          s.seconds_remaining != null &&
+          s.seconds_remaining <= 90 &&
+          s.seconds_remaining > 0
+        ) {
+          nc.classList.add("on");
+          $("nearclose-txt").textContent =
+            "NEAR CLOSE · " +
+            s.seconds_remaining +
+            "s left — research: edge peaks in the final 60–90s";
+        } else {
+          nc.classList.remove("on");
+        }
+
+        // ---- book signal: spread-fade / tight-spread (SSRN stat-arb) ----
+        const sig = $("booksignal");
+        sig.replaceChildren();
+        const certain =
+          s.ensemble_p_yes != null &&
+          (s.ensemble_p_yes > 0.95 || s.ensemble_p_yes < 0.05);
+        if (s.spread != null && s.edge != null && Math.abs(s.edge) > s.spread) {
+          const b = document.createElement("span");
+          b.className = "badge tight";
+          b.textContent = "EDGE > SPREAD";
+          sig.appendChild(b);
+        }
+        if (certain && s.spread != null && s.spread > 0.04) {
+          const b = document.createElement("span");
+          b.className = "badge fade";
+          b.textContent = "SPREAD_FADE";
+          sig.appendChild(b);
+        }
+        if (!sig.childNodes.length) sig.textContent = "—";
+
+        $("risk").textContent = s.risk;
+        $("riskdot").className = "dot " + (s.risk === "Allow" ? "ok" : "block");
+        $("disagree").textContent = pct(s.model_disagreement);
+        const holdEdge = s.hold_edge_threshold || s.edge_threshold || 0;
+        const activeEdge = s.active_edge_threshold || s.edge_threshold || 0;
+        const convEdge = s.convergence_edge_threshold || s.edge_threshold || 0;
+        $("edgebar").textContent =
+          "hold " + pct(holdEdge) +
+          " · active " + pct(activeEdge) +
+          " · conv " + pct(convEdge);
+        const holdTyp = s.hold_typical_max_edge || s.typical_max_edge || 0;
+        const activeTyp = s.active_typical_max_edge || 0;
+        const convTyp = s.convergence_typical_max_edge || 0;
+        $("edgetyp").textContent =
+          holdTyp > 0 || activeTyp > 0 || convTyp > 0
+            ? "(typ-max h " + pct(holdTyp) +
+              " · a " + pct(activeTyp) +
+              " · c " + pct(convTyp) + ")"
+            : "(learning…)";
+        $("fills").textContent = s.shadow_fills;
+        $("notional").textContent = usd(s.shadow_notional);
+        $("resolved").textContent = s.resolved_windows;
+        $("brier").textContent =
+          s.resolved_windows > 0 ? s.mean_brier.toFixed(3) : "—";
+        $("latency").textContent =
+          s.tick_to_decision_micros == null
+            ? "—"
+            : s.tick_to_decision_micros + "µs";
+        $("ordererr").textContent = s.last_simulation_error || "—";
+        const strategies = $("strategies");
+        const rows = (s.strategy_pnls || []).map(strategyRow);
+        if (rows.length) {
+          strategies.replaceChildren(...rows);
+        } else {
+          const empty = document.createElement("div");
+          empty.className = "muted";
+          empty.textContent = "waiting for market-book edge signals";
+          strategies.replaceChildren(empty);
+        }
+
+        const activeBox = $("strategies-active");
+        const arows = (s.active_pnls || []).map(activeRow);
+        if (arows.length) {
+          activeBox.replaceChildren(...arows);
+        } else {
+          const empty = document.createElement("div");
+          empty.className = "muted";
+          empty.textContent = "waiting for market-book edge signals";
+          activeBox.replaceChildren(empty);
+        }
+
+        const convBox = $("strategies-convergence");
+        const crows = (s.convergence_pnls || []).map(activeRow);
+        if (crows.length) {
+          convBox.replaceChildren(...crows);
+        } else {
+          const empty = document.createElement("div");
+          empty.className = "muted";
+          empty.textContent = "waiting for a wide blend-vs-market gap";
+          convBox.replaceChildren(empty);
+        }
+
+        // Learned recalibration readout (the 'calibrated' strategy).
+        if ($("platt")) {
+          $("platt").textContent =
+            s.platt_samples > 0
+              ? `slope ${s.platt_slope.toFixed(2)} · bias ${s.platt_bias.toFixed(2)} · n=${s.platt_samples}`
+              : "learning…";
+        }
+
+        // Keep latest state for the Strategies tab; refresh cards if visible.
+        lastState = s;
+        if (activeTab === "strategies") renderStrategyCards(s);
+      }
+
+      let lastState = null;
+
+      const PALETTE = {
+        ensemble: "#4aa8ff",
+        black_scholes: "#36d399",
+        student_t: "#fbbd23",
+        cos_vg: "#a78bfa",
+        sharp: "#22d3ee",
+        calibrated: "#4aa8ff",
+        blend: "#f472b6",
+        blend_dyn: "#34d399",
+      };
+      const colorFor = (name) => PALETTE[name] || "#8aa0b4";
+
+      function drawPnlChart(canvasId, legendId, history, key) {
+        const cv = $(canvasId);
+        const ctx = cv.getContext("2d");
+        const W = cv.width,
+          H = cv.height,
+          pad = 28;
+        ctx.clearRect(0, 0, W, H);
+        if (!history || history.length < 2) {
+          ctx.fillStyle = "#6b7c8f";
+          ctx.font = "12px monospace";
+          ctx.fillText("collecting data…", pad, H / 2);
+          return;
+        }
+        // Build per-strategy series with timestamps so gaps can be detected.
+        const names = new Set();
+        history.forEach((p) => (p[key] || []).forEach(([n]) => names.add(n)));
+        const series = {};
+        names.forEach((n) => (series[n] = []));
+        history.forEach((p) => {
+          const m = Object.fromEntries(p[key] || []);
+          names.forEach((n) =>
+            series[n].push({ t: p.t_millis, v: m[n] ?? null }),
+          );
+        });
+        // Y range (always include 0).
+        let lo = 0,
+          hi = 0;
+        Object.values(series).forEach((arr) =>
+          arr.forEach(({ v }) => {
+            if (v != null) {
+              lo = Math.min(lo, v);
+              hi = Math.max(hi, v);
+            }
+          }),
+        );
+        if (hi === lo) hi = lo + 1;
+        // Time-based X axis so downtime gaps are proportional to real elapsed time.
+        const tMin = history[0].t_millis;
+        const tMax = history[history.length - 1].t_millis;
+        const tSpan = tMax - tMin || 1;
+        const x = (t) => pad + ((t - tMin) / tSpan) * (W - 2 * pad);
+        const y = (v) => H - pad - ((v - lo) / (hi - lo)) * (H - 2 * pad);
+        // 15-minute gap threshold: any jump larger than this breaks the line
+        // so downtime shows as a gap rather than a flat horizontal segment.
+        const GAP_MS = 15 * 60 * 1000;
+        // Zero line + axes.
+        ctx.strokeStyle = "#1e2733";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(pad, y(0));
+        ctx.lineTo(W - pad, y(0));
+        ctx.stroke();
+        ctx.fillStyle = "#6b7c8f";
+        ctx.font = "10px monospace";
+        ctx.fillText("$" + hi.toFixed(0), 2, y(hi) + 4);
+        ctx.fillText("$" + lo.toFixed(0), 2, y(lo) + 4);
+        // Lines.
+        Object.entries(series).forEach(([name, arr]) => {
+          ctx.strokeStyle = colorFor(name);
+          ctx.lineWidth = 1.6;
+          ctx.beginPath();
+          let started = false;
+          let lastT = null;
+          arr.forEach(({ t, v }) => {
+            if (v == null) {
+              started = false;
+              lastT = null;
+              return;
+            }
+            const px = x(t),
+              py = y(v);
+            const isGap = lastT !== null && t - lastT > GAP_MS;
+            if (!started || isGap) {
+              ctx.moveTo(px, py);
+              started = true;
+            } else {
+              ctx.lineTo(px, py);
+            }
+            lastT = t;
+          });
+          ctx.stroke();
+        });
+        // Legend with latest values.
+        const legend = $(legendId);
+        legend.replaceChildren(
+          ...Object.entries(series).map(([name, arr]) => {
+            const last = [...arr].reverse().find(({ v }) => v != null)?.v ?? 0;
+            const span = document.createElement("span");
+            span.style.color = colorFor(name);
+            span.style.marginRight = "12px";
+            span.textContent = `${name} ${usd(last)}`;
+            return span;
+          }),
+        );
+      }
+
+      async function pollHistory() {
+        try {
+          const h = await (await fetch("/history")).json();
+          drawPnlChart("chart-hold", "legend-hold", h, "hold");
+          drawPnlChart("chart-active", "legend-active", h, "active");
+          drawPnlChart(
+            "chart-convergence",
+            "legend-convergence",
+            h,
+            "convergence",
+          );
+        } catch (e) {}
+      }
+      pollHistory();
+      setInterval(pollHistory, 5000);
+
+      // ---- Tabs ----
+      let activeTab = "paper";
+      function showTab(t) {
+        activeTab = t;
+        $("view-paper").style.display = t === "paper" ? "" : "none";
+        $("view-strategies").style.display = t === "strategies" ? "" : "none";
+        $("view-history").style.display = t === "history" ? "" : "none";
+        $("tab-paper").classList.toggle("active", t === "paper");
+        $("tab-strategies").classList.toggle("active", t === "strategies");
+        $("tab-history").classList.toggle("active", t === "history");
+        if (t === "history") pollTrades();
+        if (t === "strategies" && lastState) renderStrategyCards(lastState);
+      }
+
+      const fmtTime = (ms) =>
+        new Date(ms).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+
+      // Parse "YES @0.410 x24" -> {side, entry, qty}; tolerant of variants.
+      function parseDetail(detail) {
+        const side = /\bYES\b/.test(detail)
+          ? "YES"
+          : /\bNO\b/.test(detail)
+            ? "NO"
+            : /\bBUY\b/.test(detail)
+              ? "BUY"
+              : /\bSELL\b/.test(detail)
+                ? "SELL"
+                : "—";
+        const m = detail.match(/@\s*([\d.]+)/);
+        const q = detail.match(/x\s*([\d.]+)/i);
+        return {
+          side,
+          entry: m ? parseFloat(m[1]) : null,
+          qty: q ? parseFloat(q[1]) : null,
+        };
+      }
+
+      // ---- History tab: filters + sortable table ----
+      let allTrades = [];
+      let filt = { strat: "all", mode: "all", out: "all", side: "all" };
+      let sortKey = "time";
+      let sortDir = -1; // -1 = desc (newest/biggest first)
+
+      function buildStratChips() {
+        const box = $("filt-strat");
+        const names = [...new Set(allTrades.map((t) => t.strategy))].sort();
+        // keep "all" chip, rebuild the rest
+        box
+          .querySelectorAll(".chip:not([data-strat='all'])")
+          .forEach((c) => c.remove());
+        names.forEach((n) => {
+          const c = document.createElement("span");
+          c.className = "chip" + (filt.strat === n ? " on" : "");
+          c.dataset.strat = n;
+          c.textContent = n;
+          box.appendChild(c);
+        });
+      }
+
+      function applyFilters(rows) {
+        return rows.filter((r) => {
+          if (filt.strat !== "all" && r.strategy !== filt.strat) return false;
+          if (filt.mode !== "all" && r.mode !== filt.mode) return false;
+          if (filt.out !== "all" && r.kind === "fill") return false;
+          if (filt.out === "win" && !r.won) return false;
+          if (filt.out === "loss" && r.won) return false;
+          if (filt.side !== "all") {
+            const d = parseDetail(r.detail);
+            if (d.side !== filt.side) return false;
+          }
+          return true;
+        });
+      }
+
+      const SORTERS = {
+        time: (r) => r.t0_millis,
+        strategy: (r) => r.strategy,
+        mode: (r) => r.mode,
+        side: (r) => parseDetail(r.detail).side,
+        entry: (r) => parseDetail(r.detail).entry ?? 0,
+        qty: (r) => parseDetail(r.detail).qty ?? 0,
+        result: (r) => (r.won ? 1 : 0),
+        pnl: (r) => r.pnl ?? 0,
+      };
+
+      function fillToHistoryRow(f) {
+        const matchedSize = Number(f.matched_size || f.size || 0);
+        const matchedNotional = Number(f.matched_notional || matchedSize * Number(f.price || 0));
+        const avg = matchedSize > 0 ? matchedNotional / matchedSize : Number(f.price || 0);
+        const side = f.side === "Buy" ? "BUY" : f.side === "Sell" ? "SELL" : String(f.side || "—");
+        const rawMode = String(f.mode || "").toLowerCase().replaceAll("_", "-");
+        const mode = rawMode === "dryrun" ? "dry-run" : rawMode;
+        return {
+          kind: "fill",
+          t0_millis: Number(f.ts_millis || 0),
+          strategy: "execution",
+          mode,
+          detail:
+            side +
+            " @" +
+            avg.toFixed(3) +
+            " x" +
+            matchedSize.toFixed(4) +
+            " · " +
+            (f.fill_status || f.status || "unknown") +
+            " · " +
+            usd(matchedNotional),
+          outcome_up: null,
+          won: null,
+          pnl: null,
+          fill_status: f.fill_status || "unknown",
+          decision_id: f.idempotency_key,
+        };
+      }
+
+      function renderTrades() {
+        const box = $("trades-table");
+        box.replaceChildren();
+        if (!allTrades.length) {
+          const e = document.createElement("div");
+          e.className = "muted";
+          e.textContent =
+            "no closed trades yet — waiting for windows to resolve";
+          box.appendChild(e);
+          $("hist-summary").textContent = "";
+          return;
+        }
+        let rows = applyFilters(allTrades);
+        const sorter = SORTERS[sortKey] || SORTERS.time;
+        rows = rows.slice().sort((a, b) => {
+          const va = sorter(a),
+            vb = sorter(b);
+          if (va < vb) return -sortDir;
+          if (va > vb) return sortDir;
+          return 0;
+        });
+
+        const closedRows = rows.filter((r) => r.kind !== "fill");
+        const fillRows = rows.filter((r) => r.kind === "fill");
+        const wins = closedRows.filter((r) => r.won).length;
+        const total = closedRows.reduce((a, r) => a + (r.pnl || 0), 0);
+        const avg = closedRows.length ? total / closedRows.length : 0;
+        $("hist-summary").textContent =
+          `${closedRows.length} closed trades · ${fillRows.length} execution fills · ` +
+          `${wins} won (${closedRows.length ? ((100 * wins) / closedRows.length).toFixed(0) : 0}%) · ` +
+          `closed net ${usd(total)} · avg ${usd(avg)}/trade`;
+
+        const table = document.createElement("table");
+        table.className = "trades";
+        const head = document.createElement("tr");
+        const cols = [
+          ["time", "time"],
+          ["window", "result-up"],
+          ["strategy", "strategy"],
+          ["mode", "mode"],
+          ["side", "side"],
+          ["entry", "entry"],
+          ["qty", "qty"],
+          ["result", "result"],
+          ["P&L", "pnl"],
+        ];
+        cols.forEach(([label, key]) => {
+          const th = document.createElement("th");
+          th.textContent = label;
+          if (SORTERS[key]) {
+            th.className = "sortable";
+            if (key === sortKey) th.textContent += sortDir < 0 ? " ▼" : " ▲";
+            th.onclick = () => {
+              if (sortKey === key) sortDir = -sortDir;
+              else {
+                sortKey = key;
+                sortDir = -1;
+              }
+              renderTrades();
+            };
+          }
+          head.appendChild(th);
+        });
+        table.appendChild(head);
+
+        rows.forEach((r) => {
+          const tr = document.createElement("tr");
+          const close = r.t0_millis + 300000;
+          const d = parseDetail(r.detail);
+          const isFill = r.kind === "fill";
+          const cells = [
+            fmtTime(isFill ? r.t0_millis : close),
+            isFill ? "—" : r.outcome_up ? "UP" : "DOWN",
+            r.strategy,
+            r.mode,
+            d.side,
+            d.entry != null ? pct(d.entry) : "—",
+            d.qty != null ? d.qty : "—",
+            isFill ? r.fill_status || "fill" : r.won ? "WIN" : "LOSS",
+            isFill ? r.detail.replace(/^.*?·\s*/, "") : usd(r.pnl),
+          ];
+          cells.forEach((c, i) => {
+            const td = document.createElement("td");
+            td.textContent = c;
+            if (i === 1 && !isFill)
+              td.style.color = r.outcome_up ? "var(--up)" : "var(--down)";
+            if (i === 4 && d.side !== "—")
+              td.style.color =
+                d.side === "YES" || d.side === "BUY" ? "var(--up)" : "var(--down)";
+            if (i === 7 && !isFill) td.className = r.won ? "win" : "loss";
+            if (i === 7 && isFill)
+              td.style.color =
+                r.fill_status === "full_fill" || r.fill_status === "partial_fill"
+                  ? "var(--up)"
+                  : "var(--down)";
+            if (i === 8 && !isFill)
+              td.style.color = r.pnl >= 0 ? "var(--up)" : "var(--down)";
+            tr.appendChild(td);
+          });
+          table.appendChild(tr);
+        });
+        box.appendChild(table);
+      }
+
+      // Filter chip clicks (event delegation).
+      document.addEventListener("click", (e) => {
+        const chip = e.target.closest(".chip");
+        if (!chip) return;
+        let group = null,
+          val = null;
+        if ("strat" in chip.dataset) {
+          group = "strat";
+          val = chip.dataset.strat;
+        } else if ("mode" in chip.dataset) {
+          group = "mode";
+          val = chip.dataset.mode;
+        } else if ("out" in chip.dataset) {
+          group = "out";
+          val = chip.dataset.out;
+        } else if ("side" in chip.dataset) {
+          group = "side";
+          val = chip.dataset.side;
+        }
+        if (!group) return;
+        filt[group] = val;
+        // toggle "on" within the chip's group
+        const attr =
+          group === "strat"
+            ? "strat"
+            : group === "mode"
+              ? "mode"
+              : group === "out"
+                ? "out"
+                : "side";
+        chip.parentElement
+          .querySelectorAll(`.chip[data-${attr}]`)
+          .forEach((c) => c.classList.toggle("on", c === chip));
+        renderTrades();
+      });
+
+      async function pollTrades() {
+        try {
+          const [trades, fills] = await Promise.all([
+            fetch("/trades").then((r) => r.json()),
+            fetch("/fills").then((r) => (r.ok ? r.json() : [])),
+          ]);
+          allTrades = [
+            ...(trades || []).map((t) => ({ ...t, kind: "trade" })),
+            ...(fills || []).map(fillToHistoryRow),
+          ];
+          buildStratChips();
+          renderTrades();
+        } catch (e) {}
+      }
+      setInterval(() => {
+        if (activeTab === "history") pollTrades();
+      }, 5000);
+
+      // ---- Strategies tab: one card per strategy ----
+      function renderStrategyCards(s) {
+        const box = $("strategy-cards");
+        const holds = Object.fromEntries(
+          (s.strategy_pnls || []).map((h) => [h.name, h]),
+        );
+        const actives = Object.fromEntries(
+          (s.active_pnls || []).map((a) => [a.name, a]),
+        );
+        const convs = Object.fromEntries(
+          (s.convergence_pnls || []).map((c) => [c.name, c]),
+        );
+        const briers = Object.fromEntries(
+          (s.models || []).map((m) => [m.name, m.brier]),
+        );
+        const names = [
+          ...new Set([
+            ...Object.keys(holds),
+            ...Object.keys(actives),
+            ...Object.keys(convs),
+          ]),
+        ];
+        if (!names.length) {
+          box.replaceChildren();
+          const e = document.createElement("div");
+          e.className = "muted";
+          e.textContent = "waiting for strategy data…";
+          box.appendChild(e);
+          return;
+        }
+        // Sort by hold P&L desc.
+        names.sort(
+          (a, b) =>
+            (holds[b]?.realized_pnl || 0) - (holds[a]?.realized_pnl || 0),
+        );
+        // Max abs P&L for dual-bar scaling.
+        let maxAbs = 1;
+        names.forEach((n) => {
+          maxAbs = Math.max(
+            maxAbs,
+            Math.abs(holds[n]?.realized_pnl || 0),
+            Math.abs(actives[n]?.realized_pnl || 0),
+            Math.abs(convs[n]?.realized_pnl || 0),
+          );
+        });
+        box.replaceChildren(
+          ...names.map((n) =>
+            strategyCard(n, holds[n], actives[n], convs[n], briers[n], maxAbs),
+          ),
+        );
+      }
+
+      function metricRow(k, v, color) {
+        const row = document.createElement("div");
+        row.className = "metric";
+        const kk = document.createElement("span");
+        kk.className = "k";
+        kk.textContent = k;
+        const vv = document.createElement("span");
+        vv.textContent = v;
+        if (color) vv.style.color = color;
+        row.append(kk, vv);
+        return row;
+      }
+
+      function dualBar(label, val, maxAbs) {
+        // Single horizontal bar centered at 0, scaled to maxAbs.
+        const wrap = document.createElement("div");
+        const lab = document.createElement("div");
+        lab.className = "sub";
+        lab.style.fontSize = "10px";
+        lab.textContent = label + " " + usd(val);
+        const bar = document.createElement("div");
+        bar.className = "dualbar";
+        const w = Math.min(100, (Math.abs(val) / maxAbs) * 100);
+        const fill = document.createElement("div");
+        fill.style.width = w + "%";
+        fill.style.background =
+          val >= 0 ? "rgba(54,211,153,.35)" : "rgba(248,114,114,.35)";
+        fill.style.color = val >= 0 ? "var(--up)" : "var(--down)";
+        fill.textContent = usd(val);
+        if (val >= 0) bar.appendChild(fill);
+        else {
+          bar.style.justifyContent = "flex-end";
+          bar.appendChild(fill);
+        }
+        wrap.append(lab, bar);
+        return wrap;
+      }
+
+      function strategyCard(name, hold, active, conv, brier, maxAbs) {
+        const card = document.createElement("div");
+        card.className = "card";
+
+        const title = document.createElement("div");
+        title.className = "name";
+        const nm = document.createElement("span");
+        nm.textContent = name;
+        nm.style.color = colorFor(name);
+        const op = document.createElement("span");
+        if (hold && hold.open_side) {
+          op.className = "badge " + (hold.open_side === "YES" ? "yes" : "no");
+          op.textContent = hold.open_side + " @" + pct(hold.open_entry);
+        }
+        title.append(nm, op);
+        card.appendChild(title);
+
+        // Brier
+        card.appendChild(
+          metricRow(
+            "Brier (lower=better)",
+            brier != null ? brier.toFixed(3) : "—",
+            brier != null
+              ? brier < 0.15
+                ? "var(--up)"
+                : brier > 0.25
+                  ? "var(--down)"
+                  : "var(--warn)"
+              : null,
+          ),
+        );
+
+        // Win rate bar (hold)
+        if (hold) {
+          const wr = hold.trades ? (100 * hold.wins) / hold.trades : 0;
+          card.appendChild(
+            metricRow(
+              "hold win rate",
+              `${wr.toFixed(0)}% (${hold.wins}/${hold.trades})`,
+            ),
+          );
+          const wrbar = document.createElement("div");
+          wrbar.className = "wrbar";
+          const wi = document.createElement("i");
+          wi.style.width = wr + "%";
+          wi.style.background =
+            wr >= 55 ? "var(--up)" : wr >= 45 ? "var(--warn)" : "var(--down)";
+          wrbar.appendChild(wi);
+          card.appendChild(wrbar);
+        }
+
+        // Triple P&L bars: Hold / Active taker / Convergence
+        card.appendChild(dualBar("Hold", hold ? hold.realized_pnl : 0, maxAbs));
+        card.appendChild(
+          dualBar("Active", active ? active.realized_pnl : 0, maxAbs),
+        );
+        card.appendChild(dualBar("Conv", conv ? conv.realized_pnl : 0, maxAbs));
+
+        // MDD + trades
+        card.appendChild(
+          metricRow(
+            "hold MDD",
+            hold ? usd(-(hold.max_drawdown || 0)) : "—",
+            "var(--down)",
+          ),
+        );
+        card.appendChild(
+          metricRow(
+            "conv",
+            conv
+              ? `${usd(conv.realized_pnl)} · ${conv.trades} tr · MDD ${usd(-(conv.max_drawdown || 0))}`
+              : "—",
+          ),
+        );
+        return card;
+      }
+
+      function connect() {
+        const protocol = location.protocol === "https:" ? "wss" : "ws";
+        const ws = new WebSocket(`${protocol}://${location.host}/ws`);
+        ws.onopen = () => {
+          $("conn").textContent = "connected";
+          $("conn").style.color = "var(--up)";
+        };
+        ws.onclose = () => {
+          $("conn").textContent = "reconnecting…";
+          $("conn").style.color = "var(--down)";
+          setTimeout(connect, 1500);
+        };
+        ws.onmessage = (ev) => {
+          try {
+            render(JSON.parse(ev.data));
+          } catch (e) {}
+        };
+      }
+      fetch("/health")
+        .then((response) => response.json())
+        .then((health) => {
+          if (!health.controls_enabled) {
+            document
+              .querySelectorAll('button[onclick^="ctl"], #pause-btn')
+              .forEach((button) => {
+                button.disabled = true;
+                button.title = "Read-only dashboard: controls are disabled";
+              });
+          }
+        })
+        .catch(() => {});
+      connect();
+    </script>
+  </body>
+</html>

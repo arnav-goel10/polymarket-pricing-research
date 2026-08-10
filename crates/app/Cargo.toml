@@ -1,0 +1,22 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+poly_core = { path = "../poly_core" }
+pricing = { path = "../pricing" }
+stats = { path = "../stats" }
+feeds = { path = "../feeds" }
+market = { path = "../market" }
+execution = { path = "../execution" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

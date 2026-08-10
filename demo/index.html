@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="description" content="Read-only replay of Poly's BTC five-minute prediction-market research engine." />
+    <title>Poly · Research Replay</title>
+    <style>
+      :root { color-scheme: dark; --bg:#070a10; --panel:#101621; --line:#243044; --text:#f4f7fb; --muted:#92a0b5; --cyan:#5de4d5; --amber:#ffc66d; }
+      * { box-sizing:border-box; }
+      body { margin:0; background:radial-gradient(circle at 75% 0,#10263a 0,transparent 40%),var(--bg); color:var(--text); font:15px/1.55 Inter,ui-sans-serif,system-ui,sans-serif; }
+      main { width:min(1120px,calc(100% - 32px)); margin:auto; padding:64px 0 80px; }
+      nav { display:flex; justify-content:space-between; align-items:center; margin-bottom:72px; }
+      .wordmark { font-weight:800; letter-spacing:.18em; }
+      a { color:var(--cyan); text-decoration:none; }
+      .eyebrow { color:var(--cyan); letter-spacing:.16em; text-transform:uppercase; font-size:12px; font-weight:700; }
+      h1 { font-size:clamp(42px,8vw,84px); line-height:.95; letter-spacing:-.055em; max-width:900px; margin:18px 0 24px; }
+      .lede { color:var(--muted); font-size:19px; max-width:750px; }
+      .simulation-notice { margin:0 0 28px; padding:14px 18px; border:2px solid var(--amber); background:#211b10; color:#ffe2ad; border-radius:12px; font-weight:700; }
+      .notice { margin:32px 0 52px; padding:16px 18px; border:1px solid #594a2c; background:#1d180f; color:#f8daa4; border-radius:12px; }
+      .metrics { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-bottom:32px; }
+      .metric,.panel { border:1px solid var(--line); background:linear-gradient(145deg,rgba(22,30,44,.96),rgba(12,17,26,.96)); border-radius:16px; }
+      .metric { padding:22px; }
+      .metric span { display:block; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.12em; }
+      .metric strong { display:block; font-size:34px; margin-top:7px; }
+      .panel { padding:24px; overflow:auto; }
+      h2 { margin:0 0 18px; font-size:20px; }
+      table { width:100%; border-collapse:collapse; min-width:760px; }
+      th,td { padding:12px 10px; text-align:right; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; }
+      th:first-child,td:first-child { text-align:left; }
+      th { color:var(--muted); font-size:11px; letter-spacing:.1em; text-transform:uppercase; }
+      .positive { color:var(--cyan); } .negative { color:#ff8491; }
+      footer { color:var(--muted); margin-top:30px; font-size:13px; }
+      @media(max-width:700px){ main{padding-top:30px}.metrics{grid-template-columns:1fr}nav{margin-bottom:48px} }
+    </style>
+  </head>
+  <body>
+    <main>
+      <aside class="simulation-notice" role="note">
+        Paper-only research replay — no live orders, accounts, or funds.
+      </aside>
+      <nav><div class="wordmark">POLY</div><a href="https://github.com/arnav-goel10/poly">Source ↗</a></nav>
+      <div class="eyebrow">Read-only research replay</div>
+      <h1>Pricing uncertainty, not pretending it away.</h1>
+      <p class="lede">A reproducible view of a Rust pricing, calibration, risk, and paper-fill simulation system for BTC five-minute prediction markets.</p>
+      <div class="notice" id="notice">Loading audit evidence…</div>
+      <section class="metrics">
+        <div class="metric"><span>Ledger rows</span><strong id="rows">—</strong></div>
+        <div class="metric"><span>Distinct windows</span><strong id="windows">—</strong></div>
+        <div class="metric"><span>Forecast models</span><strong id="models">—</strong></div>
+      </section>
+      <section class="panel">
+        <h2>Window-level strategy evidence</h2>
+        <table>
+          <thead><tr><th>Mode / strategy</th><th>Windows</th><th>Total P&amp;L</th><th>Mean / window</th><th>Bootstrap 95% CI</th><th>Max drawdown</th></tr></thead>
+          <tbody id="strategy-body"></tbody>
+        </table>
+      </section>
+      <footer>Generated from versioned shadow-run artifacts. Rebuild with <code>python3 scripts/analyze_shadow_strategy.py --data fixtures/shadow-ledger-v1 --json demo/summary.json</code>.</footer>
+    </main>
+    <script>
+      const money = value => new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",maximumFractionDigits:2}).format(value);
+      fetch("summary.json").then(response => {
+        if (!response.ok) throw new Error("summary unavailable");
+        return response.json();
+      }).then(data => {
+        document.querySelector("#notice").textContent = data.disclaimer;
+        document.querySelector("#rows").textContent = data.trade_rows.toLocaleString();
+        document.querySelector("#windows").textContent = data.windows.toLocaleString();
+        document.querySelector("#models").textContent = data.forecast_models.length;
+        const rows = [...data.strategies].sort((a,b) => b.total_pnl-a.total_pnl).slice(0,12);
+        const body = document.querySelector("#strategy-body");
+        rows.forEach(row => {
+          const tr = document.createElement("tr");
+          const cells = [
+            `${row.mode} / ${row.strategy}`,
+            row.windows,
+            money(row.total_pnl),
+            money(row.mean_pnl),
+            `${money(row.boot_ci_low)} to ${money(row.boot_ci_high)}`,
+            money(row.max_drawdown),
+          ];
+          cells.forEach((value,index) => {
+            const td = document.createElement("td");
+            td.textContent = value;
+            if ([2,3].includes(index)) td.className = row[index === 2 ? "total_pnl" : "mean_pnl"] >= 0 ? "positive" : "negative";
+            tr.appendChild(td);
+          });
+          body.appendChild(tr);
+        });
+      }).catch(() => document.querySelector("#notice").textContent = "Replay summary is unavailable. Run the documented build command.");
+    </script>
+  </body>
+</html>
