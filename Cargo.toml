@@ -3,7 +3,7 @@ members = ["crates/poly_core", "crates/pricing", "crates/stats", "crates/feeds",
 resolver = "2"
 
 [workspace.dependencies]
-statrs = "0.17"
+statrs = "0.19"
 serde = { version = "1", features = ["derive"] }
 approx = "0.5"
 proptest = "1"
