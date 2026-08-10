@@ -1,0 +1,13 @@
+[package]
+name = "pricing"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+poly_core = { path = "../poly_core" }
+statrs = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+proptest = { workspace = true }

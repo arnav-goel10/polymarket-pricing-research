@@ -1,0 +1,15 @@
+[package]
+name = "execution"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+poly_core = { path = "../poly_core" }
+market = { path = "../market" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

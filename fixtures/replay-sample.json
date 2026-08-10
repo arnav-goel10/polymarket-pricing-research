@@ -1,0 +1,18 @@
+{
+  "dataset_version": "synthetic-v1",
+  "description": "Deterministic, non-production fixture spanning moneyness, volatility, skew, and binary outcomes. It validates the replay pipeline; it is not performance evidence.",
+  "samples": [
+    {"ctx":{"s_t":60180.0,"s0":60000.0,"tau":0.00000951,"mu":0.0,"sigma":0.72,"skew":0.10,"kurt":3.4},"outcome_up":true,"best_bid":0.61,"best_ask":0.64,"fill_price":0.64},
+    {"ctx":{"s_t":59820.0,"s0":60000.0,"tau":0.00000920,"mu":0.0,"sigma":0.76,"skew":-0.12,"kurt":3.8},"outcome_up":false,"best_bid":0.35,"best_ask":0.38,"fill_price":0.38},
+    {"ctx":{"s_t":60045.0,"s0":60000.0,"tau":0.00000761,"mu":0.02,"sigma":0.65,"skew":0.04,"kurt":3.2},"outcome_up":true,"best_bid":0.52,"best_ask":0.55,"fill_price":0.55},
+    {"ctx":{"s_t":59940.0,"s0":60000.0,"tau":0.00000700,"mu":-0.01,"sigma":0.68,"skew":-0.08,"kurt":3.5},"outcome_up":false,"best_bid":0.43,"best_ask":0.46,"fill_price":0.46},
+    {"ctx":{"s_t":60260.0,"s0":60000.0,"tau":0.00000571,"mu":0.01,"sigma":0.88,"skew":0.18,"kurt":4.1},"outcome_up":true,"best_bid":0.70,"best_ask":0.73,"fill_price":0.73},
+    {"ctx":{"s_t":59710.0,"s0":60000.0,"tau":0.00000540,"mu":-0.02,"sigma":0.91,"skew":-0.20,"kurt":4.3},"outcome_up":false,"best_bid":0.25,"best_ask":0.28,"fill_price":0.28},
+    {"ctx":{"s_t":60010.0,"s0":60000.0,"tau":0.00000412,"mu":0.00,"sigma":0.54,"skew":0.00,"kurt":3.0},"outcome_up":false,"best_bid":0.49,"best_ask":0.52,"fill_price":0.52},
+    {"ctx":{"s_t":59990.0,"s0":60000.0,"tau":0.00000380,"mu":0.00,"sigma":0.58,"skew":0.00,"kurt":3.1},"outcome_up":true,"best_bid":0.47,"best_ask":0.50,"fill_price":0.50},
+    {"ctx":{"s_t":60320.0,"s0":60000.0,"tau":0.00000254,"mu":0.01,"sigma":1.05,"skew":0.24,"kurt":4.8},"outcome_up":true,"best_bid":0.82,"best_ask":0.85,"fill_price":0.85},
+    {"ctx":{"s_t":59680.0,"s0":60000.0,"tau":0.00000222,"mu":-0.01,"sigma":1.08,"skew":-0.25,"kurt":4.9},"outcome_up":false,"best_bid":0.13,"best_ask":0.16,"fill_price":0.16},
+    {"ctx":{"s_t":60085.0,"s0":60000.0,"tau":0.00000159,"mu":0.03,"sigma":0.80,"skew":0.11,"kurt":3.7},"outcome_up":true,"best_bid":0.66,"best_ask":0.69,"fill_price":0.69},
+    {"ctx":{"s_t":59915.0,"s0":60000.0,"tau":0.00000127,"mu":-0.03,"sigma":0.82,"skew":-0.11,"kurt":3.7},"outcome_up":false,"best_bid":0.29,"best_ask":0.32,"fill_price":0.32}
+  ]
+}
