@@ -8,7 +8,7 @@ serde = { version = "1", features = ["derive"] }
 approx = "0.5"
 proptest = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 reqwest = { version = "0.12", features = ["json"] }
 alloy-primitives = "0.8"
 alloy-sol-types = "0.8"
