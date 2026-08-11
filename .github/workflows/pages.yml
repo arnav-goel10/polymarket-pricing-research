@@ -1,9 +1,6 @@
 name: Deploy research replay
 
 on:
-  push:
-    branches: [main]
-    paths: ["demo/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:

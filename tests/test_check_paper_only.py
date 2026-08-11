@@ -68,6 +68,31 @@ class PaperOnlyScannerTests(unittest.TestCase):
         self.assertIn("paper-fill simulation", readme)
         self.assertIn("no external order-submission path", readme)
 
+    def test_private_candidate_pages_deploy_is_manual_only(self) -> None:
+        workflow = Path(".github/workflows/pages.yml").read_text(
+            encoding="utf-8"
+        )
+        trigger_lines: list[str] = []
+        inside_triggers = False
+
+        for line in workflow.splitlines():
+            if line == "on:":
+                inside_triggers = True
+                continue
+            if inside_triggers and line and not line.startswith((" ", "\t")):
+                break
+            if inside_triggers:
+                trigger_lines.append(line)
+
+        triggers = {
+            line.strip().removesuffix(":")
+            for line in trigger_lines
+            if line.startswith("  ")
+            and not line.startswith("    ")
+            and line.strip().endswith(":")
+        }
+        self.assertEqual(triggers, {"workflow_dispatch"})
+
     def test_rejects_http_write_methods_targeting_order_endpoints(self) -> None:
         probes = {
             "crates/probe/src/http.rs": (
