@@ -8,7 +8,7 @@
 
 ## Unit of analysis
 
-Model variants in the same five-minute market are dependent. Analysis therefore aggregates P&L at `(mode, strategy, t0_millis)` and treats the window—not each fill—as the observation. Bootstrap confidence intervals resample windows, while Holm correction controls family-wise error across strategy cells.
+Model variants in the same five-minute market are dependent. Analysis therefore aggregates P&L at `(mode, strategy, t0_millis)` and treats the window, not each fill, as the observation. Bootstrap confidence intervals resample windows, while Holm correction controls family-wise error across strategy cells.
 
 ## Metrics
 
