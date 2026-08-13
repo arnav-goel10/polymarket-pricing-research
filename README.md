@@ -1,6 +1,6 @@
 # Polymarket Pricing Research
 
-[![CI](https://github.com/arnav-goel10/poly/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/poly/actions/workflows/ci.yml)
+[![CI](https://github.com/arnav-goel10/polymarket-pricing-research/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/polymarket-pricing-research/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-2021-000?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
