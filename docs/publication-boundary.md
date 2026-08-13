@@ -14,6 +14,6 @@ This repository is a paper-only research system. It may observe public market an
 
 ## Executable enforcement
 
-[`scripts/check_paper_only.py`](../scripts/check_paper_only.py) scans every declared public capability surface (Rust crates, scripts, workflows, documentation, demo assets, fixtures, manifests, and environment templates) for credential, signer, exchange-SDK, and authenticated order-path indicators. CI fails with the file, line, and capability category for every finding.
+[`scripts/check_paper_only.py`](../scripts/check_paper_only.py) scans every declared public capability surface—including Rust crates, scripts, workflows, documentation, demo assets, fixtures, manifests, and environment templates—for credential, signer, exchange-SDK, and authenticated order-path indicators. CI fails with the file, line, and capability category for every finding.
 
 The scanner deliberately allows paper-fill vocabulary and implementations such as `paper_engine.fill(decision)`: those operations mutate only the simulated portfolio and audit ledger. Scanner unit tests use adversarial temporary repositories and therefore remain outside the public capability scan roots.
