@@ -67,7 +67,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
       - name: Build fuzz targets and run each for 60 s
         run: |
           for t in rtds_frame binance_message clob_book_stream recording_reader; do
