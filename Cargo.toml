@@ -13,7 +13,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "charset", "http2", "system-proxy"] }
 alloy-primitives = "1.6"
 alloy-sol-types = "1.6"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 hex = "0.4"
 crc32fast = "1"
