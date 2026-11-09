@@ -21,7 +21,7 @@
 {"timestamp":"2026-11-09T04:58:50.887755Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
 resync count in log: 17
 
-## After venue-top reconciliation (working tree on top of 0257461)
+## After venue-top reconciliation (working tree on top of 0257461; its market crate was committed unchanged as c94542f, which also carries a later RTDS empty-frame fix)
 # Command: target/release/examples/book_health <live yes_token_id> 150
 observed 150s: books_published=67920 resyncs=0 malformed=0 sessions=1 crossed_books_published=0
 

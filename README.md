@@ -4,21 +4,21 @@
 [![Rust](https://img.shields.io/badge/Rust-2021-000?logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A real-time market-data and pricing engine in Rust. It streams public order-book and price feeds for Polymarket's Bitcoin five-minute up/down markets, rebuilds each order book locally, and prices every contract with four probability models in about 1.5 microseconds.
+A real-time market-data and pricing engine in Rust, run as a paper-only simulation. It reads public price and order-book feeds for Polymarket's five-minute Bitcoin up/down markets, rebuilds each order book locally, and estimates the probability of each outcome with four pricing models in about 1.5 microseconds. It never places an order.
 
 | | |
 | --- | ---: |
-| Order-book messages parsed and applied, one core | **1.7 million / s** |
-| Full pipeline, every event re-priced by four models | **630,000 events / s** |
-| Per-event latency, p50 / p99 | **1.9 µs / 3.1 µs** |
-| Automated tests (property-based and fault-injection included) | **216** |
-| Live run on the public feed | **67,920 book updates, 0 resyncs, 0 crossed books** |
+| Order-book messages parsed and applied, one core ([raw](bench-results/2026-11-09.txt)) | **1.7 million / s** |
+| Full pipeline, every event re-priced by four models ([raw](bench-results/2026-11-09.txt)) | **630,000 events / s** |
+| Per-event latency, p50 / p99 ([raw](bench-results/2026-11-09.txt)) | **1.9 µs / 3.1 µs** |
+| Automated Rust tests, property-based and fault-injection included ([raw](bench-results/ci-local.txt)) | **216** |
+| 150 s live check on the public feed ([raw](bench-results/live-book-health.txt)) | **67,920 book updates, 0 resyncs, 0 crossed books** |
 
-Measured on an Apple M5 laptop. Every number links to its raw output in [Benchmarks](#benchmarks).
+Measured on an Apple M5 laptop. Method and full tables are under [Benchmarks](#benchmarks).
 
-> **Simulation boundary:** every decision and fill is a paper-fill simulation. The repository contains no wallet, signer, or credentialed exchange client, and no external order-submission path. See the [publication boundary](docs/publication-boundary.md).
+> **Simulation boundary:** every decision and fill is a paper-fill simulation. The project has no wallet, signer, credentialed exchange client or order-submission path. See the [publication boundary](docs/publication-boundary.md).
 
-![Dashboard: seven models pricing the current five-minute window from live public data](docs/img/dashboard.png)
+![Paper-only research dashboard: four models plus calibrated and blended variants estimating the current five-minute window from live public data](docs/img/dashboard.png)
 
 ## Architecture
 
@@ -43,7 +43,7 @@ flowchart LR
 | `market` | Market discovery and order books. `LocalBook` rebuilds a book from a snapshot plus deltas and detects gaps, duplicates, malformed levels and crossed books. |
 | `pricing` | Digital-option pricing models (Black-Scholes, Student-t, Cornish-Fisher, COS Variance-Gamma), online Platt calibration and model averaging. |
 | `stats` | Rolling moments and volatility estimators. |
-| `execution` | Paper-fill simulation, edge selection and risk limits. |
+| `execution` | Paper-fill simulation, simulated strategy selection and paper risk limits. |
 | `app` | Orchestration, the Axum dashboard and `/metrics`, event replay, benchmarks. |
 
 More detail in [docs/architecture.md](docs/architecture.md).
@@ -52,7 +52,7 @@ More detail in [docs/architecture.md](docs/architecture.md).
 
 Each feed runs under one supervisor. A dropped socket, 30 seconds of silence, or a book that can no longer be trusted ends the session. The supervisor then reconnects with exponential backoff from 250 ms to a 10 s cap, and a session that stayed up for 30 s resets the delay.
 
-The order book never hands the pricing code a state it cannot vouch for:
+When the book cannot be trusted, it stops publishing and resyncs:
 
 - **Gaps and duplicates.** With per-message sequence numbers, a repeated message is ignored and a missing one stops the book until a fresh snapshot arrives.
 - **Malformed input.** One bad level (NaN, negative size, price outside 0 to 1) rejects the whole message, and the book resyncs.
@@ -95,10 +95,10 @@ Results from [`bench-results/2026-11-09.txt`](bench-results/2026-11-09.txt) (App
 | Price one contract, Black-Scholes | 8.7 ns |
 | Price one contract, COS Variance-Gamma (64 terms) | 1.41 µs |
 | Price one contract, four-model ensemble | 1.53 µs |
-| Merge three feeds into one time-ordered stream | 117 M events/s |
+| Merge three feeds into one time-ordered stream | 118 M events/s |
 | Replay pipeline, 100k events, re-price on every event | 633,000 events/s |
 
-Per-event latency over 1,000,000 replayed events (`cargo run --release -p app --bin latency_report`):
+Per-event latency over 999,999 replayed events (`cargo run --release -p app --bin latency_report`):
 
 | Events | p50 | p99 | p99.9 |
 | --- | ---: | ---: | ---: |
@@ -106,16 +106,16 @@ Per-event latency over 1,000,000 replayed events (`cargo run --release -p app --
 | Order-book frames | 2.0 µs | 3.3 µs | 11.0 µs |
 | Price ticks | 1.4 µs | 2.0 µs | 7.5 µs |
 
-The replay input is a generated synthetic session with live-like message ratios: per second, one Chainlink tick, ten Binance ticks and twenty book deltas. The COS Variance-Gamma model takes most of the per-event time. Each latency sample includes one pair of clock reads.
+The replay input is a generated synthetic session with live-like message ratios: per second, one Chainlink tick, ten Binance ticks and twenty book deltas. The COS Variance-Gamma model takes most of the per-event time. Each latency sample includes one pair of clock reads, which is why the same run's wall-clock rate is 544,000 events/s against Criterion's 633,000.
 
 ## Research findings
 
-The engine was built to test one question. Can digital-option models price these contracts well, and does any edge survive a correction for testing many correlated variants?
+I built the engine to find out whether digital-option models price these contracts well, and whether any apparent edge survives a correction for testing many correlated variants. They do the first. Nothing survives the second.
 
 Source: the committed paper ledger [`fixtures/shadow-ledger-v1`](fixtures/shadow-ledger-v1) (5,000 paper-fill rows over 334 five-minute windows, 500 scored forecasts per model), summarised in [`demo/summary.json`](demo/summary.json) and the [research audit](docs/research-audit.md).
 
-- **The models forecast well.** All seven variants score a Brier of 0.096 to 0.101, against 0.249 for a constant forecast at the observed up-rate. The plain Student-t model scores best (Brier 0.0958, log loss 0.311).
-- **No variant has a reliable edge.** 6 of 22 strategy cells have a bootstrap interval above zero before adjustment. None survives a Holm correction, and the smallest adjusted p-value is 0.374.
+- **Forecasts.** All seven variants score a Brier of 0.096 to 0.101, against 0.249 for a constant forecast at the observed up-rate. The plain Student-t model scores best (Brier 0.0958, log loss 0.311). The ledger does not score the market mid on the same windows, so this does not show the models beat the market.
+- **Simulated P&L.** 6 of 22 strategy cells have a bootstrap interval above zero before adjustment. None survives a Holm correction, and the smallest adjusted p-value is 0.374.
 
 Limits of the evidence:
 
