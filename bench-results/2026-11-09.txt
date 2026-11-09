@@ -1,0 +1,96 @@
+# Poly benchmark run 2026-11-09 14:06 +08, commit c94542f
+# rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)
+# cpu: Apple M5, 10 cores, 16 GB RAM, macOS 27.2
+# command: scripts/bench.sh (cargo bench -p market -p pricing -p app; cargo run --release -p app --bin latency_report -- 1000000)
+
+replay/merge_3_feeds    time:   [840.01 µs 849.98 µs 860.75 µs]
+                        thrpt:  [116.15 Melem/s 117.62 Melem/s 119.02 Melem/s]
+                 change:
+                        time:   [−1.8224% −0.8092% +0.1659%] (p = 0.14 > 0.05)
+                        thrpt:  [−0.1657% +0.8158% +1.8562%]
+                        No change in performance detected.
+replay/pipeline_full_reprice
+                        time:   [156.23 ms 157.86 ms 159.60 ms]
+                        thrpt:  [626.41 Kelem/s 633.34 Kelem/s 639.91 Kelem/s]
+                 change:
+                        time:   [−7.6134% −5.9788% −4.5765%] (p = 0.00 < 0.05)
+                        thrpt:  [+4.7960% +6.3590% +8.2408%]
+                        Performance has improved.
+
+book_update/local_book_apply_delta
+                        time:   [17.248 ns 17.273 ns 17.301 ns]
+                        change: [+24.437% +25.987% +27.387%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 8 outliers among 100 measurements (8.00%)
+  4 (4.00%) high mild
+  4 (4.00%) high severe
+book_update/legacy_sort_per_update
+                        time:   [17.224 ns 17.244 ns 17.264 ns]
+                        change: [−3.9406% −2.4037% −1.2097%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 8 outliers among 100 measurements (8.00%)
+  5 (5.00%) high mild
+  3 (3.00%) high severe
+
+book_stream/price_change_frames_x64
+                        time:   [36.482 µs 37.601 µs 39.157 µs]
+                        thrpt:  [1.6344 Melem/s 1.7021 Melem/s 1.7543 Melem/s]
+                 change:
+                        time:   [+4.0817% +7.8194% +12.685%] (p = 0.00 < 0.05)
+                        thrpt:  [−11.257% −7.2523% −3.9216%]
+                        Performance has regressed.
+Found 10 outliers among 100 measurements (10.00%)
+  1 (1.00%) high mild
+  9 (9.00%) high severe
+
+price_contract/black_scholes
+                        time:   [8.6702 ns 8.7372 ns 8.8275 ns]
+                        change: [−1.1318% −0.4043% +0.5024%] (p = 0.37 > 0.05)
+                        No change in performance detected.
+Found 12 outliers among 100 measurements (12.00%)
+  7 (7.00%) high mild
+  5 (5.00%) high severe
+price_contract/student_t
+                        time:   [42.435 ns 42.632 ns 42.904 ns]
+                        change: [−0.0251% +0.1963% +0.4562%] (p = 0.16 > 0.05)
+                        No change in performance detected.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+price_contract/sharp    time:   [10.752 ns 11.100 ns 11.553 ns]
+                        change: [+4.6972% +6.4529% +8.4534%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 17 outliers among 100 measurements (17.00%)
+  4 (4.00%) low mild
+  7 (7.00%) high mild
+  6 (6.00%) high severe
+price_contract/cornish_fisher
+                        time:   [10.541 ns 10.560 ns 10.580 ns]
+                        change: [−2.1836% −1.8122% −1.4476%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 14 outliers among 100 measurements (14.00%)
+  7 (7.00%) high mild
+  7 (7.00%) high severe
+price_contract/cos_vg_64
+                        time:   [1.3632 µs 1.4064 µs 1.4469 µs]
+                        change: [−2.1115% −0.3887% +1.5612%] (p = 0.68 > 0.05)
+                        No change in performance detected.
+Found 12 outliers among 100 measurements (12.00%)
+  10 (10.00%) high mild
+  2 (2.00%) high severe
+price_contract/ensemble_4_models
+                        time:   [1.5009 µs 1.5339 µs 1.5685 µs]
+                        change: [+1.7465% +3.2780% +5.3238%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 13 outliers among 100 measurements (13.00%)
+  5 (5.00%) high mild
+  8 (8.00%) high severe
+
+
+## latency_report (1,000,000 events)
+events=999999 repriced=999996 resyncs=0
+merge_3_feeds: 13.5 ms (74.0 M events/s)
+pipeline: 1.838 s wall incl. timing overhead, 544092 events/s
+all_events   n=999999   p50=  1875 ns  p99=  3083 ns  p99.9=  9916 ns  max= 836792 ns
+book_frames  n=645161   p50=  1959 ns  p99=  3292 ns  p99.9= 11042 ns  max= 583833 ns
+price_ticks  n=354838   p50=  1375 ns  p99=  2000 ns  p99.9=  7542 ns  max= 836792 ns
