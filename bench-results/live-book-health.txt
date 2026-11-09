@@ -1,0 +1,38 @@
+# Live order-book health on the public Polymarket market channel, 2026-11-09 +08
+
+## Before venue-top reconciliation (commit 0257461, shadow app, first ~90 s)
+# Source: JSON logs of target/release/app --mode shadow; and bench-results/live-metrics-sample.txt
+{"timestamp":"2026-11-09T04:55:03.411748Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:55:07.387207Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:55:18.725499Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:55:25.151332Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:55:31.220149Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:55:58.002076Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:56:27.596175Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:57:08.188363Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:57:12.729647Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:57:17.880652Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:57:23.357286Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:57:27.710014Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:57:43.657449Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:58:00.046781Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:58:12.544187Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:58:35.683776Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:58:50.887755Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+resync count in log: 17
+
+## After venue-top reconciliation (working tree on top of 0257461)
+# Command: target/release/examples/book_health <live yes_token_id> 150
+observed 150s: books_published=67920 resyncs=0 malformed=0 sessions=1 crossed_books_published=0
+
+# Command: curl -s 127.0.0.1:8099/metrics (shadow app, same build, uptime 161.7 s)
+poly_feed_messages_total{feed="clob_book"} 93487
+poly_feed_malformed_total{feed="clob_book"} 0
+poly_feed_reconnects_total{feed="clob_book"} 0
+poly_feed_resyncs_total{feed="clob_book"} 0
+poly_feed_connected{feed="clob_book"} 1
+poly_feed_messages_per_second{feed="clob_book"} 1092.4
+poly_feed_last_message_age_seconds{feed="clob_book"} 0.003
+poly_feed_lag_seconds{feed="clob_book"} 0.123
+poly_feed_stale{feed="clob_book"} 0
+poly_uptime_seconds 161.716577459

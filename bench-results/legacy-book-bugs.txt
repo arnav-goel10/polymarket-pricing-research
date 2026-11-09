@@ -4,3 +4,13 @@ LEGACY late delta (ts 300 after ts 456): size at 0.50 = 2
 LEGACY crossed delta published: best_bid=Some(0.6) best_ask=Some(0.52)
 LEGACY malformed snapshot published as partial book: bids=1 asks=0
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s
+
+# Note added after live observation (bench-results/live-book-health.txt):
+# - Line 1 (late delta applied) is NOT a bug. Polymarket timestamps are not
+#   ordered across event types on the wire, and TCP already orders messages
+#   within a connection, so arrival order is the right sequence.
+# - Line 2 is the real defect: the venue reports fills as trades, so consumed
+#   ask/bid levels stayed in the local book and its top went crossed. The
+#   current code reconciles each delta with the venue-reported best bid/ask.
+# - Line 3 (a malformed snapshot published as a partial book) is fixed: such
+#   a snapshot now forces a resync.

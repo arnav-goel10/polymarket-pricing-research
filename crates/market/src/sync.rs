@@ -3,7 +3,10 @@
 //! [`LocalBook`] owns one side-sorted book and decides, for every incoming
 //! message, whether it can be applied safely. Anything that would leave the
 //! book in an unknown state (a gap in the sequence, a malformed level, a book
-//! that ends up crossed) flips the book to *desynced*. A desynced book keeps
+//! that ends up crossed) flips the book to *desynced*. When the venue reports
+//! its own best bid and ask alongside a delta, levels the venue no longer
+//! shows at the top (consumed by trades) are pruned before the crossed check;
+//! see [`LocalBook::apply_delta_with_top`]. A desynced book keeps
 //! rejecting deltas until a fresh snapshot arrives, and callers must treat it
 //! as stale data. This is the resync contract the live feed and the property
 //! tests rely on.
@@ -81,6 +84,7 @@ pub struct LocalBook {
     last_seq: Option<u64>,
     synced: bool,
     resyncs_needed: u64,
+    pruned: u64,
 }
 
 impl LocalBook {
@@ -104,6 +108,7 @@ impl LocalBook {
             last_seq: None,
             synced: false,
             resyncs_needed: 0,
+            pruned: 0,
         }
     }
 
@@ -190,6 +195,21 @@ impl LocalBook {
     /// Apply one message worth of level changes carrying sequence key `seq`.
     /// The message is applied atomically: if any level is malformed, none are.
     pub fn apply_delta(&mut self, seq: u64, changes: &[LevelDelta]) -> ApplyOutcome {
+        self.apply_delta_with_top(seq, changes, VenueTop::default())
+    }
+
+    /// [`apply_delta`](Self::apply_delta), then reconcile with the venue's
+    /// reported top of book before the crossed check: bids priced above the
+    /// venue's best bid and asks below its best ask are removed. Some venues
+    /// (Polymarket among them) report fills as trades rather than as level
+    /// removals, so without this the local book keeps consumed levels and
+    /// ends up crossed. Pruned levels are counted in [`pruned_levels`](Self::pruned_levels).
+    pub fn apply_delta_with_top(
+        &mut self,
+        seq: u64,
+        changes: &[LevelDelta],
+        top: VenueTop,
+    ) -> ApplyOutcome {
         if !self.synced {
             return ApplyOutcome::AwaitingSnapshot;
         }
@@ -223,11 +243,37 @@ impl LocalBook {
             upsert(levels, c.price, c.size, c.side);
         }
         self.last_seq = Some(seq);
+        self.reconcile(top);
         if self.crossed() {
             return self.desync(ApplyOutcome::Crossed);
         }
         ApplyOutcome::Applied
     }
+
+    fn reconcile(&mut self, top: VenueTop) {
+        let before = self.book.bids.len() + self.book.asks.len();
+        if let Some(bb) = top.best_bid.filter(|p| p.is_finite()) {
+            self.book.bids.retain(|l| l.price <= bb + PRICE_EPS);
+        }
+        if let Some(ba) = top.best_ask.filter(|p| p.is_finite()) {
+            self.book.asks.retain(|l| l.price >= ba - PRICE_EPS);
+        }
+        self.pruned += (before - self.book.bids.len() - self.book.asks.len()) as u64;
+    }
+
+    /// Levels removed so far because the venue's top of book no longer
+    /// showed them.
+    pub fn pruned_levels(&self) -> u64 {
+        self.pruned
+    }
+}
+
+/// Best bid and ask as reported by the venue with a message, when it reports
+/// them. `None` means "not reported", not "empty side".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VenueTop {
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
 }
 
 /// Ordering used to keep each side best-first: bids descending, asks ascending.
@@ -401,6 +447,32 @@ mod tests {
             ApplyOutcome::Applied
         );
         assert_eq!(b.book().best_bid(), Some(0.46));
+    }
+
+    #[test]
+    fn venue_top_prunes_levels_consumed_by_trades() {
+        let mut b = seeded();
+        // A buy at 0.52 filled against the 0.52 ask; the venue reports the
+        // resting remainder as a new 0.52 bid and its new top as 0.52 / 0.53,
+        // but sends no removal for the consumed ask.
+        let out = b.apply_delta_with_top(
+            11,
+            &[d(BookSide::Bid, 0.52, 3.0)],
+            VenueTop {
+                best_bid: Some(0.52),
+                best_ask: Some(0.53),
+            },
+        );
+        assert_eq!(out, ApplyOutcome::Applied);
+        assert_eq!(b.book().best_bid(), Some(0.52));
+        assert_eq!(b.book().best_ask(), Some(0.53));
+        assert_eq!(b.pruned_levels(), 1);
+        // Without the venue top the same delta is a crossed book.
+        let mut b = seeded();
+        assert_eq!(
+            b.apply_delta(11, &[d(BookSide::Bid, 0.52, 3.0)]),
+            ApplyOutcome::Crossed
+        );
     }
 
     #[test]

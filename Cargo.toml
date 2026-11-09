@@ -7,6 +7,7 @@ statrs = "0.19"
 serde = { version = "1", features = ["derive"] }
 approx = "0.5"
 proptest = "1"
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "charset", "http2", "system-proxy"] }

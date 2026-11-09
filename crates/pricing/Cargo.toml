@@ -9,5 +9,10 @@ statrs = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 approx = { workspace = true }
 proptest = { workspace = true }
+
+[[bench]]
+name = "pricing"
+harness = false

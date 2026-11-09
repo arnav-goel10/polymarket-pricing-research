@@ -84,10 +84,11 @@ pub fn parse_frame(raw: &str) -> Vec<Tick> {
 }
 
 /// A frame that yielded no ticks is malformed if it is not JSON (keep-alive
-/// `PONG` aside) or if it is on a price topic but carries no usable price.
+/// `PONG` and the empty subscription ack aside) or if it is on a price topic but carries no usable price.
 /// Frames on other topics are expected noise.
 fn is_malformed(raw: &str) -> bool {
-    if raw == "PONG" {
+    // RTDS acknowledges a subscription with an empty text frame.
+    if raw == "PONG" || raw.trim().is_empty() {
         return false;
     }
     match serde_json::from_str::<Value>(raw) {

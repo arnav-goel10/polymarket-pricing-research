@@ -4,6 +4,7 @@ pub mod convergence;
 pub mod engine;
 pub mod latency;
 pub mod metrics;
+pub mod replay_stream;
 pub mod resolution;
 pub mod server;
 pub mod signals;

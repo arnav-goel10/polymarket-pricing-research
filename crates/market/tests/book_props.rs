@@ -6,7 +6,9 @@
 //! or reports itself out of sync. It must never hold a wrong book while
 //! claiming to be in sync.
 
-use market::{ApplyOutcome, BookSide, Level, LevelDelta, LocalBook, OrderBook, SeqPolicy};
+use market::{
+    ApplyOutcome, BookSide, Level, LevelDelta, LocalBook, OrderBook, SeqPolicy, VenueTop,
+};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
@@ -325,5 +327,33 @@ proptest! {
         prop_assert!(!lb.is_synced());
         prop_assert_eq!(lb.book(), &before);
         assert_well_formed(&lb);
+    }
+
+    /// Reconciling with any venue top (best bid below best ask) leaves a
+    /// book that is uncrossed, has nothing better than the venue's top, and
+    /// keeps every level at or behind the top untouched.
+    #[test]
+    fn venue_top_reconciliation_only_prunes_through_the_top(
+        snap in snapshot(),
+        changes in prop::collection::vec(any_change(), 1..6),
+        bb in 1u32..=998,
+        gap in 1u32..=50,
+    ) {
+        let ba = (bb + gap).min(999);
+        prop_assume!(ba > bb);
+        let mut lb = start(&snap);
+        let mut reference = snap.clone();
+        reference.apply(&changes);
+        let out = lb.apply_delta_with_top(
+            SNAP_SEQ + 1,
+            &to_deltas(&changes),
+            VenueTop { best_bid: Some(bb as f64 / TICK), best_ask: Some(ba as f64 / TICK) },
+        );
+        prop_assert_eq!(out, ApplyOutcome::Applied);
+        prop_assert!(lb.is_synced());
+        assert_well_formed(&lb);
+        reference.bids.retain(|&t, _| t <= bb);
+        reference.asks.retain(|&t, _| t >= ba);
+        prop_assert_eq!(as_ticks(lb.book()), ref_ticks(&reference));
     }
 }

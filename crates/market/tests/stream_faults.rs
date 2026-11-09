@@ -100,17 +100,19 @@ async fn bad_json_frame_requests_resync() {
 }
 
 #[tokio::test]
-async fn late_delta_is_dropped_not_applied() {
+async fn fills_reported_only_as_trades_are_reconciled() {
     let (res, books, _m) = run_one(vec![
         snap(100, 0.49, 0.52),
-        change(200, "BUY", "0.50", "8"),
-        change(150, "BUY", "0.50", "2"), // older than the book: ignored
+        text(r#"{"event_type":"last_trade_price","asset_id":"tok","price":"0.52","size":"10","side":"BUY","timestamp":"110"}"#),
+        text(r#"{"event_type":"price_change","timestamp":"110","price_changes":[{"asset_id":"tok","price":"0.52","size":"4","side":"BUY","best_bid":"0.52","best_ask":"0.6"}]}"#),
         Step::Close,
     ])
     .await;
     assert!(res.is_err());
     assert_eq!(books.len(), 2);
-    assert_eq!(books[1].book.bids[0].size, 8.0);
+    assert_consistent(&books);
+    assert_eq!(books[1].book.best_bid(), Some(0.52));
+    assert_eq!(books[1].book.best_ask(), None, "the only ask was consumed");
 }
 
 #[tokio::test]

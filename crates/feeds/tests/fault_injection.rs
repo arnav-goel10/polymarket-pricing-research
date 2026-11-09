@@ -41,6 +41,7 @@ async fn rtds_connection_dropped_mid_stream_returns_error_after_delivering_ticks
 #[tokio::test]
 async fn rtds_malformed_frames_are_counted_and_skipped() {
     let url = serve(vec![vec![
+        text(""), // subscription ack: not malformed
         text("{not json"),
         text(r#"{"topic":"crypto_prices","payload":{"value":"NaN-ish"}}"#),
         text(r#"{"topic":"comments","payload":{}}"#),

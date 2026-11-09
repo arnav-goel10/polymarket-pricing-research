@@ -6,5 +6,5 @@ pub mod window;
 
 pub use book::{FillSim, Level, OrderBook};
 pub use gamma::DiscoveredMarket;
-pub use sync::{ApplyOutcome, BookSide, LevelDelta, LocalBook, SeqPolicy};
+pub use sync::{ApplyOutcome, BookSide, LevelDelta, LocalBook, SeqPolicy, VenueTop};
 pub use window::{Window, SECONDS_PER_YEAR};

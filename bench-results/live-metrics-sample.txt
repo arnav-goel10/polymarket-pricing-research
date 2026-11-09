@@ -1,0 +1,61 @@
+# Live /metrics scrape, 2026-11-09 12:56 +08, shadow mode on public feeds, commit 0257461 + uncommitted bench work
+# Command: BIND_ADDR=127.0.0.1:8099 LOG_FORMAT=json target/release/app --mode shadow; curl -s 127.0.0.1:8099/metrics
+# HELP poly_feed_messages_total Well-formed messages received.
+# TYPE poly_feed_messages_total counter
+poly_feed_messages_total{feed="rtds"} 164
+poly_feed_messages_total{feed="binance"} 29943
+poly_feed_messages_total{feed="clob_book"} 40895
+# HELP poly_feed_malformed_total Frames that could not be decoded.
+# TYPE poly_feed_malformed_total counter
+poly_feed_malformed_total{feed="rtds"} 1
+poly_feed_malformed_total{feed="binance"} 0
+poly_feed_malformed_total{feed="clob_book"} 0
+# HELP poly_feed_reconnects_total Reconnects after a drop, timeout or resync.
+# TYPE poly_feed_reconnects_total counter
+poly_feed_reconnects_total{feed="rtds"} 0
+poly_feed_reconnects_total{feed="binance"} 0
+poly_feed_reconnects_total{feed="clob_book"} 6
+# HELP poly_feed_resyncs_total Order-book resyncs after a gap, malformed level or crossed book.
+# TYPE poly_feed_resyncs_total counter
+poly_feed_resyncs_total{feed="rtds"} 0
+poly_feed_resyncs_total{feed="binance"} 0
+poly_feed_resyncs_total{feed="clob_book"} 6
+# HELP poly_feed_connected 1 while the feed socket is open.
+# TYPE poly_feed_connected gauge
+poly_feed_connected{feed="rtds"} 1
+poly_feed_connected{feed="binance"} 1
+poly_feed_connected{feed="clob_book"} 1
+# HELP poly_feed_messages_per_second Messages per second over the last 10 complete seconds.
+# TYPE poly_feed_messages_per_second gauge
+poly_feed_messages_per_second{feed="rtds"} 1
+poly_feed_messages_per_second{feed="binance"} 97.4
+poly_feed_messages_per_second{feed="clob_book"} 645.4
+# HELP poly_feed_last_message_age_seconds Seconds since the last message.
+# TYPE poly_feed_last_message_age_seconds gauge
+poly_feed_last_message_age_seconds{feed="rtds"} 0.83
+poly_feed_last_message_age_seconds{feed="binance"} 0.15
+poly_feed_last_message_age_seconds{feed="clob_book"} 0.016
+# HELP poly_feed_lag_seconds Receive time minus exchange timestamp of the latest message.
+# TYPE poly_feed_lag_seconds gauge
+poly_feed_lag_seconds{feed="rtds"} 1.39
+poly_feed_lag_seconds{feed="binance"} 0.044
+poly_feed_lag_seconds{feed="clob_book"} 0.121
+# HELP poly_feed_stale 1 when the feed is older than its freshness threshold; decisions are blocked.
+# TYPE poly_feed_stale gauge
+poly_feed_stale{feed="rtds"} 0
+poly_feed_stale{feed="binance"} 0
+poly_feed_stale{feed="clob_book"} 0
+# HELP poly_uptime_seconds Process uptime.
+# TYPE poly_uptime_seconds gauge
+poly_uptime_seconds 106.805076167
+
+# First JSON log lines
+{"timestamp":"2026-11-09T04:54:31.414253Z","level":"INFO","fields":{"message":"starting app","mode":"Shadow"},"target":"app"}
+dashboard: http://127.0.0.1:8099  (mode: Shadow)
+{"timestamp":"2026-11-09T04:55:03.411748Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+14
+{"timestamp":"2026-11-09T04:55:03.411748Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:55:03.412166Z","level":"WARN","fields":{"message":"feed disconnected; reconnecting","feed":"clob_book","error":"Some(Desync(Crossed))","retry_in_ms":250},"target":"app"}
+{"timestamp":"2026-11-09T04:55:07.387207Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
+{"timestamp":"2026-11-09T04:55:07.387709Z","level":"WARN","fields":{"message":"feed disconnected; reconnecting","feed":"clob_book","error":"Some(Desync(Crossed))","retry_in_ms":500},"target":"app"}
+{"timestamp":"2026-11-09T04:55:18.725499Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}

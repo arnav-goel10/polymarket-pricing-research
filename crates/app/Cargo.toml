@@ -19,5 +19,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
 
 [dev-dependencies]
+criterion = { workspace = true }
 approx = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+
+[[bench]]
+name = "replay"
+harness = false

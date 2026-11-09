@@ -1,5 +1,5 @@
 use crate::book::{Level, OrderBook};
-use crate::sync::{ApplyOutcome, BookSide, LevelDelta, LocalBook, SeqPolicy};
+use crate::sync::{ApplyOutcome, BookSide, LevelDelta, LocalBook, SeqPolicy, VenueTop};
 use feeds::conn::{BoxError, ConnOpts};
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -128,14 +128,20 @@ impl std::error::Error for StreamError {}
 /// The Polymarket market channel as a state machine: feed it raw frames, get
 /// back consistent books or a resync request.
 ///
-/// Polymarket publishes no per-message sequence number, so ordering uses the
-/// exchange timestamp under [`SeqPolicy::Monotonic`]: snapshots and deltas
-/// older than the current book are dropped, and every applied message is
-/// checked for malformed levels and a crossed book.
+/// Polymarket publishes no per-message sequence number, and its timestamps
+/// are not ordered across event types on the wire (a `best_bid_ask` stamped
+/// later can arrive before a `price_change` stamped earlier). Within one
+/// connection TCP already guarantees order and no duplicates, so messages are
+/// sequenced by arrival. Each `price_change` entry carries the venue's best
+/// bid and ask after that change; the local book is reconciled against it,
+/// because fills arrive as trades and do not always come with a level
+/// removal. A book that is still crossed after reconciliation, a malformed
+/// level or an undecodable frame ends the session so the caller resyncs.
 #[derive(Debug, Clone)]
 pub struct ClobBookStream {
     token_id: String,
     book: LocalBook,
+    arrivals: u64,
     scratch: Vec<LevelDelta>,
 }
 
@@ -143,7 +149,8 @@ impl ClobBookStream {
     pub fn new(token_id: impl Into<String>) -> Self {
         Self {
             token_id: token_id.into(),
-            book: LocalBook::probability(SeqPolicy::Monotonic),
+            book: LocalBook::probability(SeqPolicy::Contiguous),
+            arrivals: 0,
             scratch: Vec::with_capacity(8),
         }
     }
@@ -152,11 +159,9 @@ impl ClobBookStream {
         &self.book
     }
 
-    fn seq_for(&self, v: &Value) -> u64 {
-        parse_ts_millis(v)
-            .map(|t| t.max(0) as u64)
-            .or(self.book.last_seq())
-            .unwrap_or(0)
+    fn next_seq(&mut self) -> u64 {
+        self.arrivals += 1;
+        self.arrivals
     }
 
     fn emit(&self, v: &Value) -> StreamBook {
@@ -167,25 +172,25 @@ impl ClobBookStream {
     }
 
     /// Apply one decoded event. `Ok(None)` means nothing to publish (another
-    /// token, an ignored event type, or a stale message).
+    /// token, an ignored event type, or no snapshot yet).
     pub fn on_event(&mut self, v: &Value) -> Result<Option<StreamBook>, StreamError> {
         match v.get("event_type").and_then(|x| x.as_str()) {
             Some("book") => {
                 if v.get("asset_id").and_then(|x| x.as_str()) != Some(self.token_id.as_str()) {
                     return Ok(None);
                 }
-                let seq = self.seq_for(v);
                 let (Some(bids), Some(asks)) = (strict_levels(v, "bids"), strict_levels(v, "asks"))
                 else {
-                    return Err(StreamError::Desync(ApplyOutcome::Malformed));
+                    return Err(StreamError::Desync(self.book.mark_desynced()));
                 };
+                let seq = self.next_seq();
                 let outcome = self.book.apply_snapshot(seq, &bids, &asks);
                 self.publish(outcome, v)
             }
             Some("price_change") => {
-                let seq = self.seq_for(v);
                 self.scratch.clear();
                 let mut malformed = false;
+                let mut top = VenueTop::default();
                 if let Some(changes) = v.get("price_changes").and_then(|x| x.as_array()) {
                     for c in changes {
                         if c.get("asset_id").and_then(|x| x.as_str())
@@ -207,19 +212,27 @@ impl ClobBookStream {
                             }
                             _ => malformed = true,
                         }
+                        // The venue's top after this change. An empty side is
+                        // reported as "0" (bids) or "1" (asks), which correctly
+                        // prunes every local level on that side.
+                        top = VenueTop {
+                            best_bid: num(c, "best_bid"),
+                            best_ask: num(c, "best_ask"),
+                        };
                     }
                 }
-                if malformed {
-                    if self.book.is_synced() {
-                        return Err(StreamError::Desync(self.book.mark_desynced()));
-                    }
+                if !self.book.is_synced() {
                     return Ok(None);
+                }
+                if malformed {
+                    return Err(StreamError::Desync(self.book.mark_desynced()));
                 }
                 if self.scratch.is_empty() {
                     return Ok(None);
                 }
+                let seq = self.next_seq();
                 let changes = std::mem::take(&mut self.scratch);
-                let outcome = self.book.apply_delta(seq, &changes);
+                let outcome = self.book.apply_delta_with_top(seq, &changes, top);
                 self.scratch = changes;
                 self.publish(outcome, v)
             }
@@ -410,17 +423,21 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_delta_is_dropped() {
+    fn fill_without_level_removal_is_reconciled_from_venue_top() {
+        // Shape taken from a live frame: a buy at the ask fills, the venue
+        // sends the remainder as a new bid plus its new top, but no removal
+        // of the consumed ask level.
         let mut s = ClobBookStream::new("tok");
         collect(&mut s, SNAP).unwrap();
         let out = collect(
             &mut s,
-            r#"{"event_type":"price_change","timestamp":"100","price_changes":[
-                {"asset_id":"tok","price":"0.50","size":"8","side":"BUY"}]}"#,
+            r#"{"event_type":"price_change","timestamp":"200","price_changes":[
+                {"asset_id":"tok","price":"0.52","size":"3","side":"BUY","best_bid":"0.52","best_ask":"0.53"}]}"#,
         )
         .unwrap();
-        assert!(out.is_empty());
-        assert_eq!(s.local_book().book().best_bid(), Some(0.49));
+        assert_eq!(out[0].book.best_bid(), Some(0.52));
+        assert_eq!(out[0].book.best_ask(), Some(0.53));
+        assert_eq!(s.local_book().pruned_levels(), 1);
     }
 
     #[test]
