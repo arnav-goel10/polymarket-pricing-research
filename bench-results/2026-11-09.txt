@@ -1,96 +1,123 @@
-# Poly benchmark run 2026-11-09 14:06 +08, commit c94542f
+# Poly benchmark run 2026-11-09 16:32 +08, commit e0962f9
 # rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)
 # cpu: Apple M5, 10 cores, 16 GB RAM, macOS 27.2
-# command: scripts/bench.sh (cargo bench -p market -p pricing -p app; cargo run --release -p app --bin latency_report -- 1000000)
+# command: POLY_RECORDING=/private/tmp/claude-501/-Users-arnav-Documents-ienergy-chatbot/7e22b042-5669-4e36-aa75-a8607a3c6008/scratchpad/live-10min.prec scripts/bench.sh
 
-replay/merge_3_feeds    time:   [840.01 µs 849.98 µs 860.75 µs]
-                        thrpt:  [116.15 Melem/s 117.62 Melem/s 119.02 Melem/s]
+replay/merge_3_feeds    time:   [822.59 µs 824.01 µs 825.55 µs]
+                        thrpt:  [121.10 Melem/s 121.33 Melem/s 121.54 Melem/s]
                  change:
-                        time:   [−1.8224% −0.8092% +0.1659%] (p = 0.14 > 0.05)
-                        thrpt:  [−0.1657% +0.8158% +1.8562%]
-                        No change in performance detected.
-replay/pipeline_full_reprice
-                        time:   [156.23 ms 157.86 ms 159.60 ms]
-                        thrpt:  [626.41 Kelem/s 633.34 Kelem/s 639.91 Kelem/s]
-                 change:
-                        time:   [−7.6134% −5.9788% −4.5765%] (p = 0.00 < 0.05)
-                        thrpt:  [+4.7960% +6.3590% +8.2408%]
+                        time:   [−4.8432% −3.9420% −3.0155%] (p = 0.00 < 0.05)
+                        thrpt:  [+3.1093% +4.1037% +5.0897%]
                         Performance has improved.
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+replay/pipeline_full_reprice
+                        time:   [162.18 ms 164.29 ms 167.02 ms]
+                        thrpt:  [598.58 Kelem/s 608.55 Kelem/s 616.46 Kelem/s]
+                 change:
+                        time:   [+2.3251% +4.0727% +5.9062%] (p = 0.00 < 0.05)
+                        thrpt:  [−5.5768% −3.9133% −2.2722%]
+                        Performance has regressed.
+Found 3 outliers among 20 measurements (15.00%)
+  1 (5.00%) low mild
+  1 (5.00%) high mild
+  1 (5.00%) high severe
+
+recording/pipeline_real_frames
+                        time:   [3.0071 s 3.7217 s 4.4239 s]
+                        thrpt:  [215.64 Kelem/s 256.33 Kelem/s 317.24 Kelem/s]
+recording/read_and_verify
+                        time:   [142.88 ms 144.54 ms 146.99 ms]
+                        thrpt:  [2.6924 GiB/s 2.7380 GiB/s 2.7698 GiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
 
 book_update/local_book_apply_delta
-                        time:   [17.248 ns 17.273 ns 17.301 ns]
-                        change: [+24.437% +25.987% +27.387%] (p = 0.00 < 0.05)
+                        time:   [19.010 ns 19.055 ns 19.102 ns]
+                        change: [+9.8015% +10.369% +10.921%] (p = 0.00 < 0.05)
                         Performance has regressed.
-Found 8 outliers among 100 measurements (8.00%)
-  4 (4.00%) high mild
-  4 (4.00%) high severe
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
 book_update/legacy_sort_per_update
-                        time:   [17.224 ns 17.244 ns 17.264 ns]
-                        change: [−3.9406% −2.4037% −1.2097%] (p = 0.00 < 0.05)
-                        Performance has improved.
-Found 8 outliers among 100 measurements (8.00%)
+                        time:   [19.001 ns 19.125 ns 19.253 ns]
+                        change: [+9.5387% +10.061% +10.598%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 7 outliers among 100 measurements (7.00%)
+  2 (2.00%) low mild
   5 (5.00%) high mild
-  3 (3.00%) high severe
 
 book_stream/price_change_frames_x64
-                        time:   [36.482 µs 37.601 µs 39.157 µs]
-                        thrpt:  [1.6344 Melem/s 1.7021 Melem/s 1.7543 Melem/s]
+                        time:   [38.140 µs 38.345 µs 38.566 µs]
+                        thrpt:  [1.6595 Melem/s 1.6691 Melem/s 1.6780 Melem/s]
                  change:
-                        time:   [+4.0817% +7.8194% +12.685%] (p = 0.00 < 0.05)
-                        thrpt:  [−11.257% −7.2523% −3.9216%]
-                        Performance has regressed.
-Found 10 outliers among 100 measurements (10.00%)
-  1 (1.00%) high mild
-  9 (9.00%) high severe
+                        time:   [−1.5956% +2.7296% +6.2162%] (p = 0.18 > 0.05)
+                        thrpt:  [−5.8524% −2.6570% +1.6215%]
+                        No change in performance detected.
+Found 7 outliers among 100 measurements (7.00%)
+  2 (2.00%) high mild
+  5 (5.00%) high severe
 
 price_contract/black_scholes
-                        time:   [8.6702 ns 8.7372 ns 8.8275 ns]
-                        change: [−1.1318% −0.4043% +0.5024%] (p = 0.37 > 0.05)
-                        No change in performance detected.
-Found 12 outliers among 100 measurements (12.00%)
-  7 (7.00%) high mild
-  5 (5.00%) high severe
-price_contract/student_t
-                        time:   [42.435 ns 42.632 ns 42.904 ns]
-                        change: [−0.0251% +0.1963% +0.4562%] (p = 0.16 > 0.05)
-                        No change in performance detected.
-Found 4 outliers among 100 measurements (4.00%)
-  2 (2.00%) high mild
-  2 (2.00%) high severe
-price_contract/sharp    time:   [10.752 ns 11.100 ns 11.553 ns]
-                        change: [+4.6972% +6.4529% +8.4534%] (p = 0.00 < 0.05)
-                        Performance has regressed.
-Found 17 outliers among 100 measurements (17.00%)
-  4 (4.00%) low mild
-  7 (7.00%) high mild
-  6 (6.00%) high severe
-price_contract/cornish_fisher
-                        time:   [10.541 ns 10.560 ns 10.580 ns]
-                        change: [−2.1836% −1.8122% −1.4476%] (p = 0.00 < 0.05)
+                        time:   [8.5865 ns 8.5923 ns 8.6009 ns]
+                        change: [−2.8695% −2.0500% −1.4025%] (p = 0.00 < 0.05)
                         Performance has improved.
-Found 14 outliers among 100 measurements (14.00%)
-  7 (7.00%) high mild
-  7 (7.00%) high severe
-price_contract/cos_vg_64
-                        time:   [1.3632 µs 1.4064 µs 1.4469 µs]
-                        change: [−2.1115% −0.3887% +1.5612%] (p = 0.68 > 0.05)
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+price_contract/student_t
+                        time:   [42.219 ns 42.279 ns 42.355 ns]
+                        change: [−0.7009% −0.3807% −0.0846%] (p = 0.01 < 0.05)
+                        Change within noise threshold.
+Found 19 outliers among 100 measurements (19.00%)
+  2 (2.00%) low mild
+  1 (1.00%) high mild
+  16 (16.00%) high severe
+price_contract/sharp    time:   [10.026 ns 10.056 ns 10.095 ns]
+                        change: [−10.211% −8.4840% −7.0279%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) high mild
+  4 (4.00%) high severe
+price_contract/cornish_fisher
+                        time:   [10.532 ns 10.646 ns 10.884 ns]
+                        change: [−0.0987% +0.5057% +1.8889%] (p = 0.36 > 0.05)
                         No change in performance detected.
 Found 12 outliers among 100 measurements (12.00%)
-  10 (10.00%) high mild
-  2 (2.00%) high severe
-price_contract/ensemble_4_models
-                        time:   [1.5009 µs 1.5339 µs 1.5685 µs]
-                        change: [+1.7465% +3.2780% +5.3238%] (p = 0.00 < 0.05)
-                        Performance has regressed.
-Found 13 outliers among 100 measurements (13.00%)
+  2 (2.00%) high mild
+  10 (10.00%) high severe
+price_contract/cos_vg_64
+                        time:   [1.2489 µs 1.2518 µs 1.2558 µs]
+                        change: [−6.8580% −4.8124% −2.5534%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 10 outliers among 100 measurements (10.00%)
   5 (5.00%) high mild
-  8 (8.00%) high severe
+  5 (5.00%) high severe
+price_contract/ensemble_4_models
+                        time:   [1.3085 µs 1.3215 µs 1.3486 µs]
+                        change: [−12.492% −10.940% −9.4299%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  1 (1.00%) low mild
+  4 (4.00%) high mild
+  1 (1.00%) high severe
 
 
-## latency_report (1,000,000 events)
+## latency_report (1,000,000 synthetic events)
 events=999999 repriced=999996 resyncs=0
-merge_3_feeds: 13.5 ms (74.0 M events/s)
-pipeline: 1.838 s wall incl. timing overhead, 544092 events/s
-all_events   n=999999   p50=  1875 ns  p99=  3083 ns  p99.9=  9916 ns  max= 836792 ns
-book_frames  n=645161   p50=  1959 ns  p99=  3292 ns  p99.9= 11042 ns  max= 583833 ns
-price_ticks  n=354838   p50=  1375 ns  p99=  2000 ns  p99.9=  7542 ns  max= 836792 ns
+merge_3_feeds: 11.6 ms (86.5 M events/s)
+pipeline: 1.625 s wall incl. timing overhead, 615486 events/s
+all_events   n=999999   p50=  1708 ns  p99=  2334 ns  p99.9=  4000 ns  max=  21083 ns
+book_frames  n=645161   p50=  1792 ns  p99=  2500 ns  p99.9=  4958 ns  max=  21083 ns
+price_ticks  n=354838   p50=  1250 ns  p99=  1459 ns  p99.9=  2291 ns  max=  19667 ns
+
+## latency_report on recording live-10min.prec
+recording=live-10min.prec frames=953972 bytes=424931997 span=599.5s truncated_tail=None
+read+verify: 139.7 ms (3041 MB/s, 6.83 M frames/s)
+repriced=950545 resyncs=0 ignored=1
+pipeline: 2.265 s wall incl. timing overhead, 421142 frames/s, 265x real time
+all_frames   n=953972   p50=  2375 ns  p99=  3667 ns  p99.9= 20333 ns  max=  33583 ns
+rtds         n=590      p50=  3833 ns  p99=  4542 ns  p99.9=  5334 ns  max=   9375 ns
+binance      n=455436   p50=  1959 ns  p99=  2750 ns  p99.9=  5208 ns  max=  21708 ns
+clob_book    n=497943   p50=  2583 ns  p99=  4250 ns  p99.9= 20708 ns  max=  33583 ns

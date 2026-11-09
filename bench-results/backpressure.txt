@@ -1,0 +1,4 @@
+# cargo test -p feeds --test backpressure -- --nocapture (2026-11-09 +08)
+peak live heap growth: 1098416 bytes for 200000 frames offered (bound 4194304)
+test stalled_consumer_keeps_memory_bounded_and_counts_drops ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s

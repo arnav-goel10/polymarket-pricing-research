@@ -22,9 +22,13 @@ Every WebSocket feed (`feeds::rtds`, `feeds::binance`, `market::clob_book`) is a
 
 `market::clob_book::ClobBookStream` adapts the Polymarket market channel to `LocalBook`. Polymarket sends no sequence numbers and its timestamps are not ordered across event types, so messages are sequenced by arrival on the connection. Fills arrive as `last_trade_price` events without a level removal, which is why each `price_change` entry's `best_bid` / `best_ask` is used for reconciliation. Any desync ends the session, and the app refetches a REST snapshot before resubscribing.
 
+## Recording, lifecycle and operations
+
+`feeds::recording` defines the append-only recording format and `feeds::recorder` the non-blocking writer (bounded queue, drop newest and count). `RECORD_PATH` turns recording on in the app; `record` and `prec` are the standalone tools. SIGTERM or SIGINT stops HTTP, cancels feeds, and drains and fsyncs the recorder. The full design, trade-offs and failure modes are in [DESIGN.md](DESIGN.md), and the operator guide for each metric is in [RUNBOOK.md](RUNBOOK.md).
+
 ## Observability
 
-`poly_core::FeedMetrics` holds relaxed atomic counters per feed (messages, malformed frames, reconnects, resyncs, connection state, last receive time, last exchange timestamp and a 10-second message-rate ring). `app::metrics::Metrics` renders them at `GET /metrics` in Prometheus text format, including a stale flag per feed. `LOG_FORMAT=json` switches `tracing` output to JSON lines.
+`poly_core::FeedMetrics` holds relaxed atomic counters per feed (messages, malformed frames, reconnects, resyncs, connection state, last receive time, last exchange timestamp and a 10-second message-rate ring). `app::metrics::Metrics` renders them at `GET /metrics` in Prometheus text format, including a stale flag per feed and the recorder queue counters. `/healthz` is liveness only; `/readyz` returns 503 until every feed is fresh. `LOG_FORMAT=json` switches `tracing` output to JSON lines.
 
 ## Control plane
 

@@ -1,38 +1,50 @@
-# Local CI run 2026-11-09 14:12 +08
+# Local CI run 2026-11-09 16:49 +08
 $ cargo fmt --all --check
 ok
 $ cargo clippy --workspace --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.35s
 $ cargo test --workspace --all-targets
-     Running unittests src/lib.rs (target/debug/deps/app-5aaae3af23f1cd1a)
-test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
-     Running unittests src/main.rs (target/debug/deps/app-4e9bfc4fdb2cc39e)
+     Running unittests src/lib.rs (target/debug/deps/app-a6e68c3702cf325f)
+test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+     Running unittests src/main.rs (target/debug/deps/app-9f1bed86862dd5a1)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-     Running unittests src/bin/latency_report.rs (target/debug/deps/latency_report-e93d7c4f451f3588)
+     Running unittests src/bin/latency_report.rs (target/debug/deps/latency_report-2623cbc87e02d5d0)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-     Running unittests src/bin/replay.rs (target/debug/deps/replay-a7341e55202256b1)
+     Running unittests src/bin/prec.rs (target/debug/deps/prec-fd6b4568a9a82122)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/record.rs (target/debug/deps/record-66e2585d89142e85)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/replay.rs (target/debug/deps/replay-e20a5e719c0fd164)
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-     Running benches/replay.rs (target/debug/deps/replay-27c45f505b139880)
-     Running unittests src/lib.rs (target/debug/deps/execution-63f6af2c70c0b481)
+     Running unittests src/bin/soak.rs (target/debug/deps/soak-4254cdf0b93d44b0)
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/live_sample.rs (target/debug/deps/live_sample-56b6a61b832d4d5e)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+     Running tests/record_shutdown.rs (target/debug/deps/record_shutdown-391e72a54ec4eaa7)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s
+     Running benches/replay.rs (target/debug/deps/replay-103a7353ed1d286a)
+     Running unittests src/lib.rs (target/debug/deps/execution-e7f4704fd060a61b)
 test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-     Running unittests src/lib.rs (target/debug/deps/feeds-73857a4c97020ceb)
-test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-     Running tests/fault_injection.rs (target/debug/deps/fault_injection-1b8904fcc54322c4)
+     Running unittests src/lib.rs (target/debug/deps/feeds-b171a667cab103da)
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+     Running tests/backpressure.rs (target/debug/deps/backpressure-f672293748d5cd06)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests/fault_injection.rs (target/debug/deps/fault_injection-dab5fb588b296504)
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
-     Running unittests examples/binance_stream.rs (target/debug/examples/binance_stream-d8edadf38491ea76)
+     Running unittests examples/binance_stream.rs (target/debug/examples/binance_stream-06568dc07fa46e06)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-     Running unittests examples/chainlink_latest.rs (target/debug/examples/chainlink_latest-88e8078c7ad02a8a)
+     Running unittests examples/chainlink_latest.rs (target/debug/examples/chainlink_latest-43af02440b4c7572)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-     Running unittests examples/rtds_stream.rs (target/debug/examples/rtds_stream-d43469b66df40134)
+     Running unittests examples/rtds_stream.rs (target/debug/examples/rtds_stream-f0c6b625a950f714)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-     Running unittests src/lib.rs (target/debug/deps/market-fbbc4591d6b688bf)
+     Running unittests src/lib.rs (target/debug/deps/market-ad62de7ba7d94f8f)
 test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-     Running tests/book_props.rs (target/debug/deps/book_props-1813c261f00c609e)
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
-     Running tests/stream_faults.rs (target/debug/deps/stream_faults-93a92d57ea40c66b)
+     Running tests/book_props.rs (target/debug/deps/book_props-bdbfe7fac7ca28c0)
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+     Running tests/stream_faults.rs (target/debug/deps/stream_faults-0ca8165132be9d0b)
 test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
-     Running benches/book.rs (target/debug/deps/book-fb487a54b3bf2812)
-     Running unittests examples/book_health.rs (target/debug/examples/book_health-2f6bf9481d135787)
+     Running benches/book.rs (target/debug/deps/book-a77d5e4c26d18056)
+     Running unittests examples/book_health.rs (target/debug/examples/book_health-d492cd6ed7726570)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
      Running unittests src/lib.rs (target/debug/deps/poly_core-1a1513b8ab133b01)
 test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -43,12 +55,24 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
      Running benches/pricing.rs (target/debug/deps/pricing-21b7be8fcc94bcf3)
      Running unittests src/lib.rs (target/debug/deps/stats-e33b98d39284ffc6)
 test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-TOTAL passed 216 failed 0
+TOTAL passed 230 failed 0
+$ cargo bench --workspace --no-run
+  Executable benches src/lib.rs (target/release/deps/stats-c5be7fc6f6f0c72e)
+$ cargo run --release -p app --bin latency_report -- --recording fixtures/live-sample.prec
+recording=fixtures/live-sample.prec frames=9941 bytes=3999803 span=5.0s truncated_tail=None
+read+verify: 1.1 ms (3504 MB/s, 8.71 M frames/s)
+repriced=9897 resyncs=0 ignored=0
+$ cargo deny check
+advisories ok, bans ok, licenses ok, sources ok
 $ python3 scripts/check_paper_only.py
 OK: paper-only boundary and dashboard syntax verified
 $ python3 -m unittest tests/test_check_paper_only.py
-Ran 10 tests in 0.015s
+Ran 10 tests
 
-OK
+OK  (after restoring the README boundary sentence the test requires; it failed once in this run)
 $ analyze_shadow_strategy.py --check, regenerate, git diff --exit-code demo/summary.json
 summary regenerated byte-for-byte
+$ ruby YAML parse of .github/workflows/ci.yml and ops/prometheus/alerts.yml; json parse of ops/grafana/poly-feeds.json
+rust,benches,deny,coverage,fuzz-build,evidence,container
+11 alert rules
+11 grafana panels

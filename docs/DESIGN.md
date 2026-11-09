@@ -21,7 +21,7 @@ Non-functional
 | Bounded memory under any input rate | no unbounded queues | backpressure test, soak test |
 | Clean shutdown | no truncated recording, sockets closed | SIGTERM test |
 
-Non-goals: horizontal scaling (one process handles one contract; a 10-minute live recording averaged about 1,600 messages per second across the three feeds), exactly-once delivery across restarts, order submission of any kind.
+Non-goals: horizontal scaling (one process handles one contract, and a 10-minute live recording averaged about 1,600 messages per second across the three feeds), exactly-once delivery across restarts, order submission of any kind.
 
 ## Architecture
 
@@ -92,6 +92,6 @@ The reader yields every complete record and reports a partial final record as `T
 ## What would change at larger scale
 
 - **Many contracts.** One `LocalBook` per token in a map, and a single CLOB connection subscribing to all of them (the market channel accepts a list of asset ids).
-- **Many consumers.** Publish books over a shared-memory ring or a broker instead of a Mutex slot.
+- **Many consumers.** Replace the Mutex slot with a shared-memory ring or a broker.
 - **Long recordings.** Rotate files hourly and compress closed segments (the JSON compresses well). Index control records for seeking.
 - **Histograms.** Per-stage latency histograms in `/metrics` (parse, apply, publish), which is the point to adopt a metrics crate.

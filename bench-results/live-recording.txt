@@ -1,0 +1,11 @@
+# Live recording, 2026-11-09 06:28-06:38 UTC, public feeds
+# Command: target/release/record live-10min.prec --secs 600 (commit 64b848e code, built from the working tree before that commit)
+2026-11-09T06:30:04.926244Z  INFO record: market window rolled; resubscribing
+2026-11-09T06:35:04.326638Z  INFO record: market window rolled; resubscribing
+recorded 953972 frames, 424931997 bytes, dropped 0 (duration reached)
+live-10min.prec: 953972 records, 424931997 bytes, 599.5 s, rtds=590 binance=455436 clob_book=497943 control=3, truncated_tail=None
+sha256 9df7029ba9e17114929bfae6cdc1e41f298e846c3d04210808439cd73c484a2b
+# Not committed (425 MB). Committed slice:
+# Command: target/release/prec slice live-10min.prec fixtures/live-sample.prec --control 2 --max-bytes 4000000
+fixtures/live-sample.prec: 9941 records, 3999803 bytes, 5.0 s, rtds=5 binance=5697 clob_book=4238 control=1, truncated_tail=None
+sha256 ee0c0cc4238b16ff83b3327a2a0c6220d19d384b0944862105b8b3b6af352f78
