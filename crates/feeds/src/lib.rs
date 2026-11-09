@@ -5,6 +5,8 @@ pub mod config;
 pub mod conn;
 pub mod micro;
 pub mod normalizer;
+pub mod recorder;
+pub mod recording;
 pub mod report;
 pub mod rtds;
 pub mod testkit;

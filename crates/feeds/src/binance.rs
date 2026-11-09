@@ -68,17 +68,20 @@ where
             Ok(None) => return Err("binance stream closed".into()),
             Ok(Some(Err(e))) => return Err(e.into()),
             Ok(Some(Ok(msg))) => match msg {
-                Message::Text(txt) => match parse_message(&txt) {
-                    Some(ev) => {
-                        let ts = match ev {
-                            BinanceEvent::Trade(t) => t.ts_millis,
-                            BinanceEvent::Book(b) => b.ts_millis,
-                        };
-                        opts.message(ts);
-                        on_event(ev);
+                Message::Text(txt) => {
+                    opts.tap_frame(&txt);
+                    match parse_message(&txt) {
+                        Some(ev) => {
+                            let ts = match ev {
+                                BinanceEvent::Trade(t) => t.ts_millis,
+                                BinanceEvent::Book(b) => b.ts_millis,
+                            };
+                            opts.message(ts);
+                            on_event(ev);
+                        }
+                        None => opts.malformed(),
                     }
-                    None => opts.malformed(),
-                },
+                }
                 Message::Ping(data) => {
                     writer.send(Message::Pong(data)).await?;
                 }

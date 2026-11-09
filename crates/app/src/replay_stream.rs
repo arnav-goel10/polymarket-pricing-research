@@ -7,6 +7,9 @@
 //! credentials) with realistic message ratios: per simulated second about
 //! one Chainlink tick, ten Binance ticks and twenty order-book deltas.
 
+use feeds::binance::BinanceEvent;
+use feeds::recording::{Record, Source};
+use feeds::FeedSource;
 use market::clob_book::ClobBookStream;
 use market::SECONDS_PER_YEAR;
 use poly_core::PricingContext;
@@ -75,6 +78,10 @@ pub struct Pipeline {
     ensemble: Ensemble,
     pub repriced: u64,
     pub resyncs: u64,
+    /// Frames from a recording that no parser accepted.
+    pub ignored: u64,
+    last_vol_ts: i64,
+    time_scaled_vol: bool,
     /// Latest model probability minus the book mid.
     pub last_edge: f64,
 }
@@ -103,6 +110,9 @@ impl Pipeline {
             ensemble: Ensemble::new(models),
             repriced: 0,
             resyncs: 0,
+            ignored: 0,
+            last_vol_ts: 0,
+            time_scaled_vol: false,
             last_edge: 0.0,
         }
     }
@@ -134,12 +144,81 @@ impl Pipeline {
         self.reprice(ev.ts_millis)
     }
 
+    /// Apply one raw recorded frame through the real feed parsers and
+    /// re-price. Volatility uses time-scaled returns, since real frames
+    /// arrive irregularly.
+    pub fn on_record(&mut self, rec: &Record) -> Option<f64> {
+        let now = rec.recv_micros / 1000;
+        match rec.source {
+            Source::Rtds => {
+                let ticks = feeds::rtds::parse_frame(&rec.frame);
+                if ticks.is_empty() {
+                    self.ignored += 1;
+                }
+                for t in ticks {
+                    if t.source == FeedSource::Chainlink {
+                        self.on_event(&Event {
+                            ts_millis: now,
+                            kind: EventKind::Chainlink(t.price),
+                        });
+                    }
+                }
+            }
+            Source::Binance => match feeds::binance::parse_message(&rec.frame) {
+                Some(ev) => {
+                    let px = match ev {
+                        BinanceEvent::Trade(t) => t.price,
+                        BinanceEvent::Book(b) => 0.5 * (b.bid + b.ask),
+                    };
+                    if let Some(prev) = self.last_binance {
+                        let dt = (now - self.last_vol_ts) as f64 / 1000.0;
+                        if dt > 0.0 && px > 0.0 {
+                            self.ewma.update((px / prev).ln() / dt.sqrt());
+                            self.last_binance = Some(px);
+                            self.last_vol_ts = now;
+                        }
+                    } else {
+                        self.last_binance = Some(px);
+                        self.last_vol_ts = now;
+                    }
+                }
+                None => self.ignored += 1,
+            },
+            Source::ClobBook => {
+                if self.book.on_text(&rec.frame, |_| {}).is_err() {
+                    self.resyncs += 1;
+                }
+            }
+            Source::Control => {
+                if let Some(token) = serde_json::from_str::<serde_json::Value>(&rec.frame)
+                    .ok()
+                    .and_then(|v| v.get("subscribe")?.as_str().map(str::to_owned))
+                {
+                    self.book = ClobBookStream::new(token);
+                }
+                return None;
+            }
+        }
+        self.time_scaled_vol = true;
+        self.reprice(now)
+    }
+
+    pub fn book_mid(&self) -> Option<f64> {
+        self.book.local_book().book().mid()
+    }
+
     fn reprice(&mut self, now: i64) -> Option<f64> {
         let s_t = self.last_chainlink?;
         let start = self.window_start?;
         let remaining = (start + WINDOW_MILLIS - now).max(1) as f64 / 1000.0;
-        // Binance ticks arrive ~every 100 ms in the fixture.
-        let sigma = (self.ewma.vol() * (SECONDS_PER_YEAR / 0.1).sqrt()).max(0.05);
+        // Synthetic Binance ticks arrive every 100 ms; recorded returns are
+        // already scaled to one second.
+        let per_year = if self.time_scaled_vol {
+            SECONDS_PER_YEAR
+        } else {
+            SECONDS_PER_YEAR / 0.1
+        };
+        let sigma = (self.ewma.vol() * per_year.sqrt()).clamp(0.05, 5.0);
         let ctx = PricingContext {
             s_t,
             s0: self.s0,
@@ -274,6 +353,52 @@ mod tests {
             EventKind::Chainlink(1.0),
             "ties keep feed order"
         );
+    }
+
+    #[test]
+    fn replays_raw_recorded_frames_through_the_real_parsers() {
+        let rec = |ms: i64, source, frame: &str| Record {
+            recv_micros: ms * 1000,
+            source,
+            frame: frame.to_string(),
+        };
+        let t0 = 1_767_225_600_000;
+        let frames = [
+            rec(t0, Source::Control, r#"{"subscribe":"tok"}"#),
+            rec(
+                t0 + 1,
+                Source::ClobBook,
+                r#"{"event_type":"book","asset_id":"tok","timestamp":"1","bids":[{"price":"0.48","size":"10"}],"asks":[{"price":"0.52","size":"10"}]}"#,
+            ),
+            rec(
+                t0 + 2,
+                Source::Binance,
+                r#"{"stream":"btcusdt@aggTrade","data":{"p":"100000","q":"1","m":false,"T":1}}"#,
+            ),
+            rec(
+                t0 + 900,
+                Source::Binance,
+                r#"{"stream":"btcusdt@aggTrade","data":{"p":"100010","q":"1","m":false,"T":2}}"#,
+            ),
+            rec(
+                t0 + 1000,
+                Source::Rtds,
+                r#"{"topic":"crypto_prices_chainlink","type":"update","payload":{"value":100005.0,"timestamp":1}}"#,
+            ),
+            rec(
+                t0 + 1001,
+                Source::ClobBook,
+                r#"{"event_type":"price_change","timestamp":"2","price_changes":[{"asset_id":"tok","price":"0.49","size":"5","side":"BUY","best_bid":"0.49","best_ask":"0.52"}]}"#,
+            ),
+            rec(t0 + 1002, Source::Rtds, "{garbage"),
+        ];
+        let mut p = Pipeline::new();
+        let probs: Vec<f64> = frames.iter().filter_map(|r| p.on_record(r)).collect();
+        assert_eq!(p.resyncs, 0);
+        assert_eq!(p.ignored, 1);
+        assert_eq!(probs.len(), 3, "re-priced once the reference price exists");
+        assert!(probs.iter().all(|x| (0.0..=1.0).contains(x)));
+        assert_eq!(p.book_mid(), Some(0.505));
     }
 
     #[test]

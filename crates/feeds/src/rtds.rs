@@ -144,6 +144,7 @@ where
                 match msg {
                     Some(Ok(Message::Text(txt))) => {
                         last_data = tokio::time::Instant::now();
+                        opts.tap_frame(&txt);
                         let ticks = parse_frame(&txt);
                         if ticks.is_empty() && is_malformed(&txt) {
                             opts.malformed();

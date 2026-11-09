@@ -22,6 +22,57 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
       - run: cargo run -p app --bin replay -- fixtures/replay-sample.json --json
+      - name: Replay the committed live recording
+        run: cargo run --release -p app --bin latency_report -- --recording fixtures/live-sample.prec
+
+  benches:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile benchmarks (not run; CI machines are too noisy to gate on)
+        run: cargo bench --workspace --no-run
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --summary-only
+      - run: cargo llvm-cov report --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+
+  fuzz-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Build fuzz targets and run each for 60 s
+        run: |
+          for t in rtds_frame binance_message clob_book_stream recording_reader; do
+            cargo fuzz run "$t" fuzz/corpus/"$t" -- -max_total_time=60
+          done
 
   evidence:
     runs-on: ubuntu-latest
@@ -44,4 +95,21 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - run: docker build --tag poly:ci .
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: poly:ci
+      - name: Smoke-test the image (liveness endpoint)
+        run: |
+          docker run -d --name poly -p 8080:8080 poly:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/healthz && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/healthz
+          docker stop --time 10 poly
+          test "$(docker inspect -f '{{.State.ExitCode}}' poly)" = "0"

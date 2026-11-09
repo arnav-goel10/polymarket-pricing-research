@@ -33,6 +33,35 @@ fn bench(c: &mut Criterion) {
         })
     });
     g.finish();
+
+    // Real recorded session, if present (POLY_RECORDING overrides the path).
+    let path = std::env::var("POLY_RECORDING").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/live-sample.prec"
+        )
+        .into()
+    });
+    if let Ok((records, _)) = feeds::recording::read_all(&path) {
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mut g = c.benchmark_group("recording");
+        g.sample_size(10);
+        g.throughput(Throughput::Elements(records.len() as u64));
+        g.bench_function("pipeline_real_frames", |b| {
+            b.iter(|| {
+                let mut p = Pipeline::new();
+                for r in &records {
+                    black_box(p.on_record(r));
+                }
+                black_box(p.repriced)
+            })
+        });
+        g.throughput(Throughput::Bytes(bytes));
+        g.bench_function("read_and_verify", |b| {
+            b.iter(|| black_box(feeds::recording::read_all(&path).unwrap().0.len()))
+        });
+        g.finish();
+    }
 }
 
 criterion_group!(benches, bench);

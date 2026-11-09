@@ -19,6 +19,7 @@ use app::window_clock::WindowClock;
 use execution::{ExecMode, ExecutionService, RiskLimits, RiskManager, Side, TradeDecision};
 use feeds::conn::ConnOpts;
 use feeds::micro::best_lag;
+use feeds::recording::Source;
 use feeds::FeedSource;
 use market::{clob_book, DiscoveredMarket};
 use poly_core::{AppConfig, Backoff, DryRunStrategy, FeedMetrics, RunMode};
@@ -518,17 +519,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rtds_metrics = Arc::new(FeedMetrics::new("rtds", RTDS_STALE_MILLIS));
     let binance_metrics = Arc::new(FeedMetrics::new("binance", BINANCE_STALE_MILLIS));
     let book_metrics = Arc::new(FeedMetrics::new("clob_book", BOOK_STALE_MILLIS));
-    let metrics = Arc::new(Metrics::new(vec![
+    // Optional raw-frame recorder (RECORD_PATH). Feed tasks never block on it:
+    // a full queue drops the frame and counts it (see feeds::recorder).
+    let recorder = match std::env::var("RECORD_PATH") {
+        Ok(path) if !path.is_empty() => {
+            let (handle, task) = feeds::recorder::start_file(&path, 65_536)?;
+            info!(path = %path, "recording raw frames");
+            Some((handle, task))
+        }
+        _ => None,
+    };
+    let rec_handle = recorder.as_ref().map(|(h, _)| h.clone());
+    let with_tap = |opts: ConnOpts, source: Source| match &rec_handle {
+        Some(h) => opts.recording(h.clone(), source),
+        None => opts,
+    };
+    let mut metrics = Metrics::new(vec![
         rtds_metrics.clone(),
         binance_metrics.clone(),
         book_metrics.clone(),
-    ]));
+    ]);
+    metrics.recorder = recorder.as_ref().map(|(h, _)| h.stats.clone());
+    let metrics = Arc::new(metrics);
+    let mut feed_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     {
         let buffers = buffers.clone();
         let url = cfg.feeds.rtds_url.clone();
-        let opts = ConnOpts::with_metrics(rtds_metrics.clone());
-        tokio::spawn(async move {
+        let opts = with_tap(ConnOpts::with_metrics(rtds_metrics.clone()), Source::Rtds);
+        feed_tasks.push(tokio::spawn(async move {
             let on_tick = move |t: feeds::Tick| {
                 if let Ok(mut b) = buffers.lock() {
                     match t.source {
@@ -545,7 +564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             feeds::rtds::run_reconnecting(&url, opts, on_tick).await;
-        });
+        }));
     }
 
     // Direct Binance perp feed drives the volatility estimate (the RTDS Chainlink
@@ -555,8 +574,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let buffers = buffers.clone();
         let url = cfg.feeds.binance_url.clone();
-        let opts = ConnOpts::with_metrics(binance_metrics.clone());
-        tokio::spawn(async move {
+        let opts = with_tap(
+            ConnOpts::with_metrics(binance_metrics.clone()),
+            Source::Binance,
+        );
+        feed_tasks.push(tokio::spawn(async move {
             let mut last_push = 0i64;
             let on_event = move |ev: feeds::binance::BinanceEvent| {
                 // Queue imbalance from every bookTicker (order-flow signal).
@@ -593,7 +615,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             feeds::binance::run_reconnecting(&url, opts, on_event).await;
-        });
+        }));
     }
 
     let active_market = Arc::new(Mutex::new(None::<DiscoveredMarket>));
@@ -620,7 +642,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let active_market = active_market.clone();
         let token_override = cfg.execution.token_id_override.clone();
         let book_metrics = book_metrics.clone();
-        tokio::spawn(async move {
+        let book_rec = rec_handle.clone();
+        feed_tasks.push(tokio::spawn(async move {
             let mut backoff = Backoff::default();
             loop {
                 let token_id = token_override.clone().or_else(|| {
@@ -646,7 +669,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let book_for_stream = book.clone();
                     let active_market_for_check = active_market.clone();
                     let token_override_for_check = token_override.clone();
-                    let opts = ConnOpts::with_metrics(book_metrics.clone());
+                    let mut opts = ConnOpts::with_metrics(book_metrics.clone());
+                    if let Some(h) = &book_rec {
+                        h.record(
+                            Source::Control,
+                            &serde_json::json!({ "subscribe": token_id }).to_string(),
+                        );
+                        opts = opts.recording(h.clone(), Source::ClobBook);
+                    }
                     let started = std::time::Instant::now();
                     let mut stream = Box::pin(clob_book::stream_book_ws_with(
                         clob_book::CLOB_MARKET_WS,
@@ -694,7 +724,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-        });
+        }));
     }
 
     // Resume: load the persisted ledger; REBUILD the P&L-curve series from it (the
@@ -1739,6 +1769,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.mode.as_str()
     );
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
-    axum::serve(listener, app).await?;
+    // Graceful shutdown on SIGINT/SIGTERM: stop accepting requests and let
+    // in-flight ones finish, cancel feed tasks (closing their sockets), then
+    // drain and fsync the recorder before exiting.
+    // Open dashboard WebSockets never finish on their own, so in-flight
+    // connections get a 5 s grace period before the server is dropped.
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let signal = app::lifecycle::shutdown_signal().await;
+        info!(signal, "shutdown requested");
+        let _ = stop_tx.send(true);
+    });
+    tokio::select! {
+        res = server => res?,
+        _ = async {
+            let _ = stop_rx.wait_for(|stop| *stop).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        } => warn!("grace period over; closing remaining connections"),
+    }
+    for t in &feed_tasks {
+        t.abort();
+    }
+    for t in feed_tasks {
+        let _ = t.await;
+    }
+    info!("feed tasks stopped");
+    drop(rec_handle);
+    if let Some((handle, task)) = recorder {
+        let dropped = handle
+            .stats
+            .dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        drop(handle);
+        match tokio::task::spawn_blocking(move || task.finish()).await {
+            Ok(Ok((records, bytes))) => info!(records, bytes, dropped, "recorder flushed"),
+            Ok(Err(e)) => error!(error = %e, "recorder flush failed"),
+            Err(e) => error!(error = %e, "recorder task failed"),
+        }
+    }
+    info!("shutdown complete");
     Ok(())
 }

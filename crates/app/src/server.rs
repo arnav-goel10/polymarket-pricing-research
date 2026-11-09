@@ -47,7 +47,9 @@ pub fn router(shared: Shared) -> Router {
         .route("/trades", get(trades_handler))
         .route("/fills", get(fills_handler))
         .route("/health", get(health_handler))
-        .route("/metrics", get(metrics_handler));
+        .route("/metrics", get(metrics_handler))
+        .route("/healthz", get(healthz_handler))
+        .route("/readyz", get(readyz_handler));
     let router = if controls_enabled {
         router.route("/control", post(control_handler))
     } else {
@@ -90,6 +92,30 @@ fn read_fills_jsonl(path: &str) -> Vec<FillRecord> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Liveness: the process is up and its runtime is answering requests.
+/// Deliberately independent of upstream feeds, so an exchange outage does not
+/// get the process restarted in a loop.
+async fn healthz_handler() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+/// Readiness: 200 only while every feed is within its freshness threshold
+/// and the run is not stopped; otherwise 503 with the reasons.
+async fn readyz_handler(State(s): State<Shared>) -> impl IntoResponse {
+    let stale = s.metrics.stale_feeds_at(poly_core::metrics::wall_millis());
+    let killed = s.flags.lock().map(|f| f.killed).unwrap_or(true);
+    let ready = stale.is_empty() && !killed;
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(serde_json::json!({"ready": ready, "stale_feeds": stale, "killed": killed})),
+    )
 }
 
 /// Prometheus text-format feed health (lag, rate, reconnects, stale flags).
@@ -255,6 +281,74 @@ mod tests {
             metrics: Arc::new(crate::metrics::Metrics::default()),
         };
         let _r = router(shared); // builds without panicking
+    }
+
+    fn shared_with(feeds: Vec<Arc<poly_core::FeedMetrics>>) -> Shared {
+        let (_tx, rx) = watch::channel(DashboardState::default());
+        Shared {
+            rx,
+            flags: Arc::new(Mutex::new(ControlFlags::default())),
+            history: Arc::new(Mutex::new(Vec::new())),
+            trades: Arc::new(Mutex::new(Vec::new())),
+            fills_path: String::new(),
+            control_token: None,
+            metrics: Arc::new(crate::metrics::Metrics::new(feeds)),
+        }
+    }
+
+    async fn get_status(shared: Shared, path: &str) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let resp = router(shared)
+            .oneshot(
+                axum::http::Request::get(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn healthz_is_live_even_when_feeds_are_down() {
+        let feed = Arc::new(poly_core::FeedMetrics::new("rtds", 5_000));
+        let (code, body) = get_status(shared_with(vec![feed]), "/healthz").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body, "ok");
+    }
+
+    #[tokio::test]
+    async fn readyz_tracks_feed_freshness_and_kill_switch() {
+        let rtds = Arc::new(poly_core::FeedMetrics::new("rtds", 5_000));
+        let book = Arc::new(poly_core::FeedMetrics::new("clob_book", 3_000));
+        let shared = shared_with(vec![rtds.clone(), book.clone()]);
+
+        let (code, body) = get_status(shared.clone(), "/readyz").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.contains("rtds") && body.contains("clob_book"),
+            "{body}"
+        );
+
+        rtds.record_message(0);
+        let (code, body) = get_status(shared.clone(), "/readyz").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "book still stale");
+        assert!(
+            !body.contains("\"rtds\"") && body.contains("clob_book"),
+            "{body}"
+        );
+
+        book.record_message(0);
+        let (code, _) = get_status(shared.clone(), "/readyz").await;
+        assert_eq!(code, StatusCode::OK);
+
+        shared.flags.lock().unwrap().killed = true;
+        let (code, _) = get_status(shared, "/readyz").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

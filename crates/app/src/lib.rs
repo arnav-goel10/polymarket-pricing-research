@@ -3,6 +3,7 @@ pub mod backtest;
 pub mod convergence;
 pub mod engine;
 pub mod latency;
+pub mod lifecycle;
 pub mod metrics;
 pub mod replay_stream;
 pub mod resolution;

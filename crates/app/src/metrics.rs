@@ -10,6 +10,8 @@ use std::time::Instant;
 #[derive(Debug)]
 pub struct Metrics {
     pub feeds: Vec<Arc<FeedMetrics>>,
+    /// Raw-frame recorder counters, when recording is enabled.
+    pub recorder: Option<Arc<feeds::recorder::RecorderStats>>,
     started: Instant,
 }
 
@@ -29,12 +31,23 @@ impl Metrics {
     pub fn new(feeds: Vec<Arc<FeedMetrics>>) -> Self {
         Self {
             feeds,
+            recorder: None,
             started: Instant::now(),
         }
     }
 
     pub fn feed(&self, name: &str) -> Option<&Arc<FeedMetrics>> {
         self.feeds.iter().find(|f| f.name == name)
+    }
+
+    /// Feeds that are past their freshness threshold. Empty means ready.
+    pub fn stale_feeds_at(&self, now_millis: i64) -> Vec<&'static str> {
+        self.feeds
+            .iter()
+            .map(|f| f.snapshot_at(now_millis))
+            .filter(|s| s.stale)
+            .map(|s| s.name)
+            .collect()
     }
 
     pub fn render(&self) -> String {
@@ -115,6 +128,39 @@ impl Metrics {
             "1 when the feed is older than its freshness threshold; decisions are blocked.",
             per(&|s| Some(f64::from(u8::from(s.stale)))),
         );
+        if let Some(r) = &self.recorder {
+            use std::sync::atomic::Ordering::Relaxed;
+            for (name, kind, help, v) in [
+                (
+                    "poly_recorder_written_total",
+                    "counter",
+                    "Frames written to the recording.",
+                    r.written.load(Relaxed),
+                ),
+                (
+                    "poly_recorder_dropped_total",
+                    "counter",
+                    "Frames dropped because the recorder queue was full.",
+                    r.dropped.load(Relaxed),
+                ),
+                (
+                    "poly_recorder_queue_depth",
+                    "gauge",
+                    "Frames queued and not yet written.",
+                    r.queue_depth(),
+                ),
+                (
+                    "poly_recorder_queue_capacity",
+                    "gauge",
+                    "Recorder queue capacity in frames.",
+                    r.capacity.load(Relaxed),
+                ),
+            ] {
+                let _ = writeln!(out, "# HELP {name} {help}");
+                let _ = writeln!(out, "# TYPE {name} {kind}");
+                let _ = writeln!(out, "{name} {v}");
+            }
+        }
         let _ = writeln!(out, "# HELP poly_uptime_seconds Process uptime.");
         let _ = writeln!(out, "# TYPE poly_uptime_seconds gauge");
         let _ = writeln!(

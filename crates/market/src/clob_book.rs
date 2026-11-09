@@ -318,6 +318,7 @@ where
             Ok(None) => return Err("clob market ws closed".into()),
             Ok(Some(Err(e))) => return Err(e.into()),
             Ok(Some(Ok(Message::Text(txt)))) => {
+                opts.tap_frame(&txt);
                 let metrics = opts.metrics.as_deref();
                 let res = state.on_text(&txt, |update| {
                     if let Some(m) = metrics {

@@ -27,6 +27,7 @@ fn opts(m: &Arc<FeedMetrics>) -> ConnOpts {
     ConnOpts {
         idle_timeout: Duration::from_millis(400),
         metrics: Some(m.clone()),
+        tap: None,
     }
 }
 

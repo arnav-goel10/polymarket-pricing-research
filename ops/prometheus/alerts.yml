@@ -1,0 +1,104 @@
+# Prometheus alerting rules for the poly app's /metrics endpoint.
+# Not validated with promtool in this repo (promtool was not available when
+# these were written). Thresholds follow docs/RUNBOOK.md.
+groups:
+  - name: poly-feeds
+    rules:
+      - alert: PolyFeedStale
+        expr: poly_feed_stale == 1
+        for: 30s
+        labels:
+          severity: page
+        annotations:
+          summary: "Feed {{ $labels.feed }} is stale"
+          description: "No fresh data from {{ $labels.feed }} for longer than its threshold for 30s. Simulated decisions are blocked. See RUNBOOK.md#poly_feed_stale."
+
+      - alert: PolyFeedDisconnected
+        expr: poly_feed_connected == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Feed {{ $labels.feed }} disconnected for 2m"
+          description: "The supervisor is retrying with backoff but has not reconnected. See RUNBOOK.md#poly_feed_connected."
+
+      - alert: PolyFeedReconnectStorm
+        expr: increase(poly_feed_reconnects_total[10m]) > 10
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Feed {{ $labels.feed }} reconnected {{ $value }} times in 10m"
+          description: "Flapping upstream or network. See RUNBOOK.md#poly_feed_reconnects_total."
+
+      - alert: PolyBookResyncs
+        expr: increase(poly_feed_resyncs_total{feed="clob_book"}[15m]) > 3
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Order book resynced {{ $value }} times in 15m"
+          description: "Gaps, malformed levels or crossed books after reconciliation. See RUNBOOK.md#poly_feed_resyncs_total."
+
+      - alert: PolyMalformedFrames
+        expr: rate(poly_feed_malformed_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Feed {{ $labels.feed }} sending malformed frames"
+          description: "Upstream format change is the usual cause. See RUNBOOK.md#poly_feed_malformed_total."
+
+      - alert: PolyFeedLagHigh
+        expr: poly_feed_lag_seconds{feed=~"binance|clob_book"} > 2
+        for: 2m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Feed {{ $labels.feed }} lag {{ $value }}s"
+          description: "Receive time is well behind exchange time. Check host clock (NTP) and network. See RUNBOOK.md#poly_feed_lag_seconds."
+
+      - alert: PolyFeedSilentButConnected
+        expr: poly_feed_connected == 1 and poly_feed_messages_per_second == 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Feed {{ $labels.feed }} connected but silent"
+          description: "Socket open with no data; the idle timeout should fire within 30s. See RUNBOOK.md#poly_feed_messages_per_second."
+
+  - name: poly-recorder
+    rules:
+      - alert: PolyRecorderDropping
+        expr: increase(poly_recorder_dropped_total[5m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Recorder dropped {{ $value }} frames in 5m"
+          description: "Disk is slower than the feeds; the recording has gaps. See RUNBOOK.md#poly_recorder_dropped_total."
+
+      - alert: PolyRecorderQueueFilling
+        expr: poly_recorder_queue_depth / poly_recorder_queue_capacity > 0.5
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Recorder queue over half full"
+          description: "Drops start when the queue is full. See RUNBOOK.md#poly_recorder_queue_depth."
+
+  - name: poly-process
+    rules:
+      - alert: PolyDown
+        expr: up{job="poly"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "poly /metrics not scraped for 1m"
+          description: "Process down or /healthz failing. See RUNBOOK.md#process-down."
+
+      - alert: PolyRestarted
+        expr: poly_uptime_seconds < 300
+        labels:
+          severity: info
+        annotations:
+          summary: "poly restarted in the last 5m"
+          description: "Check logs for the shutdown reason (signal) or a crash."

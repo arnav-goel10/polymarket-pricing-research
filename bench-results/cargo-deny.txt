@@ -1,0 +1,20 @@
+# cargo deny check, 2026-11-09 14:33 +08, cargo-deny 0.20.2
+# Before fixes it reported RUSTSEC-2026-0258 (h2 0.4.15) and RUSTSEC-2026-0220 (ruint 1.18.0); fixed with cargo update -p h2 -p ruint (h2 0.4.20, ruint 1.21.1)
+   1 warning[duplicate]: found 2 duplicate entries for crate 'base64'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'block-buffer'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'core-foundation'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'cpufeatures'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'crypto-common'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'digest'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'r-efi'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'rand_chacha'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'thiserror'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'thiserror-impl'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'tokio-tungstenite'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'tungstenite'
+   1 warning[duplicate]: found 2 duplicate entries for crate 'windows-sys'
+   1 warning[duplicate]: found 3 duplicate entries for crate 'getrandom'
+   1 warning[duplicate]: found 3 duplicate entries for crate 'rand'
+   1 warning[duplicate]: found 3 duplicate entries for crate 'rand_core'
+   3 warning[license-not-encountered]: license was not encountered
+advisories ok, bans ok, licenses ok, sources ok
