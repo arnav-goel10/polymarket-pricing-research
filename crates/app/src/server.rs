@@ -31,6 +31,8 @@ pub struct Shared {
     /// Bearer token for state-changing dashboard controls. When absent the
     /// control route is not registered, making public shadow demos read-only.
     pub control_token: Option<Arc<str>>,
+    /// Feed-health counters exposed at `/metrics`.
+    pub metrics: Arc<crate::metrics::Metrics>,
 }
 
 const DASHBOARD_HTML: &str = include_str!("../dashboard/index.html");
@@ -44,7 +46,8 @@ pub fn router(shared: Shared) -> Router {
         .route("/history", get(history_handler))
         .route("/trades", get(trades_handler))
         .route("/fills", get(fills_handler))
-        .route("/health", get(health_handler));
+        .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler));
     let router = if controls_enabled {
         router.route("/control", post(control_handler))
     } else {
@@ -87,6 +90,17 @@ fn read_fills_jsonl(path: &str) -> Vec<FillRecord> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Prometheus text-format feed health (lag, rate, reconnects, stale flags).
+async fn metrics_handler(State(s): State<Shared>) -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        s.metrics.render(),
+    )
 }
 
 async fn health_handler(State(s): State<Shared>) -> impl IntoResponse {
@@ -238,8 +252,45 @@ mod tests {
             trades: Arc::new(Mutex::new(Vec::new())),
             fills_path: String::new(),
             control_token: None,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
         };
         let _r = router(shared); // builds without panicking
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_serves_prometheus_text() {
+        use tower::ServiceExt;
+        let (_tx, rx) = watch::channel(DashboardState::default());
+        let feed = Arc::new(poly_core::FeedMetrics::new("rtds", 5_000));
+        feed.record_message(0);
+        let shared = Shared {
+            rx,
+            flags: Arc::new(Mutex::new(ControlFlags::default())),
+            history: Arc::new(Mutex::new(Vec::new())),
+            trades: Arc::new(Mutex::new(Vec::new())),
+            fills_path: String::new(),
+            control_token: None,
+            metrics: Arc::new(crate::metrics::Metrics::new(vec![feed])),
+        };
+        let resp = router(shared)
+            .oneshot(
+                axum::http::Request::get("/metrics")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain; version=0.0.4"));
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("poly_feed_messages_total{feed=\"rtds\"} 1"));
+        assert!(text.contains("poly_feed_stale{feed=\"rtds\"} 0"));
     }
 
     #[test]

@@ -1,0 +1,6 @@
+# Legacy order-book probe, run 2026-11-09 12:45 +08 against main@a5a0c04
+# Command: probe test appended to crates/market/src/clob_book.rs in a throwaway worktree of main; cargo test -p market legacy_probe -- --nocapture
+LEGACY late delta (ts 300 after ts 456): size at 0.50 = 2
+LEGACY crossed delta published: best_bid=Some(0.6) best_ask=Some(0.52)
+LEGACY malformed snapshot published as partial book: bids=1 asks=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.00s

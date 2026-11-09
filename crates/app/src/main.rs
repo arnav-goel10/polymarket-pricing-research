@@ -6,6 +6,7 @@
 use app::adaptive::{AdaptiveEdge, AdaptiveEdgeParams};
 use app::engine::{step, StepCtx};
 use app::latency::RollingLatency;
+use app::metrics::{Metrics, BINANCE_STALE_MILLIS, BOOK_STALE_MILLIS, RTDS_STALE_MILLIS};
 use app::resolution::{
     ActiveObs, ActivePaperTracker, PaperObservation, PendingWindow, ResolutionTracker,
     StrategyPaperTracker,
@@ -16,10 +17,11 @@ use app::state::DashboardState;
 use app::state::StrategyPnl;
 use app::window_clock::WindowClock;
 use execution::{ExecMode, ExecutionService, RiskLimits, RiskManager, Side, TradeDecision};
+use feeds::conn::ConnOpts;
 use feeds::micro::best_lag;
 use feeds::FeedSource;
 use market::{clob_book, DiscoveredMarket};
-use poly_core::{AppConfig, DryRunStrategy, RunMode};
+use poly_core::{AppConfig, Backoff, DryRunStrategy, FeedMetrics, RunMode};
 use pricing::{
     BlackScholesDigital, CosVgDigital, DigitalModel, OnlinePlatt, OnlineWeights, SharpDigital,
     StudentTDigital,
@@ -473,10 +475,21 @@ async fn discover_active_market(window_secs: i64) -> Option<DiscoveredMarket> {
     }
 }
 
+/// `RUST_LOG` sets the filter; `LOG_FORMAT=json` switches to one JSON object
+/// per line (with the structured fields, e.g. `feed`, `retry_in_ms`) for log
+/// shippers.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,reqwest=warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    if std::env::var("LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("json")) {
+        tracing_subscriber::fmt()
+            .json()
+            .with_current_span(false)
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 }
 
 #[tokio::main]
@@ -502,31 +515,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
     let (tx, rx) = watch::channel(DashboardState::default());
 
+    let rtds_metrics = Arc::new(FeedMetrics::new("rtds", RTDS_STALE_MILLIS));
+    let binance_metrics = Arc::new(FeedMetrics::new("binance", BINANCE_STALE_MILLIS));
+    let book_metrics = Arc::new(FeedMetrics::new("clob_book", BOOK_STALE_MILLIS));
+    let metrics = Arc::new(Metrics::new(vec![
+        rtds_metrics.clone(),
+        binance_metrics.clone(),
+        book_metrics.clone(),
+    ]));
+
     {
         let buffers = buffers.clone();
         let url = cfg.feeds.rtds_url.clone();
+        let opts = ConnOpts::with_metrics(rtds_metrics.clone());
         tokio::spawn(async move {
-            loop {
-                let buffers = buffers.clone();
-                let res = feeds::rtds::run(&url, move |t| {
-                    if let Ok(mut b) = buffers.lock() {
-                        match t.source {
-                            FeedSource::Chainlink => {
-                                b.last_chainlink_millis = t.ts_millis.max(now_millis());
-                                b.chainlink.push(t.ts_millis, t.price);
-                            }
-                            FeedSource::Binance => {
-                                b.last_binance_millis = t.ts_millis.max(now_millis());
-                                b.binance.push(t.ts_millis, t.price);
-                            }
-                            _ => {}
+            let on_tick = move |t: feeds::Tick| {
+                if let Ok(mut b) = buffers.lock() {
+                    match t.source {
+                        FeedSource::Chainlink => {
+                            b.last_chainlink_millis = t.ts_millis.max(now_millis());
+                            b.chainlink.push(t.ts_millis, t.price);
                         }
+                        FeedSource::Binance => {
+                            b.last_binance_millis = t.ts_millis.max(now_millis());
+                            b.binance.push(t.ts_millis, t.price);
+                        }
+                        _ => {}
                     }
-                })
-                .await;
-                warn!(?res, "rtds disconnected; reconnecting");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
+                }
+            };
+            feeds::rtds::run_reconnecting(&url, opts, on_tick).await;
         });
     }
 
@@ -537,48 +555,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let buffers = buffers.clone();
         let url = cfg.feeds.binance_url.clone();
+        let opts = ConnOpts::with_metrics(binance_metrics.clone());
         tokio::spawn(async move {
-            loop {
-                let buffers = buffers.clone();
-                let mut last_push = 0i64;
-                let res = feeds::binance::run(&url, move |ev| {
-                    // Queue imbalance from every bookTicker (order-flow signal).
-                    let imbalance = match &ev {
-                        feeds::binance::BinanceEvent::Book(b) => {
-                            let tot = b.bid_qty + b.ask_qty;
-                            (tot > 0.0).then(|| (b.bid_qty - b.ask_qty) / tot)
-                        }
-                        _ => None,
-                    };
-                    let price = match ev {
-                        feeds::binance::BinanceEvent::Trade(t) => t.price,
-                        feeds::binance::BinanceEvent::Book(b) => 0.5 * (b.bid + b.ask),
-                    };
-                    // Use wall-clock time for both cadence and storage: bookTicker
-                    // frames have no `T` field (exchange ts = 0), which would break a
-                    // cadence based on the event timestamp. Sample ~1s bars so vol
-                    // and lead-lag have intra-window resolution; imbalance every tick.
-                    let ts = now_millis();
-                    let push = price > 0.0 && ts - last_push >= 1_000;
-                    if push {
-                        last_push = ts;
+            let mut last_push = 0i64;
+            let on_event = move |ev: feeds::binance::BinanceEvent| {
+                // Queue imbalance from every bookTicker (order-flow signal).
+                let imbalance = match &ev {
+                    feeds::binance::BinanceEvent::Book(b) => {
+                        let tot = b.bid_qty + b.ask_qty;
+                        (tot > 0.0).then(|| (b.bid_qty - b.ask_qty) / tot)
                     }
-                    if imbalance.is_some() || push {
-                        if let Ok(mut b) = buffers.lock() {
-                            if let Some(im) = imbalance {
-                                b.last_imbalance = im;
-                            }
-                            if push {
-                                b.last_binance_millis = ts;
-                                b.binance.push(ts, price);
-                            }
+                    _ => None,
+                };
+                let price = match ev {
+                    feeds::binance::BinanceEvent::Trade(t) => t.price,
+                    feeds::binance::BinanceEvent::Book(b) => 0.5 * (b.bid + b.ask),
+                };
+                // Use wall-clock time for both cadence and storage: bookTicker
+                // frames have no `T` field (exchange ts = 0), which would break a
+                // cadence based on the event timestamp. Sample ~1s bars so vol
+                // and lead-lag have intra-window resolution; imbalance every tick.
+                let ts = now_millis();
+                let push = price > 0.0 && ts - last_push >= 1_000;
+                if push {
+                    last_push = ts;
+                }
+                if imbalance.is_some() || push {
+                    if let Ok(mut b) = buffers.lock() {
+                        if let Some(im) = imbalance {
+                            b.last_imbalance = im;
+                        }
+                        if push {
+                            b.last_binance_millis = ts;
+                            b.binance.push(ts, price);
                         }
                     }
-                })
-                .await;
-                warn!(?res, "binance disconnected; reconnecting");
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
+                }
+            };
+            feeds::binance::run_reconnecting(&url, opts, on_event).await;
         });
     }
 
@@ -605,7 +619,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let book = book.clone();
         let active_market = active_market.clone();
         let token_override = cfg.execution.token_id_override.clone();
+        let book_metrics = book_metrics.clone();
         tokio::spawn(async move {
+            let mut backoff = Backoff::default();
             loop {
                 let token_id = token_override.clone().or_else(|| {
                     active_market
@@ -630,8 +646,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let book_for_stream = book.clone();
                     let active_market_for_check = active_market.clone();
                     let token_override_for_check = token_override.clone();
-                    let mut stream = Box::pin(clob_book::stream_book_ws(
+                    let opts = ConnOpts::with_metrics(book_metrics.clone());
+                    let started = std::time::Instant::now();
+                    let mut stream = Box::pin(clob_book::stream_book_ws_with(
+                        clob_book::CLOB_MARKET_WS,
                         &token_for_stream,
+                        &opts,
                         move |update| {
                             if let Ok(mut slot) = book_for_stream.lock() {
                                 slot.token_id = Some(token_for_callback.clone());
@@ -644,7 +664,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     loop {
                         tokio::select! {
                             res = &mut stream => {
-                                warn!(?res, "clob book websocket disconnected; reconnecting");
+                                // Drop, silence or book desync: back off, then the
+                                // outer loop refetches a REST snapshot and resubscribes.
+                                book_metrics.set_connected(false);
+                                book_metrics.record_reconnect();
+                                let delay = backoff.on_session_end(started.elapsed());
+                                warn!(
+                                    feed = "clob_book",
+                                    error = ?res.err(),
+                                    retry_in_ms = delay.as_millis() as u64,
+                                    "feed disconnected; reconnecting"
+                                );
+                                tokio::time::sleep(delay).await;
                                 break;
                             }
                             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
@@ -1699,6 +1730,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         trades,
         fills_path: cfg.execution.persist_fills_path.clone(),
         control_token: cfg.control_token.clone().map(Into::into),
+        metrics,
     };
     let app = router(shared);
     println!(

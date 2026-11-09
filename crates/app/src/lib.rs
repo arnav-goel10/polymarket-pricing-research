@@ -3,6 +3,7 @@ pub mod backtest;
 pub mod convergence;
 pub mod engine;
 pub mod latency;
+pub mod metrics;
 pub mod resolution;
 pub mod server;
 pub mod signals;

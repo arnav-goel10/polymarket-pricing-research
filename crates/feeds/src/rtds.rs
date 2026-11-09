@@ -10,7 +10,9 @@
 //! recent `{timestamp,value}` points — a free volatility warm-up history); then real-time
 //! `update` frames carry a single `payload.value`. Keep-alive: `PING` ~5s.
 
+use crate::conn::{supervise, BoxError, ConnOpts};
 use crate::tick::{FeedSource, Tick};
+use poly_core::Backoff;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -81,13 +83,35 @@ pub fn parse_frame(raw: &str) -> Vec<Tick> {
     parse_tick(raw).into_iter().collect()
 }
 
+/// A frame that yielded no ticks is malformed if it is not JSON (keep-alive
+/// `PONG` aside) or if it is on a price topic but carries no usable price.
+/// Frames on other topics are expected noise.
+fn is_malformed(raw: &str) -> bool {
+    if raw == "PONG" {
+        return false;
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Err(_) => true,
+        Ok(root) => root
+            .get("topic")
+            .and_then(|t| t.as_str())
+            .and_then(source_for_topic)
+            .is_some(),
+    }
+}
+
 /// Real-time connection shell: connect, subscribe to BTC on both topics, keep alive
 /// with periodic PINGs, and emit normalized ticks (snapshots + real-time updates)
 /// until the socket errors.
-pub async fn run<F>(
-    url: &str,
-    mut on_tick: F,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+pub async fn run<F>(url: &str, on_tick: F) -> Result<(), BoxError>
+where
+    F: FnMut(Tick),
+{
+    run_with(url, &ConnOpts::default(), on_tick).await
+}
+
+/// [`run`] with an explicit idle timeout and optional health counters.
+pub async fn run_with<F>(url: &str, opts: &ConnOpts, mut on_tick: F) -> Result<(), BoxError>
 where
     F: FnMut(Tick),
 {
@@ -95,36 +119,45 @@ where
     use tokio_tungstenite::tungstenite::Message;
 
     let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+    opts.connected(true);
     let (mut write, mut read) = ws.split();
     write.send(Message::Text(subscribe_message())).await?;
 
-    let mut ping = tokio::time::interval(std::time::Duration::from_secs(5));
+    let ping_every = opts.idle_timeout.min(Duration::from_secs(5)) / 2;
+    let mut ping = tokio::time::interval(ping_every.max(Duration::from_millis(10)));
     // Data-inactivity guard: a silently half-open TCP socket leaves `read.next()`
     // pending forever with no error, so the loop would spin sending PINGs into the
-    // void and never reconnect — leaving the settlement-critical Chainlink price
-    // frozen. If no frame arrives for 30s, return an error so the caller reconnects.
-    let mut last_data = std::time::Instant::now();
+    // void and never reconnect, leaving the settlement-critical Chainlink price
+    // frozen. If no frame arrives within the idle timeout, return an error so the
+    // supervisor reconnects.
+    let mut last_data = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = ping.tick() => {
-                if last_data.elapsed() > std::time::Duration::from_secs(30) {
-                    return Err("rtds inactivity timeout (30s no data)".into());
+                if last_data.elapsed() > opts.idle_timeout {
+                    return Err("rtds inactivity timeout (no data)".into());
                 }
-                write.send(Message::Text("PING".to_string())).await?;
+                write.send(Message::Text("PING".into())).await?;
             }
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(txt))) => {
-                        last_data = std::time::Instant::now();
-                        for t in parse_frame(&txt) {
+                        last_data = tokio::time::Instant::now();
+                        let ticks = parse_frame(&txt);
+                        if ticks.is_empty() && is_malformed(&txt) {
+                            opts.malformed();
+                        }
+                        for t in ticks {
+                            opts.message(t.ts_millis);
                             on_tick(t);
                         }
                     }
+                    Some(Ok(Message::Close(_))) => return Err("rtds closed by server".into()),
                     Some(Ok(_)) => {
-                        last_data = std::time::Instant::now(); // any frame = alive
+                        last_data = tokio::time::Instant::now(); // any frame = alive
                     }
                     Some(Err(e)) => return Err(e.into()),
-                    None => return Ok(()),
+                    None => return Err("rtds stream ended".into()),
                 }
             }
         }
@@ -132,17 +165,15 @@ where
 }
 
 /// Reconnect forever with capped exponential backoff.
-pub async fn run_reconnecting<F>(url: &str, on_tick: F) -> !
+pub async fn run_reconnecting<F>(url: &str, opts: ConnOpts, on_tick: F)
 where
     F: FnMut(Tick) + Clone,
 {
-    let mut delay = Duration::from_millis(250);
-    loop {
-        let res = run(url, on_tick.clone()).await;
-        tracing::warn!(?res, "rtds disconnected");
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(10));
-    }
+    let metrics = opts.metrics.clone();
+    supervise("rtds", metrics, Backoff::default(), None, || {
+        run_with(url, &opts, on_tick.clone())
+    })
+    .await
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
+use crate::conn::{supervise, BoxError, ConnOpts};
 use crate::tick::{BookUpdate, Trade};
+use poly_core::Backoff;
 use serde_json::Value;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub enum BinanceEvent {
@@ -40,32 +41,44 @@ pub fn parse_message(raw: &str) -> Option<BinanceEvent> {
 /// Real-time connection shell. Streams Binance perp events to a callback until error.
 ///
 /// Exits on any of: read error, stream closed, or 30s of silence (silent TCP
-/// freeze). The caller is responsible for reconnecting.
-pub async fn run<F>(
-    url: &str,
-    mut on_event: F,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+/// freeze). Use [`run_reconnecting`] or [`crate::conn::supervise`] to reconnect.
+pub async fn run<F>(url: &str, on_event: F) -> Result<(), BoxError>
+where
+    F: FnMut(BinanceEvent),
+{
+    run_with(url, &ConnOpts::default(), on_event).await
+}
+
+/// [`run`] with an explicit idle timeout and optional health counters.
+pub async fn run_with<F>(url: &str, opts: &ConnOpts, mut on_event: F) -> Result<(), BoxError>
 where
     F: FnMut(BinanceEvent),
 {
     use futures_util::{SinkExt, StreamExt};
-    use tokio::time::{timeout, Duration};
+    use tokio::time::timeout;
     use tokio_tungstenite::tungstenite::Message;
 
     let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+    opts.connected(true);
     let (mut writer, mut reader) = ws.split();
 
     loop {
-        match timeout(Duration::from_secs(30), reader.next()).await {
-            Err(_) => return Err("binance read timeout (30s of silence)".into()),
+        match timeout(opts.idle_timeout, reader.next()).await {
+            Err(_) => return Err("binance read timeout (silence)".into()),
             Ok(None) => return Err("binance stream closed".into()),
             Ok(Some(Err(e))) => return Err(e.into()),
             Ok(Some(Ok(msg))) => match msg {
-                Message::Text(txt) => {
-                    if let Some(ev) = parse_message(&txt) {
+                Message::Text(txt) => match parse_message(&txt) {
+                    Some(ev) => {
+                        let ts = match ev {
+                            BinanceEvent::Trade(t) => t.ts_millis,
+                            BinanceEvent::Book(b) => b.ts_millis,
+                        };
+                        opts.message(ts);
                         on_event(ev);
                     }
-                }
+                    None => opts.malformed(),
+                },
                 Message::Ping(data) => {
                     writer.send(Message::Pong(data)).await?;
                 }
@@ -76,17 +89,16 @@ where
     }
 }
 
-pub async fn run_reconnecting<F>(url: &str, on_event: F) -> !
+/// Reconnect forever with capped exponential backoff.
+pub async fn run_reconnecting<F>(url: &str, opts: ConnOpts, on_event: F)
 where
     F: FnMut(BinanceEvent) + Clone,
 {
-    let mut delay = Duration::from_millis(250);
-    loop {
-        let res = run(url, on_event.clone()).await;
-        tracing::warn!(?res, "binance disconnected");
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(10));
-    }
+    let metrics = opts.metrics.clone();
+    supervise("binance", metrics, Backoff::default(), None, || {
+        run_with(url, &opts, on_event.clone())
+    })
+    .await
 }
 
 /// Default combined-stream URL for BTCUSDT perp aggTrade + bookTicker.
