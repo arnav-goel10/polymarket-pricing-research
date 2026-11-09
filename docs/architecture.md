@@ -14,9 +14,21 @@ The executable boundary is documented in [Publication boundary](publication-boun
 6. The risk manager evaluates staleness, spread, depth, timing, disagreement, exposure, notional, decision rate, and simulated losses.
 7. The paper-fill simulator records shadow or dry-run decisions, hypothetical fills, and P&amp;L. It has no credential, signer, or order-posting interface.
 
+## Feed ingestion and the local order book
+
+Every WebSocket feed (`feeds::rtds`, `feeds::binance`, `market::clob_book`) is a `run_with(url, &ConnOpts, callback)` function that streams until the connection fails and then returns the error. `feeds::conn::supervise` owns the retry loop: it marks the feed disconnected, counts the reconnect, logs the cause with structured fields and sleeps with `poly_core::Backoff` (250 ms doubling to 10 s, reset after a 30 s healthy session). `ConnOpts::idle_timeout` (30 s by default) turns a silent half-open socket into an error.
+
+`market::sync::LocalBook` rebuilds one book from a snapshot plus deltas. Under `SeqPolicy::Contiguous` a duplicate is ignored and a gap stops the book until the next snapshot. A malformed level rejects the whole message and desyncs the book. After each delta the book is reconciled with the venue-reported best bid and ask (`VenueTop`), then checked for a crossed state, which also desyncs it. A desynced book publishes nothing.
+
+`market::clob_book::ClobBookStream` adapts the Polymarket market channel to `LocalBook`. Polymarket sends no sequence numbers and its timestamps are not ordered across event types, so messages are sequenced by arrival on the connection. Fills arrive as `last_trade_price` events without a level removal, which is why each `price_change` entry's `best_bid` / `best_ask` is used for reconciliation. Any desync ends the session, and the app refetches a REST snapshot before resubscribing.
+
+## Observability
+
+`poly_core::FeedMetrics` holds relaxed atomic counters per feed (messages, malformed frames, reconnects, resyncs, connection state, last receive time, last exchange timestamp and a 10-second message-rate ring). `app::metrics::Metrics` renders them at `GET /metrics` in Prometheus text format, including a stale flag per feed. `LOG_FORMAT=json` switches `tracing` output to JSON lines.
+
 ## Control plane
 
-The Axum dashboard exposes state, history, fills, trades, health, and same-origin WebSocket endpoints. State-changing dry-run controls are registered only when `CONTROL_TOKEN` is configured and require an exact Bearer token.
+The Axum dashboard exposes state, history, fills, trades, health, Prometheus metrics, and same-origin WebSocket endpoints. State-changing dry-run controls are registered only when `CONTROL_TOKEN` is configured and require an exact Bearer token.
 
 Non-loopback dry-run operation requires a control token with at least 32 characters. Public shadow demos remain read-only.
 
