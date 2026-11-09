@@ -1,0 +1,25 @@
+# cargo +nightly fuzz run -O recording_reader fuzz/corpus/recording_reader -- -max_total_time=300 -print_final_stats=1 (2026-11-09, Apple M5)
+# log trimmed to the first lines and the final stats; corpus grew to 58 inputs (not committed, seeds only)
+   Compiling poly-fuzz v0.0.0 (/Users/arnav/Documents/polymarket-pricing-research/fuzz)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.97s
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.09s
+     Running `fuzz/target/aarch64-apple-darwin/release/recording_reader -artifact_prefix=/Users/arnav/Documents/polymarket-pricing-research/fuzz/artifacts/recording_reader/ -max_total_time=300 -print_final_stats=1 fuzz/corpus/recording_reader`
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 1498330032
+INFO: Loaded 1 modules   (68465 inline 8-bit counters): 68465 [0x1024d4340, 0x1024e4eb1), 
+INFO: Loaded 1 PC tables (68465 PCs): 68465 [0x1024e4eb8,0x1025f05c8), 
+...
+"\001@\000\000" # Uses: 48146
+"\025\001\000\000\000\000\000\000" # Uses: 37487
+"\006\000\000\000\000\000\000\000" # Uses: 34708
+"\000\000\000\000\000\000\000\000" # Uses: 24929
+"\346n\330'" # Uses: 24929
+"\012\000\000\000" # Uses: 24816
+"\004\221\005\\" # Uses: 22647
+###### End of recommended dictionary. ######
+Done 14228769 runs in 301 second(s)
+stat::number_of_executed_units: 14228769
+stat::average_exec_per_sec:     47271
+stat::new_units_added:          359
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              528

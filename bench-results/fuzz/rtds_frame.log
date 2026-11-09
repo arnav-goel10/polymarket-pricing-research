@@ -1,0 +1,25 @@
+# cargo +nightly fuzz run -O rtds_frame fuzz/corpus/rtds_frame -- -max_total_time=300 -print_final_stats=1 (2026-11-09, Apple M5)
+# log trimmed to the first lines and the final stats; corpus grew to 1219 inputs (not committed, seeds only)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.18s
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.08s
+     Running `fuzz/target/aarch64-apple-darwin/release/rtds_frame -artifact_prefix=/Users/arnav/Documents/polymarket-pricing-research/fuzz/artifacts/rtds_frame/ -max_total_time=300 -print_final_stats=1 fuzz/corpus/rtds_frame`
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 584457750
+INFO: Loaded 1 modules   (68201 inline 8-bit counters): 68201 [0x1010a3f30, 0x1010b4999), 
+INFO: Loaded 1 PC tables (68201 PCs): 68201 [0x1010b49a0,0x1011bf030), 
+INFO:        2 files found in fuzz/corpus/rtds_frame
+...
+"\004\000\000\000" # Uses: 7177
+"Y\002\000\000" # Uses: 6876
+"\314\314\314\014" # Uses: 6209
+"\377\014" # Uses: 5046
+"\000\000\000F" # Uses: 2405
+"H\000\000\000\000\000\000\000" # Uses: 1053
+"\001\000\000\000\000\000\000A" # Uses: 360
+###### End of recommended dictionary. ######
+Done 9592850 runs in 301 second(s)
+stat::number_of_executed_units: 9592850
+stat::average_exec_per_sec:     31869
+stat::new_units_added:          10220
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              615

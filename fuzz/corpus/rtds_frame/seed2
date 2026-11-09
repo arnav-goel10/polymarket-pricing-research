@@ -1,0 +1,1 @@
+{"topic":"crypto_prices","type":"subscribe","payload":{"symbol":"btc/usd","data":[{"timestamp":1,"value":64175.9},{"timestamp":2,"value":64177.1}]}}

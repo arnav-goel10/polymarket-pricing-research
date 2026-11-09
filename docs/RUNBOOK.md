@@ -78,7 +78,7 @@ Present only when `RECORD_PATH` is set.
 
 - **Alerts:** `PolyRecorderDropping` on any drop in 5 min. `PolyRecorderQueueFilling` when depth stays above half of `poly_recorder_queue_capacity` for 1 min.
 - **Meaning:** the disk cannot keep up. Drops never slow the feeds (by design), but the recording now has gaps and is not suitable for exact replay.
-- **Action:** move `RECORD_PATH` to a faster local disk. Live sessions write roughly 1 MB per second.
+- **Action:** move `RECORD_PATH` to a faster local disk. A 10-minute live session wrote 425 MB, about 0.7 MB per second.
 
 ### poly_uptime_seconds
 

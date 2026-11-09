@@ -1,0 +1,25 @@
+# cargo +nightly fuzz run -O clob_book_stream fuzz/corpus/clob_book_stream -- -max_total_time=300 -print_final_stats=1 (2026-11-09, Apple M5)
+# log trimmed to the first lines and the final stats; corpus grew to 1492 inputs (not committed, seeds only)
+   Compiling feeds v0.1.0 (/Users/arnav/Documents/polymarket-pricing-research/crates/feeds)
+   Compiling market v0.1.0 (/Users/arnav/Documents/polymarket-pricing-research/crates/market)
+   Compiling poly-fuzz v0.0.0 (/Users/arnav/Documents/polymarket-pricing-research/fuzz)
+    Finished `release` profile [optimized + debuginfo] target(s) in 6.35s
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.24s
+     Running `fuzz/target/aarch64-apple-darwin/release/clob_book_stream -artifact_prefix=/Users/arnav/Documents/polymarket-pricing-research/fuzz/artifacts/clob_book_stream/ -max_total_time=300 -print_final_stats=1 fuzz/corpus/clob_book_stream`
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 1195386779
+...
+"\000\003" # Uses: 188
+"[\000\000\000\000\000\000\000" # Uses: 148
+"\000\010" # Uses: 128
+"\014\000\000\000\000\000\000\000" # Uses: 149
+"\000\000\000\374" # Uses: 135
+"\005\000\000\000" # Uses: 58
+"\376\377\377\370" # Uses: 25
+###### End of recommended dictionary. ######
+Done 1219730 runs in 301 second(s)
+stat::number_of_executed_units: 1219730
+stat::average_exec_per_sec:     4052
+stat::new_units_added:          10047
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              475

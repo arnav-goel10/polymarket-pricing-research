@@ -1,0 +1,25 @@
+# cargo +nightly fuzz run -O binance_message fuzz/corpus/binance_message -- -max_total_time=300 -print_final_stats=1 (2026-11-09, Apple M5)
+# log trimmed to the first lines and the final stats; corpus grew to 1434 inputs (not committed, seeds only)
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.29s
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.11s
+     Running `fuzz/target/aarch64-apple-darwin/release/binance_message -artifact_prefix=/Users/arnav/Documents/polymarket-pricing-research/fuzz/artifacts/binance_message/ -max_total_time=300 -print_final_stats=1 fuzz/corpus/binance_message`
+INFO: Running with entropic power schedule (0xFF, 100).
+INFO: Seed: 886378922
+INFO: Loaded 1 modules   (68200 inline 8-bit counters): 68200 [0x10250bfd0, 0x10251ca38), 
+INFO: Loaded 1 PC tables (68200 PCs): 68200 [0x10251ca38,0x1026270b8), 
+INFO:        2 files found in fuzz/corpus/binance_message
+...
+"\0005" # Uses: 3447
+"\001\000" # Uses: 3212
+"\375\377\377\377" # Uses: 2305
+"\000\000\000\000\000\000\000\011" # Uses: 1986
+"4\000\000\000" # Uses: 1539
+"\003\032\000\000" # Uses: 1357
+"\0016" # Uses: 53
+###### End of recommended dictionary. ######
+Done 10027585 runs in 301 second(s)
+stat::number_of_executed_units: 10027585
+stat::average_exec_per_sec:     33314
+stat::new_units_added:          11220
+stat::slowest_unit_time_sec:    0
+stat::peak_rss_mb:              590

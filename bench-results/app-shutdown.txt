@@ -1,0 +1,11 @@
+# App lifecycle check, 2026-11-09 +08, commit 64b848e
+# BIND_ADDR=127.0.0.1:8099 RECORD_PATH=app-shutdown.prec LOG_FORMAT=json target/release/app --mode shadow; curl /healthz /readyz /metrics; kill -TERM <pid>
+healthz: 200 readyz(3s): {"killed":false,"ready":true,"stale_feeds":[]} 200   (curl output copied from the run)
+poly_recorder_written_total 43650 / dropped 0 / queue_depth 0 / capacity 65536 (scrape before SIGTERM)
+process exited after SIGTERM
+{"timestamp":"2026-11-09T06:41:04.985764Z","level":"INFO","fields":{"message":"recording raw frames","path":"/private/tmp/claude-501/-Users-arnav-Documents-ienergy-chatbot/7e22b042-5669-4e36-aa75-a860
+{"timestamp":"2026-11-09T06:41:19.699910Z","level":"INFO","fields":{"message":"shutdown requested","signal":"SIGTERM"},"target":"app"}
+{"timestamp":"2026-11-09T06:41:19.700136Z","level":"INFO","fields":{"message":"feed tasks stopped"},"target":"app"}
+{"timestamp":"2026-11-09T06:41:19.704613Z","level":"INFO","fields":{"message":"recorder flushed","records":43663,"bytes":16651597,"dropped":0},"target":"app"}
+{"timestamp":"2026-11-09T06:41:19.704634Z","level":"INFO","fields":{"message":"shutdown complete"},"target":"app"}
+app-shutdown.prec: 43663 records, 16651597 bytes, 14.2 s, rtds=15 binance=27267 clob_book=16380 control=1, truncated_tail=None

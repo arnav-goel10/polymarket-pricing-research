@@ -21,7 +21,7 @@ Non-functional
 | Bounded memory under any input rate | no unbounded queues | backpressure test, soak test |
 | Clean shutdown | no truncated recording, sockets closed | SIGTERM test |
 
-Non-goals: horizontal scaling (one process handles one contract at a few thousand messages per second), exactly-once delivery across restarts, order submission of any kind.
+Non-goals: horizontal scaling (one process handles one contract; a 10-minute live recording averaged about 1,600 messages per second across the three feeds), exactly-once delivery across restarts, order submission of any kind.
 
 ## Architecture
 
@@ -69,7 +69,7 @@ The reader yields every complete record and reports a partial final record as `T
 | Recorder backpressure | Bounded queue, drop newest and count | Block the producer; unbounded queue; drop oldest | Blocking stalls the socket reader, and a stalled reader is what makes the exchange connection go stale. Unbounded grows memory without limit when the disk is slow. Drop-oldest and drop-newest have the same memory bound. Drop-newest is what `try_send` does without extra locking, and the drop counter makes the gap visible either way. |
 | Recorder writer | Dedicated OS thread, `std::sync::mpsc::sync_channel` | tokio task with async file I/O | File writes are blocking syscalls. A thread keeps them off the runtime's worker threads and needs no async file layer. |
 | Dashboard fan-out | `tokio::sync::watch` (latest value only) | broadcast channel per client | A slow browser can only ever be one snapshot behind. No per-client queue can grow. |
-| Metrics | Hand-rolled Prometheus text over atomics | `prometheus` or `metrics` crates | Fourteen series. Relaxed atomics on the hot path, no registry lock, no extra dependency. Would switch to a crate once histograms are needed. |
+| Metrics | Hand-rolled Prometheus text over atomics | `prometheus` or `metrics` crates | Fourteen metric families. Relaxed atomics on the hot path, no registry lock, no extra dependency. Would switch to a crate once histograms are needed. |
 | Liveness vs readiness | `/healthz` ignores feeds, `/readyz` requires all feeds fresh | One health endpoint | An exchange outage should take the instance out of rotation, not get it restarted in a loop. |
 | Reconnect backoff | Exponential 250 ms to 10 s, reset after 30 s healthy, no jitter | Fixed delay (the old 2 s); jittered backoff | One client per feed, so no thundering herd to spread out. Deterministic delays keep the tests exact. |
 
