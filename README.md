@@ -13,7 +13,7 @@ A real-time market-data and pricing engine in Rust, run as a paper-only simulati
 | Order-book messages parsed and applied, one core ([raw](bench-results/2026-11-09.txt)) | **1.7 million / s** |
 | Memory over the 10-minute soak ([raw](bench-results/soak-2026-11-09.csv)) | **flat, 6.5 to 7.7 MiB** |
 | Fuzzing, 4 targets × 5 min ([raw](bench-results/fuzz/)) | **35 million inputs, 0 crashes** |
-| Tests and line coverage ([tests](bench-results/ci-local.txt), [coverage](bench-results/coverage.txt)) | **230 tests, 69% of lines** |
+| Tests and line coverage ([tests](bench-results/ci-local.txt), [coverage](bench-results/coverage.txt)) | **231 tests, 69% of lines** |
 | 10-minute live recording replayed, and a 150 s live check ([raw](bench-results/2026-11-09.txt), [live](bench-results/live-book-health.txt)) | **0 book resyncs, 0 crossed books** |
 
 Measured on an Apple M5 laptop. Method and full tables are under [Benchmarks](#benchmarks).
@@ -73,7 +73,7 @@ How it is tested:
 - **Fault injection** ([`crates/feeds/tests/fault_injection.rs`](crates/feeds/tests/fault_injection.rs), [`crates/market/tests/stream_faults.rs`](crates/market/tests/stream_faults.rs)) runs the real streaming loops against a local WebSocket server that drops connections mid-stream, sends garbage, goes silent, or refuses connections.
 - **Fuzzing** ([`fuzz/`](fuzz/fuzz_targets)) runs the RTDS and Binance parsers, the order-book stream and the recording reader under libFuzzer. The book target also checks that every published book is sorted and uncrossed. The reader target checks that every record it accepts re-encodes to the same bytes.
 - **Real data.** A 10-minute live recording (953,972 frames) replays with zero resyncs. A 4 MB slice is committed and replayed in CI ([`crates/app/tests/live_sample.rs`](crates/app/tests/live_sample.rs)).
-- **Live check.** Before the venue-top fix, the shadow app resynced 6 times in its first 90 seconds on the public feed. After it, 150 seconds and 67,920 book updates produced no resync and no crossed book ([`bench-results/live-book-health.txt`](bench-results/live-book-health.txt)).
+- **Live check.** Before the book was trimmed to the venue's best bid and ask, the app resynced 6 times in its first 90 seconds on the public feed. After it, 150 seconds and 67,920 book updates produced no resync and no crossed book ([`bench-results/live-book-health.txt`](bench-results/live-book-health.txt)).
 
 The old stream code had two bugs these tests target. It published crossed books, and it turned a malformed snapshot into a partial book. Both are recorded in [`bench-results/legacy-book-bugs.txt`](bench-results/legacy-book-bugs.txt).
 
@@ -90,7 +90,7 @@ poly_feed_stale{feed="clob_book"} 0
 
 Logs are structured `tracing` events. `LOG_FORMAT=json` prints one JSON object per line with fields such as `feed`, `retry_in_ms` and `error`.
 
-[docs/RUNBOOK.md](docs/RUNBOOK.md) explains each signal, the alert it should drive and what to do. Alert rules are in [`ops/prometheus/alerts.yml`](ops/prometheus/alerts.yml) and a Grafana dashboard is in [`ops/grafana/poly-feeds.json`](ops/grafana/poly-feeds.json). Both are unvalidated, since promtool and Grafana were not available here. [docs/DESIGN.md](docs/DESIGN.md) covers requirements, data flow, trade-offs and failure modes.
+[docs/RUNBOOK.md](docs/RUNBOOK.md) explains each signal, the alert it should drive and what to do. Alert rules are in [`ops/prometheus/alerts.yml`](ops/prometheus/alerts.yml) and a Grafana dashboard is in [`ops/grafana/poly-feeds.json`](ops/grafana/poly-feeds.json). Neither has been validated with promtool or loaded into Grafana yet. [docs/DESIGN.md](docs/DESIGN.md) covers requirements, data flow, trade-offs and failure modes.
 
 ## Recording and replay
 
@@ -135,11 +135,11 @@ Per-frame latency on the 10-minute live recording (`latency_report --recording`)
 | Order book | 497,943 | 2.6 µs | 4.3 µs | 20.7 µs |
 | Reference price | 590 | 3.8 µs | 4.5 µs | 5.3 µs |
 
-Throughput on the recording varies with the measurement. The Criterion median is 256,000 frames/s, with a wide interval of 216,000 to 317,000. A single timed pass gives 421,000, and the 10-minute soak sustained 396,000. Each latency sample includes one pair of clock reads. Real order-book frames run larger than synthetic ones, often carrying both outcome tokens, so they cost more than the 1.7 µs synthetic p50. The COS Variance-Gamma model takes most of the per-frame time.
+These are processing costs, measured to show headroom. End to end, network lag (0.04 to 0.12 s in the live scrape above) and the engine's 250 ms decision tick dominate, and the pipeline keeps up with the live feed rate on a small fraction of one core. Throughput on the recording varies with the measurement. The Criterion median is 256,000 frames/s, with a wide interval of 216,000 to 317,000. A single timed pass gives 421,000, and the 10-minute soak sustained 396,000. Each latency sample includes one pair of clock reads. Real order-book frames run larger than synthetic ones, often carrying both outcome tokens, so they cost more than the 1.7 µs synthetic p50. The COS Variance-Gamma model takes most of the per-frame time.
 
 ## Research findings
 
-I built the engine to find out whether digital-option models price these contracts well, and whether any apparent edge survives a correction for testing many correlated variants. They do the first. Nothing survives the second.
+I built the engine to find out whether digital-option models price these contracts well, and whether any apparent edge survives a correction for testing many correlated variants. The models forecast well. No simulated strategy holds up after the correction.
 
 Source: the committed paper ledger [`fixtures/shadow-ledger-v1`](fixtures/shadow-ledger-v1) (5,000 paper-fill rows over 334 five-minute windows, 500 scored forecasts per model), summarised in [`demo/summary.json`](demo/summary.json) and the [research audit](docs/research-audit.md).
 
@@ -200,7 +200,7 @@ cargo +nightly llvm-cov --workspace --summary-only   # coverage
 cargo +nightly fuzz run recording_reader -- -max_total_time=300
 ```
 
-CI also checks dependencies with cargo-deny, measures coverage, compiles the benchmarks, runs each fuzz target briefly, replays the committed recording, and builds and smoke-tests the container. The container job has not run yet, since Docker was not available locally. CI fails if the committed research summary cannot be regenerated byte-for-byte.
+CI also checks dependencies with cargo-deny, measures coverage, compiles the benchmarks, runs each fuzz target briefly, replays the committed recording, and builds and smoke-tests the container. The container job has not been run yet. CI fails if the committed research summary cannot be regenerated byte-for-byte.
 
 ## License
 

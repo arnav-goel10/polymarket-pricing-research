@@ -1,6 +1,6 @@
 # Live order-book health on the public Polymarket market channel, 2026-11-09 +08
 
-## Before venue-top reconciliation (commit 0257461, shadow app, first ~90 s)
+## Before venue-top reconciliation (commit 0257461, shadow app started 2026-11-09T04:54:31Z, first ~90 s)
 # Source: JSON logs of target/release/app --mode shadow; and bench-results/live-metrics-sample.txt
 {"timestamp":"2026-11-09T04:55:03.411748Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}
 {"timestamp":"2026-11-09T04:55:07.387207Z","level":"WARN","fields":{"message":"book resync","feed":"clob_book","token_id":"111142650236720196122039582453652475982754653231093838605512753100674789898082","error":"clob book desynced (Crossed); resync required"},"target":"market::clob_book"}

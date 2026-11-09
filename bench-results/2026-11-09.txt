@@ -1,7 +1,7 @@
 # Poly benchmark run 2026-11-09 16:32 +08, commit e0962f9
 # rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)
 # cpu: Apple M5, 10 cores, 16 GB RAM, macOS 27.2
-# command: POLY_RECORDING=/private/tmp/claude-501/-Users-arnav-Documents-ienergy-chatbot/7e22b042-5669-4e36-aa75-a8607a3c6008/scratchpad/live-10min.prec scripts/bench.sh
+# command: POLY_RECORDING=live-10min.prec scripts/bench.sh   (local 425 MB recording, sha256 in live-recording.txt)
 
 replay/merge_3_feeds    time:   [822.59 µs 824.01 µs 825.55 µs]
                         thrpt:  [121.10 Melem/s 121.33 Melem/s 121.54 Melem/s]

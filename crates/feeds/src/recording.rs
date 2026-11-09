@@ -247,6 +247,11 @@ impl<R: Read> RecordReader<R> {
         }
         let len = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
         let crc = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        // Some filesystems leave zero-filled blocks after a crash. A zero
+        // length never occurs in a real record, so treat it as the tail.
+        if len == 0 && crc == 0 {
+            return Err(ReadError::TruncatedTail { offset: start });
+        }
         if len > MAX_RECORD_BYTES || (len as usize) < PAYLOAD_PREFIX {
             return Err(ReadError::BadLength { offset: start, len });
         }
@@ -354,6 +359,13 @@ mod tests {
     fn every_truncation_point_yields_a_clean_prefix() {
         let full = sample();
         let (all, _) = read_bytes(&full);
+        // Byte offsets where a record ends (cutting there loses nothing).
+        let mut boundaries = vec![HEADER_LEN];
+        let mut at = HEADER_LEN;
+        while at < full.len() {
+            at += 8 + u32::from_le_bytes(full[at..at + 4].try_into().unwrap()) as usize;
+            boundaries.push(at);
+        }
         for cut in 0..full.len() {
             let (recs, err) = read_bytes(&full[..cut]);
             if cut < HEADER_LEN {
@@ -365,14 +377,28 @@ mod tests {
                 all[..recs.len()],
                 "prefix must match at cut {cut}"
             );
-            let boundary = err.is_none();
-            if !boundary {
+            if boundaries.contains(&cut) {
+                assert!(err.is_none(), "cut {cut} is a record boundary: {err:?}");
+            } else {
                 assert!(
                     matches!(err, Some(ReadError::TruncatedTail { .. })),
-                    "cut {cut}: {err:?}"
+                    "cut {cut} is mid-record and must be reported: {err:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn zero_filled_tail_after_a_crash_is_a_truncated_tail() {
+        let mut v = sample();
+        let (all, _) = read_bytes(&v);
+        v.extend_from_slice(&[0u8; 4096]);
+        let (recs, err) = read_bytes(&v);
+        assert_eq!(recs, all);
+        assert!(
+            matches!(err, Some(ReadError::TruncatedTail { .. })),
+            "{err:?}"
+        );
     }
 
     #[test]
