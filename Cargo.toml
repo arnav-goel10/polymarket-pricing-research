@@ -3,22 +3,22 @@ members = ["crates/poly_core", "crates/pricing", "crates/stats", "crates/feeds",
 resolver = "2"
 
 [workspace.dependencies]
-statrs = "0.17"
+statrs = "0.19"
 serde = { version = "1", features = ["derive"] }
 approx = "0.5"
 proptest = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-reqwest = { version = "0.12", features = ["json"] }
-alloy-primitives = "0.8"
-alloy-sol-types = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "charset", "http2", "system-proxy"] }
+alloy-primitives = "1.6"
+alloy-sol-types = "1.6"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 serde_json = "1"
 thiserror = "2"
 futures-util = "0.3"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

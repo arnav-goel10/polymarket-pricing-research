@@ -44,12 +44,12 @@ pub fn decode_full_report(raw: &[u8]) -> Result<V3Report, DecodeError> {
         Vec<FixedBytes<32>>,
         FixedBytes<32>,
     );
-    let (_ctx, report_data, _rs, _ss, _vs) = <Outer as SolValue>::abi_decode_params(raw, true)
+    let (_ctx, report_data, _rs, _ss, _vs) = <Outer as SolValue>::abi_decode_params_validate(raw)
         .map_err(|e| DecodeError::Abi(e.to_string()))?;
 
     type Inner = (FixedBytes<32>, u32, u32, U256, U256, u32, I256, I256, I256);
     let (feed_id, valid_from, observations, _native, _link, expires, price, bid, ask) =
-        <Inner as SolValue>::abi_decode_params(report_data.as_ref(), true)
+        <Inner as SolValue>::abi_decode_params_validate(report_data.as_ref())
             .map_err(|e| DecodeError::Abi(e.to_string()))?;
 
     Ok(V3Report {

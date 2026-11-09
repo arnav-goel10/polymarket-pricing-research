@@ -137,7 +137,7 @@ async fn handle_socket(mut socket: WebSocket, s: Shared) {
             Ok(t) => t,
             Err(_) => break,
         };
-        if socket.send(Message::Text(txt)).await.is_err() {
+        if socket.send(Message::Text(txt.into())).await.is_err() {
             break;
         }
         if rx.changed().await.is_err() {
