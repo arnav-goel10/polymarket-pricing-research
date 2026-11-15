@@ -411,9 +411,11 @@ impl<C: Clock> Lease for MemoryLease<C> {
     }
 
     fn fence(&self, epoch: Epoch, write: &mut dyn FnMut()) -> Result<(), FenceError> {
-        let now = self.clock.now_millis();
         // Held across the write, so the lease cannot change in between.
         let s = self.lock();
+        // Read the clock after locking, so a write that waited for the lock
+        // is checked against the time it actually runs at.
+        let now = self.clock.now_millis();
         check_epoch(s.live(now).map(|g| g.epoch), epoch)?;
         write();
         Ok(())

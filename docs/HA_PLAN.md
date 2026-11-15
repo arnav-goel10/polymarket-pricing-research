@@ -25,6 +25,7 @@ Out of scope: Raft, a broker, and a public raw-data stream. Re-serving exchange 
 - **A. Event identity, merge and lease core.** Includes a tool that measures key uniqueness on the real recording. No cloud needed; builds in GitHub Actions. Done, see the High availability section of [DESIGN.md](DESIGN.md).
 - **B.** Stream API with snapshot, sequence and resume. Client library with hedged subscribe. Chaos harness in CI with mutants that must fail.
 - **C.** AWS: Terraform, two or three t4g.nano or micro nodes, DynamoDB lease, S3 archive, a Budgets alarm. Needs the AWS account.
+  The in-process lease holds its lock while a write runs, which only works in memory. On AWS an S3 upload cannot be atomic with a DynamoDB check, so the archive must enforce the epoch itself: each object key carries the epoch and the upload is a conditional put, and the lease is renewed outside the upload.
 - **D.** Alerts to a phone, a public status page, runbook updates, the first live kill drill.
 - **E.** Operate for weeks, a postmortem per incident, Linux numbers, a README rewrite, and decisions on the repo name and on publishing crates.
 
