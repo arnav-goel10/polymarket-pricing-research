@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, ha-failover]
   pull_request:
 
 permissions:
@@ -24,6 +24,8 @@ jobs:
       - run: cargo run -p app --bin replay -- fixtures/replay-sample.json --json
       - name: Replay the committed live recording
         run: cargo run --release -p app --bin latency_report -- --recording fixtures/live-sample.prec
+      - name: Check event keys on the committed live recording
+        run: cargo run --release -p ha --bin keycheck -- fixtures/live-sample.prec --fail-on-collision
 
   benches:
     runs-on: ubuntu-latest
