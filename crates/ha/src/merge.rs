@@ -203,6 +203,9 @@ impl Merger {
         let w = &mut self.windows[i];
         let c = &mut self.counters[i];
 
+        if ev.venue_ts_millis.is_none() {
+            c.untimed += 1;
+        }
         if w.seen.contains(&ev.key) {
             c.duplicates += 1;
             return Verdict::Duplicate;
@@ -215,10 +218,7 @@ impl Merger {
                 }
                 t
             }
-            None => {
-                c.untimed += 1;
-                w.max_seen.unwrap_or(w.floor)
-            }
+            None => w.max_seen.unwrap_or(w.floor),
         };
 
         if w.seen.len() >= w.cfg.capacity {
