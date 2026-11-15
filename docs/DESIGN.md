@@ -96,22 +96,41 @@ The reader yields every complete record and reports a partial final record as `T
 
 The plan is two or three identical nodes, each reading the same public feeds on its own, with the client merging their streams ([HA_PLAN.md](HA_PLAN.md)). Every node sees the same venue, so no replicated log is needed. What is needed is a way to tell that two nodes saw the same event, a merge that uses it, and a single node chosen to archive. Milestone A builds those three pieces in `crates/ha`. No node runs them in production yet, and the single-process mode above is unchanged.
 
-**Event keys** (`ha::key`). A key is a kind plus a 128-bit id, built only from fields the venue sent. Receive time, node id and connection id never go in. One frame can hold several events (a CLOB `price_change` frame carries changes for both outcome tokens; an RTDS snapshot carries many points), so keys are per event.
+**Event keys** (`ha::key`). A key is a kind, a 128-bit id and the venue timestamp, built only from fields the venue sent. Receive time, node id and connection id never go in. One frame can hold several events (a CLOB `price_change` frame carries changes for both outcome tokens; an RTDS snapshot carries many points), so keys are per event. The timestamp is part of the key, so two copies of one key always carry the same timestamp, and each rule uses only a timestamp that is the same in every copy.
 
 | Event | Key fields |
 | --- | --- |
-| Binance `aggTrade` / `bookTicker` | symbol + aggregate trade id `a` / book update id `u`, kept exactly |
+| Binance `aggTrade` / `bookTicker` | symbol + aggregate trade id `a` / book update id `u`, kept exactly, + engine time `T` |
 | RTDS price, live or snapshot point | topic, symbol, the point's own timestamp |
 | CLOB `book` | asset id, hash, timestamp |
-| CLOB `price_change` entry | asset id, hash, timestamp, side, price |
+| CLOB `price_change` entry | asset id, hash, timestamp, side, price, size |
 | CLOB `best_bid_ask` | asset id, timestamp, best bid, best ask |
 | CLOB `last_trade_price` | asset id, transaction hash, timestamp, side, price, size |
 
+Binance uses `T` only. `E` is the push time, it differs from `T` in 1,435 of the 5,697 recorded frames, and nothing promises it matches across connections, so it is never a fallback. A Binance message without `T` keeps its sequence key and is untimed. Size is in the price change key by decision: an entry gives the new total size at one level, so two entries that differ only in size are two states of that level and neither may be dropped. The recording does not force this (the key without size also has 0 collisions there).
+
 Anything else becomes `Unkeyed` with a fingerprint of its content, and is counted. Keepalives are not events.
 
-**Merge** (`ha::merge`). Each feed has a window of recently delivered keys, bounded by a venue-time span and a hard capacity, both preallocated. A key in the window is a duplicate. A key older than the window's horizon is late: dropped and counted per feed, never passed on as new, because a late copy cannot be told from a duplicate whose key has left the window. If every node delivers within the span, the output is exactly the union of what the nodes received, each event once. A property test checks this over random subsets of a base stream at up to four nodes with random delays. A second property checks that nothing is delivered twice at any lateness. Two broken mergers (one that ignores the horizon, one that uses half the span) are run against the same properties, and the test fails unless both are caught.
+**Merge** (`ha::merge`). Each feed has a window of recently delivered keys, bounded by a venue-time span and a hard capacity, both preallocated. A key in the window is a duplicate. A timed key not in the window is late if its timestamp is below the horizon (newest timestamp minus span) or if it is at or below the floor, the largest (timestamp, key) the capacity cap has pushed out. Late keys are dropped and counted per feed, never passed on as new, because a late copy cannot be told from a duplicate whose key has left the window.
 
-**Lease** (`ha::lease`). A `Lease` trait (acquire, renew, release, current) hands out a strictly higher fencing epoch for every tenure. `MemoryLease` implements it with an injected clock. The sink enforces the fence: `Fenced<T>` refuses writes under an epoch older than the highest it has accepted, and a new leader calls `advance` before its first write. Tests cover expiry, takeover, and the zombie case, where the old leader wakes after its lease has expired and its write is refused. A lease that reuses epochs is shown to fail both the zombie test and a random-schedule property.
+What is guaranteed:
+
+- A timed key is never delivered twice, at any lateness and any capacity. The window position comes from the key itself, so no copy can slip past under another timestamp.
+- If every node delivers within the span and the capacity holds one span of keys, the output is exactly the union of what the nodes received, each timed key once, and nothing is late.
+- When the cap bites, a key is dropped as late only if at least `capacity` keys ordered after it were already delivered. The floor is the exact key pushed out, so other keys at the same millisecond still get through.
+
+What is not:
+
+- Untimed keys (unkeyed raw frames, Binance without `T`) are kept apart, never late, deduplicated while in the window, and can come out twice after that. They never move the floor, so they cannot make a timed event late.
+- If a venue sent one sequence number with two different timestamps, those are two keys and both come out.
+
+Two property tests check this over random subsets of a base stream at up to four nodes with random delays, with untimed events, unkeyed kinds, the same id under several kinds and feeds, and the same kind and id at several timestamps. One checks the union when lateness fits. The other checks, at any lateness and capacity, that nothing timed comes out twice, that every late drop had one of the causes above, and that the delivered, expired, forced-eviction and untimed counters add up. Four broken mergers (no horizon, half the span, no floor, and a floor that blocks the whole millisecond as the first version did) run against the same properties, and the test fails unless all four are caught.
+
+**Lease** (`ha::lease`). A `Lease` trait (acquire, renew, release, current, fence) hands out a strictly higher fencing epoch for every tenure. The contract requires that across restarts too: a real lease must persist the last epoch in the same atomic write as the grant. `MemoryLease` implements it in memory with an injected clock and does not persist; after a restart it starts at epoch 1, and a sink that remembers a higher epoch refuses every new leader until the lease is started with `MemoryLease::resume` from the saved epoch. Both cases are tested.
+
+The sink enforces the fence by asking the lease at the moment of each write. `Fenced<T, L>` runs a write only if its epoch is the live grant's epoch, as one atomic step with that check (in production a conditional write on the lease store), and never below the highest epoch it has accepted. So a stale grant is refused as soon as it stops being live: after takeover before the new leader has written anything, after expiry before anyone takes over, and after the writer's own release. Nothing depends on the new leader acting first. The first version only remembered the highest accepted epoch and needed the new leader to call `advance` before any zombie write; that design is kept as a test mutant and the zombie-in-the-gap test shows it accepts the stale write.
+
+A random-schedule property runs three nodes, each with its own clock offset from the store's by up to 20 ms, against a separate model of the lease contract. Every node keeps writing with the newest grant it ever got, after expiry, takeover and its own release. It checks that every call returns what the contract says, that epochs rise, that a write is accepted exactly when its epoch is live, and that at most one node believes it leads, where a node believes only while its own clock is a full skew bound before expiry. Four broken variants must be caught: a lease that reuses epochs, one that renews after expiry, a sink that only remembers the highest epoch, and nodes that ignore clock skew.
 
 **Measured on the committed live recording** (`keycheck`, run in CI on `fixtures/live-sample.prec`):
 
@@ -121,15 +140,15 @@ Anything else becomes `Unkeyed` with a fingerprint of its content, and is counte
 | Binance | 5,697 | 5,697 | 5,697 | 0 | 0 | 0 |
 | CLOB | 4,238 | 8,389 | 8,389 | 0 | 0 | 8 |
 
-A collision would mean two different events sharing a key, so the merger would drop a real one. A repeat is the same key with the same content, so dropping the second copy loses nothing. The first planned CLOB key (asset id, hash, timestamp) had 298 collisions on the same file. Different frames at the same millisecond can carry the same hash for the same asset at a different price, which is why side and price are in the key. A test pins these numbers.
+A collision would mean two different events sharing a key, so the merger would drop a real one. A repeat is the same key with the same content, so dropping the second copy loses nothing. Content is the whole venue event, not only the fields outside the key, so a collision on any field shows; for unkeyed events, whose key already is their content, it is the raw frame. The 8 CLOB repeats are price change entries identical in every field, envelope included. The first planned CLOB key (asset id, hash, timestamp) had 298 collisions on the same file. Different frames at the same millisecond can carry the same hash for the same asset at a different price, which is why side and price are in the key. A test pins these numbers.
 
 Limits, stated plainly:
 
 - The fixture is about 10 minutes from one session. It has no Binance trades and only 5 RTDS frames, so those keys are checked by unit tests and by the venue's documented semantics more than by data. The CLOB numbers are the strong evidence.
 - Key uniqueness on one node's recording does not prove two nodes see the same fields. That needs two simultaneous recordings, which is milestone B.
-- Unkeyed events merge by content and have no venue time, so they are not protected against late copies and can come out twice. None occurred in the fixture.
+- Unkeyed events merge by content. Without a venue time they are not protected against late copies and can come out twice. None occurred in the fixture.
 - Late events are dropped. Size the span above the worst node lag and watch the late counter.
-- The lease is in memory with one shared clock. A real lease needs a store with conditional writes and a margin for clock skew between hosts.
+- The lease is in memory and does not persist its epoch. A real lease needs a store with conditional writes that persists the epoch and decides expiry by its own clock. The skew bound of 20 ms in the tests is an assumption; on real hosts it has to be measured and the margin set above it.
 
 ## Known gaps
 

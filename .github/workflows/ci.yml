@@ -19,13 +19,13 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --all-targets
-      - run: cargo run -p app --bin replay -- fixtures/replay-sample.json --json
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace --all-targets
+      - run: cargo run --locked -p app --bin replay -- fixtures/replay-sample.json --json
       - name: Replay the committed live recording
-        run: cargo run --release -p app --bin latency_report -- --recording fixtures/live-sample.prec
+        run: cargo run --locked --release -p app --bin latency_report -- --recording fixtures/live-sample.prec
       - name: Check event keys on the committed live recording
-        run: cargo run --release -p ha --bin keycheck -- fixtures/live-sample.prec --fail-on-collision
+        run: cargo run --locked --release -p ha --bin keycheck -- fixtures/live-sample.prec --fail-on-collision
 
   benches:
     runs-on: ubuntu-latest
@@ -35,7 +35,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Compile benchmarks (not run; CI machines are too noisy to gate on)
-        run: cargo bench --workspace --no-run
+        run: cargo bench --locked --workspace --no-run
 
   deny:
     runs-on: ubuntu-latest
@@ -56,7 +56,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov --workspace --summary-only
+      - run: cargo llvm-cov --locked --workspace --summary-only
       - run: cargo llvm-cov report --lcov --output-path lcov.info
       - uses: actions/upload-artifact@v4
         with:
