@@ -4,28 +4,54 @@
 //! so a key is built only from fields the venue sent. Receive time, node id,
 //! connection id and anything else local to one socket never go in.
 //!
-//! A key is a kind plus a 128-bit id. For Binance the id holds the venue's
-//! own sequence number exactly. For the other feeds it is a 128-bit FNV-1a
-//! fingerprint of the identity fields, each length prefixed so that field
-//! boundaries cannot shift. Fingerprints keep the key a fixed 32 bytes with
-//! no heap allocation, which matters because the merger holds tens of
-//! thousands of them. The chance of two different identities sharing a
-//! fingerprint is about n^2 / 2^129, negligible next to the real risk, which
-//! is that the identity fields themselves are not unique. `keycheck`
-//! measures that on a recording.
+//! A key is a kind, a 128-bit id and the event's venue timestamp. The
+//! timestamp is part of the key, not a side value that travels with it: two
+//! copies with the same key always carry the same timestamp, so the merger
+//! can place a key in its window by the key alone. A rule may only use a
+//! timestamp that is the same in every copy of the event, which is why
+//! Binance uses the trade time `T` and never the event time `E` (see below).
+//!
+//! For Binance the id holds the venue's own sequence number exactly. For the
+//! other feeds it is a 128-bit FNV-1a fingerprint of the identity fields,
+//! each length prefixed so that field boundaries cannot shift. Fingerprints
+//! keep the key a fixed size with no heap allocation, which matters because
+//! the merger holds tens of thousands of them. The chance of two different
+//! identities sharing a fingerprint is about n^2 / 2^129, negligible next to
+//! the real risk, which is that the identity fields themselves are not
+//! unique. `keycheck` measures that on a recording.
 //!
 //! One raw frame can carry several events, so keys are per event, not per
 //! frame. The rules, per feed:
 //!
 //! | Feed and event | Identity fields | Why |
 //! | --- | --- | --- |
-//! | Binance `aggTrade` | symbol, aggregate trade id `a` | `a` is the venue's trade sequence |
-//! | Binance `bookTicker` | symbol, book update id `u` | `u` is the venue's book sequence |
+//! | Binance `aggTrade` | symbol, aggregate trade id `a`, trade time `T` | `a` is the venue's trade sequence |
+//! | Binance `bookTicker` | symbol, book update id `u`, transaction time `T` | `u` is the venue's book sequence |
 //! | RTDS price (update or snapshot point) | topic, `payload.symbol`, point `timestamp` | one price per symbol per venue timestamp; a snapshot point and the live update for the same instant share a key |
 //! | CLOB `book` | asset id, `hash`, `timestamp` | the venue's book hash at that time |
-//! | CLOB `price_change`, one key per entry | asset id, `hash`, frame `timestamp`, `side`, `price` | one frame holds changes for both outcome tokens, and the live recording showed different frames at the same millisecond sharing a hash, so asset, hash and time alone collided 298 times; adding side and price removed every collision |
+//! | CLOB `price_change`, one key per entry | asset id, `hash`, frame `timestamp`, `side`, `price`, `size` | see below |
 //! | CLOB `best_bid_ask` | asset id, `timestamp`, `best_bid`, `best_ask` | there is no hash; the quoted top is the event |
 //! | CLOB `last_trade_price` | asset id, `transaction_hash`, `timestamp`, `side`, `price`, `size` | one transaction can fill at several prices |
+//!
+//! Binance time. `T` is set by the matching engine and is the same in every
+//! copy of a message. `E` is the time the message was pushed, and on the
+//! committed recording it differs from `T` in 1,435 of 5,697 frames, so a
+//! node that fell back to `E` could stamp one event differently from a node
+//! that did not. A Binance event without `T` is still keyed by its sequence
+//! number but has no timestamp, and the merger treats it as untimed.
+//!
+//! Price changes. One frame holds changes for both outcome tokens, and the
+//! live recording showed different frames at the same millisecond sharing a
+//! hash for the same asset at a different price, so asset, hash and time
+//! alone collided 298 times. Side and price removed those collisions. Size
+//! is in the key as well, by decision rather than from data: an entry gives
+//! the new total size at one price level, so two entries equal in asset,
+//! hash, millisecond, side and price but different in size would be two
+//! states of that level, and dropping either would leave the book wrong.
+//! The committed recording has no such pair (the key without size also
+//! shows 0 collisions there, and `keycheck` prints that number), so nothing
+//! measured forces this; it costs nothing, because every copy of one entry
+//! carries the same size.
 //!
 //! Anything else (another topic or event type, a frame missing an identity
 //! field, a frame that is not JSON) becomes [`KeyKind::Unkeyed`] with a
@@ -36,10 +62,6 @@
 //! twice. Keepalive frames (`PING`, `PONG`, empty acks) are not events at all
 //! and are reported as [`FrameKind::Noise`]. Recorder control records are
 //! [`FrameKind::Control`].
-//!
-//! Each event also carries the venue timestamp when it has one. The merger
-//! uses it to bound its window. It is part of the identity only where the
-//! table says so.
 
 use feeds::recording::Source;
 use serde_json::Value;
@@ -130,10 +152,15 @@ impl KeyKind {
 }
 
 /// The identity of one venue event. Fixed size, `Copy`, no heap.
+///
+/// `ts_millis` is the venue timestamp named by the key's rule, or `None`
+/// when the event has none. It is part of the identity: equality, ordering
+/// and hashing all include it, so one key cannot carry two timestamps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EventKey {
     pub kind: KeyKind,
     pub id: u128,
+    pub ts_millis: Option<i64>,
 }
 
 impl Hash for EventKey {
@@ -142,11 +169,18 @@ impl Hash for EventKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let lo = self.id as u64;
         let hi = (self.id >> 64) as u64;
-        state.write_u64(lo ^ hi.rotate_left(29) ^ self.kind.code().wrapping_mul(GOLDEN));
+        let ts = self.ts_millis.map_or(UNTIMED, |t| t as u64);
+        state.write_u64(
+            lo ^ hi.rotate_left(29)
+                ^ self.kind.code().wrapping_mul(GOLDEN)
+                ^ ts.rotate_left(43).wrapping_mul(SALT),
+        );
     }
 }
 
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+const SALT: u64 = 0xD6E8_FEB8_6659_FD93;
+const UNTIMED: u64 = 0x5BD1_E995_5BD1_E995;
 
 /// A fast, deterministic hasher for [`EventKey`] sets. Not meant to resist
 /// chosen inputs: keys come from venues, not from users.
@@ -175,13 +209,6 @@ fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
-}
-
-/// A key plus the venue timestamp of the event, when the venue sent one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stamped {
-    pub key: EventKey,
-    pub venue_ts_millis: Option<i64>,
 }
 
 const FNV128_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
@@ -256,6 +283,21 @@ impl Fingerprint {
         self
     }
 
+    /// Like [`Fingerprint::value`], leaving out one member of an object.
+    pub fn value_without(&mut self, v: &Value, skip: &str) -> &mut Self {
+        let Some(m) = v.as_object() else {
+            return self.value(v);
+        };
+        let n = m.keys().filter(|k| k.as_str() != skip).count();
+        self.bytes(b"{").int(n as i64);
+        for (k, x) in m {
+            if k != skip {
+                self.field(k.as_bytes()).value(x);
+            }
+        }
+        self
+    }
+
     pub fn finish(&self) -> u128 {
         self.0
     }
@@ -288,12 +330,6 @@ pub enum FrameKind {
     Venue,
 }
 
-static NULL: Value = Value::Null;
-
-fn get<'v>(v: &'v Value, k: &str) -> &'v Value {
-    v.get(k).unwrap_or(&NULL)
-}
-
 fn str_field<'v>(v: &'v Value, k: &str) -> Option<&'v str> {
     v.get(k)?.as_str()
 }
@@ -309,17 +345,33 @@ pub(crate) fn clob_ts(v: &Value) -> Option<i64> {
 
 struct Sink<'a, F, const C: bool> {
     f: &'a mut F,
+    /// The frame as received, used as the content of unkeyed events.
+    raw: &'a str,
     events: u32,
 }
 
-impl<F: FnMut(Stamped, u128), const C: bool> Sink<'_, F, C> {
-    fn keyed(&mut self, kind: KeyKind, id: u128, ts: Option<i64>, content: &[&Value]) {
-        let c = if C { canonical(content) } else { 0 };
-        let key = EventKey { kind, id };
+impl<F: FnMut(EventKey, u128), const C: bool> Sink<'_, F, C> {
+    /// Emit a keyed event. `content` writes the whole venue event into a
+    /// fingerprint; it only runs when content is being measured.
+    fn keyed(
+        &mut self,
+        kind: KeyKind,
+        id: u128,
+        ts: Option<i64>,
+        content: impl FnOnce(&mut Fingerprint),
+    ) {
+        let c = if C {
+            let mut fp = Fingerprint::new();
+            content(&mut fp);
+            fp.finish()
+        } else {
+            0
+        };
         (self.f)(
-            Stamped {
-                key,
-                venue_ts_millis: ts,
+            EventKey {
+                kind,
+                id,
+                ts_millis: ts,
             },
             c,
         );
@@ -331,29 +383,35 @@ impl<F: FnMut(Stamped, u128), const C: bool> Sink<'_, F, C> {
         self.emit_unkeyed(feed, id, ts);
     }
 
-    fn unkeyed_raw(&mut self, feed: Feed, raw: &str) {
+    fn unkeyed_raw(&mut self, feed: Feed) {
         let mut fp = Fingerprint::new();
-        fp.field(raw.as_bytes());
+        fp.field(self.raw.as_bytes());
         self.emit_unkeyed(feed, fp.finish(), None);
     }
 
     fn emit_unkeyed(&mut self, feed: Feed, id: u128, ts: Option<i64>) {
+        // The id already is the event's content, so content compared under
+        // one id could never differ. Use the raw frame instead: the check
+        // then sees the same unkeyed content arriving in frames that differ
+        // elsewhere (an RTDS envelope, the rest of a CLOB array).
+        let c = if C {
+            let mut fp = Fingerprint::new();
+            fp.field(self.raw.as_bytes());
+            fp.finish()
+        } else {
+            0
+        };
         let key = EventKey {
             kind: KeyKind::Unkeyed(feed),
             id,
+            ts_millis: ts,
         };
-        (self.f)(
-            Stamped {
-                key,
-                venue_ts_millis: ts,
-            },
-            id,
-        );
+        (self.f)(key, c);
         self.events += 1;
     }
 }
 
-fn walk<F: FnMut(Stamped, u128), const C: bool>(
+fn walk<F: FnMut(EventKey, u128), const C: bool>(
     source: Source,
     frame: &str,
     f: &mut F,
@@ -365,9 +423,13 @@ fn walk<F: FnMut(Stamped, u128), const C: bool>(
     if trimmed.is_empty() || trimmed == "PONG" || trimmed == "PING" {
         return FrameKind::Noise;
     }
-    let mut sink: Sink<'_, F, C> = Sink { f, events: 0 };
+    let mut sink: Sink<'_, F, C> = Sink {
+        f,
+        raw: frame,
+        events: 0,
+    };
     match serde_json::from_str::<Value>(frame) {
-        Err(_) => sink.unkeyed_raw(feed, frame),
+        Err(_) => sink.unkeyed_raw(feed),
         Ok(root) => match feed {
             Feed::Binance => binance(&root, &mut sink),
             Feed::Rtds => rtds(&root, &mut sink),
@@ -382,13 +444,16 @@ fn walk<F: FnMut(Stamped, u128), const C: bool>(
 }
 
 /// Call `f` with the key of every event in a raw frame.
-pub fn for_each_event<F: FnMut(Stamped)>(source: Source, frame: &str, mut f: F) -> FrameKind {
-    walk::<_, false>(source, frame, &mut |s: Stamped, _: u128| f(s))
+pub fn for_each_event<F: FnMut(EventKey)>(source: Source, frame: &str, mut f: F) -> FrameKind {
+    walk::<_, false>(source, frame, &mut |k: EventKey, _: u128| f(k))
 }
 
-/// Like [`for_each_event`], and also pass a fingerprint of the event's
-/// venue content (prices, sizes, levels), for measuring key collisions.
-pub fn for_each_event_with_content<F: FnMut(Stamped, u128)>(
+/// Like [`for_each_event`], and also pass a fingerprint of the event's full
+/// venue content, for measuring key collisions. For a keyed event that is
+/// the whole event object (for a price change entry, the entry plus the
+/// rest of its frame; for an RTDS point, the point without the symbol,
+/// which is identity). For an unkeyed event it is the raw frame.
+pub fn for_each_event_with_content<F: FnMut(EventKey, u128)>(
     source: Source,
     frame: &str,
     mut f: F,
@@ -397,8 +462,8 @@ pub fn for_each_event_with_content<F: FnMut(Stamped, u128)>(
 }
 
 /// Append the keys of every event in a raw frame to `out`.
-pub fn frame_keys(source: Source, frame: &str, out: &mut Vec<Stamped>) -> FrameKind {
-    for_each_event(source, frame, |s| out.push(s))
+pub fn frame_keys(source: Source, frame: &str, out: &mut Vec<EventKey>) -> FrameKind {
+    for_each_event(source, frame, |k| out.push(k))
 }
 
 fn binance_id(symbol: &str, seq: u64) -> u128 {
@@ -407,17 +472,16 @@ fn binance_id(symbol: &str, seq: u64) -> u128 {
     ((fp.finish() as u64 as u128) << 64) | seq as u128
 }
 
-fn binance<F: FnMut(Stamped, u128), const C: bool>(root: &Value, s: &mut Sink<'_, F, C>) {
+fn binance<F: FnMut(EventKey, u128), const C: bool>(root: &Value, s: &mut Sink<'_, F, C>) {
     let (Some(stream), Some(data)) = (str_field(root, "stream"), root.get("data")) else {
         s.unkeyed(Feed::Binance, root, None);
         return;
     };
     // The stream name is always present and names the symbol in lower case.
     let symbol = stream.split('@').next().unwrap_or("");
-    let ts = data
-        .get("T")
-        .and_then(Value::as_i64)
-        .or_else(|| data.get("E").and_then(Value::as_i64));
+    // Only the engine's time `T`. `E` is the push time and is not promised
+    // to match across connections, so it never becomes part of a key.
+    let ts = data.get("T").and_then(Value::as_i64);
     let (kind, id_field) = if stream.ends_with("@aggTrade") {
         (KeyKind::BinanceTrade, "a")
     } else if stream.ends_with("@bookTicker") {
@@ -427,12 +491,14 @@ fn binance<F: FnMut(Stamped, u128), const C: bool>(root: &Value, s: &mut Sink<'_
         return;
     };
     match data.get(id_field).and_then(Value::as_u64) {
-        Some(seq) => s.keyed(kind, binance_id(symbol, seq), ts, &[data]),
+        Some(seq) => s.keyed(kind, binance_id(symbol, seq), ts, |fp| {
+            fp.value(data);
+        }),
         None => s.unkeyed(Feed::Binance, data, ts),
     }
 }
 
-fn rtds<F: FnMut(Stamped, u128), const C: bool>(root: &Value, s: &mut Sink<'_, F, C>) {
+fn rtds<F: FnMut(EventKey, u128), const C: bool>(root: &Value, s: &mut Sink<'_, F, C>) {
     let topic = str_field(root, "topic");
     let payload = root.get("payload");
     let price_topic = matches!(topic, Some("crypto_prices" | "crypto_prices_chainlink"));
@@ -459,7 +525,7 @@ fn rtds<F: FnMut(Stamped, u128), const C: bool>(root: &Value, s: &mut Sink<'_, F
     }
 }
 
-fn rtds_point<F: FnMut(Stamped, u128), const C: bool>(
+fn rtds_point<F: FnMut(EventKey, u128), const C: bool>(
     topic: &str,
     symbol: &str,
     p: &Value,
@@ -472,13 +538,17 @@ fn rtds_point<F: FnMut(Stamped, u128), const C: bool>(
         (Some(t), Some(v)) if v.is_number() => {
             let mut fp = Fingerprint::new();
             fp.field(topic.as_bytes()).field(symbol.as_bytes()).int(t);
-            s.keyed(KeyKind::RtdsPrice, fp.finish(), Some(t), &[v]);
+            // A live update repeats the symbol inside the point and a
+            // snapshot point does not; the symbol is identity either way.
+            s.keyed(KeyKind::RtdsPrice, fp.finish(), Some(t), |c| {
+                c.value_without(p, "symbol");
+            });
         }
         _ => s.unkeyed(Feed::Rtds, p, ts),
     }
 }
 
-fn clob<F: FnMut(Stamped, u128), const C: bool>(root: &Value, s: &mut Sink<'_, F, C>) {
+fn clob<F: FnMut(EventKey, u128), const C: bool>(root: &Value, s: &mut Sink<'_, F, C>) {
     match root.as_array() {
         Some(items) => {
             for item in items {
@@ -489,16 +559,18 @@ fn clob<F: FnMut(Stamped, u128), const C: bool>(root: &Value, s: &mut Sink<'_, F
     }
 }
 
-fn clob_event<F: FnMut(Stamped, u128), const C: bool>(e: &Value, s: &mut Sink<'_, F, C>) {
+fn clob_event<F: FnMut(EventKey, u128), const C: bool>(e: &Value, s: &mut Sink<'_, F, C>) {
     let ts = clob_ts(e);
     let asset = str_field(e, "asset_id");
+    let whole = |fp: &mut Fingerprint| {
+        fp.value(e);
+    };
     match str_field(e, "event_type") {
         Some("book") => match (asset, str_field(e, "hash"), ts) {
             (Some(a), Some(h), Some(t)) => {
                 let mut fp = Fingerprint::new();
                 fp.field(a.as_bytes()).field(h.as_bytes()).int(t);
-                let content = [get(e, "bids"), get(e, "asks")];
-                s.keyed(KeyKind::ClobBook, fp.finish(), Some(t), &content);
+                s.keyed(KeyKind::ClobBook, fp.finish(), Some(t), whole);
             }
             _ => s.unkeyed(Feed::Clob, e, ts),
         },
@@ -514,16 +586,20 @@ fn clob_event<F: FnMut(Stamped, u128), const C: bool>(e: &Value, s: &mut Sink<'_
                     ts,
                     str_field(c, "side"),
                     str_field(c, "price"),
+                    str_field(c, "size"),
                 );
                 match fields {
-                    (Some(a), Some(h), Some(t), Some(side), Some(price)) => {
+                    (Some(a), Some(h), Some(t), Some(side), Some(price), Some(size)) => {
                         let mut fp = Fingerprint::new();
                         fp.field(a.as_bytes())
                             .field(h.as_bytes())
                             .int(t)
                             .field(side.as_bytes())
-                            .field(price.as_bytes());
-                        s.keyed(KeyKind::ClobPriceChange, fp.finish(), Some(t), &[c]);
+                            .field(price.as_bytes())
+                            .field(size.as_bytes());
+                        s.keyed(KeyKind::ClobPriceChange, fp.finish(), Some(t), |fp| {
+                            fp.value_without(e, "price_changes").value(c);
+                        });
                     }
                     _ => s.unkeyed(Feed::Clob, c, ts),
                 }
@@ -542,8 +618,7 @@ fn clob_event<F: FnMut(Stamped, u128), const C: bool>(e: &Value, s: &mut Sink<'_
                         .int(t)
                         .field(bid.as_bytes())
                         .field(ask.as_bytes());
-                    let content = [get(e, "best_bid"), get(e, "best_ask"), get(e, "spread")];
-                    s.keyed(KeyKind::ClobBestBidAsk, fp.finish(), Some(t), &content);
+                    s.keyed(KeyKind::ClobBestBidAsk, fp.finish(), Some(t), whole);
                 }
                 _ => s.unkeyed(Feed::Clob, e, ts),
             }
@@ -566,13 +641,7 @@ fn clob_event<F: FnMut(Stamped, u128), const C: bool>(e: &Value, s: &mut Sink<'_
                         .field(side.as_bytes())
                         .field(price.as_bytes())
                         .field(size.as_bytes());
-                    let content = [
-                        get(e, "price"),
-                        get(e, "size"),
-                        get(e, "side"),
-                        get(e, "fee_rate_bps"),
-                    ];
-                    s.keyed(KeyKind::ClobLastTrade, fp.finish(), Some(t), &content);
+                    s.keyed(KeyKind::ClobLastTrade, fp.finish(), Some(t), whole);
                 }
                 _ => s.unkeyed(Feed::Clob, e, ts),
             }
@@ -584,34 +653,83 @@ fn clob_event<F: FnMut(Stamped, u128), const C: bool>(e: &Value, s: &mut Sink<'_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
-    fn keys(source: Source, frame: &str) -> (FrameKind, Vec<Stamped>) {
+    fn keys(source: Source, frame: &str) -> (FrameKind, Vec<EventKey>) {
         let mut out = Vec::new();
         let kind = frame_keys(source, frame, &mut out);
         (kind, out)
     }
 
-    fn one(source: Source, frame: &str) -> Stamped {
+    fn one(source: Source, frame: &str) -> EventKey {
         let (kind, v) = keys(source, frame);
         assert_eq!(kind, FrameKind::Venue, "{frame}");
         assert_eq!(v.len(), 1, "{frame}");
         v[0]
     }
 
+    fn with_content(source: Source, frame: &str) -> Vec<(EventKey, u128)> {
+        let mut out = Vec::new();
+        for_each_event_with_content(source, frame, |k, c| out.push((k, c)));
+        out
+    }
+
     #[test]
     fn binance_keys_hold_the_venue_sequence_exactly() {
         let book = r#"{"stream":"btcusdt@bookTicker","data":{"e":"bookTicker","u":12055123599894,"s":"BTCUSDT","b":"74271.30","B":"4.702","a":"74271.40","A":"10.044","T":1794206104504,"E":1794206104505}}"#;
         let k = one(Source::Binance, book);
-        assert_eq!(k.key.kind, KeyKind::BinanceBook);
-        assert_eq!(k.key.id as u64, 12055123599894);
-        assert_eq!(k.venue_ts_millis, Some(1794206104504));
+        assert_eq!(k.kind, KeyKind::BinanceBook);
+        assert_eq!(k.id as u64, 12055123599894);
+        assert_eq!(k.ts_millis, Some(1794206104504));
 
         let trade = r#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","a":987654321,"p":"60050.10","q":"0.5","m":false,"T":1700000000000}}"#;
         let t = one(Source::Binance, trade);
-        assert_eq!(t.key.kind, KeyKind::BinanceTrade);
-        assert_eq!(t.key.id as u64, 987654321);
+        assert_eq!(t.kind, KeyKind::BinanceTrade);
+        assert_eq!(t.id as u64, 987654321);
         // Same number, other stream: different keys.
-        assert_ne!(t.key, k.key);
+        assert_ne!(t, k);
+    }
+
+    fn binance_book(u: u64, t: Option<i64>, e: Option<i64>) -> String {
+        let mut data = format!(r#""e":"bookTicker","u":{u},"s":"BTCUSDT","b":"1.0","a":"1.1""#);
+        if let Some(t) = t {
+            data.push_str(&format!(r#","T":{t}"#));
+        }
+        if let Some(e) = e {
+            data.push_str(&format!(r#","E":{e}"#));
+        }
+        format!(r#"{{"stream":"btcusdt@bookTicker","data":{{{data}}}}}"#)
+    }
+
+    #[test]
+    fn binance_time_is_the_engine_time_and_never_the_push_time() {
+        // Without `T` the event keeps its sequence key but has no time,
+        // even when `E` is there: `E` is never used as a fallback.
+        let k = one(Source::Binance, &binance_book(7, None, Some(500)));
+        assert_eq!(k.kind, KeyKind::BinanceBook);
+        assert_eq!(k.ts_millis, None);
+        assert_eq!(k, one(Source::Binance, &binance_book(7, None, Some(900))));
+    }
+
+    proptest! {
+        /// Copies of one Binance event that differ only in push time get one
+        /// key with one timestamp. Different engine times are different keys.
+        #[test]
+        fn binance_copies_share_a_key_and_a_timestamp(
+            u in any::<u64>(),
+            t in 0i64..4_000_000_000_000,
+            e1 in proptest::option::of(0i64..4_000_000_000_000),
+            e2 in proptest::option::of(0i64..4_000_000_000_000),
+            dt in 1i64..1_000,
+        ) {
+            let a = one(Source::Binance, &binance_book(u, Some(t), e1));
+            let b = one(Source::Binance, &binance_book(u, Some(t), e2));
+            prop_assert_eq!(a, b);
+            prop_assert_eq!(a.ts_millis, Some(t));
+            let c = one(Source::Binance, &binance_book(u, Some(t + dt), e1));
+            prop_assert_ne!(a, c);
+            prop_assert_eq!(a.id, c.id);
+        }
     }
 
     #[test]
@@ -619,18 +737,25 @@ mod tests {
         let a = r#"{"connection_id":"AAA=","payload":{"symbol":"btc/usd","timestamp":1794206104000,"value":74213.13},"timestamp":1794206104917,"topic":"crypto_prices_chainlink","type":"update"}"#;
         let b = r#"{"connection_id":"BBB=","payload":{"symbol":"btc/usd","timestamp":1794206104000,"value":74213.13},"timestamp":1794206104999,"topic":"crypto_prices_chainlink","type":"update"}"#;
         assert_eq!(one(Source::Rtds, a), one(Source::Rtds, b));
+        assert_eq!(with_content(Source::Rtds, a), with_content(Source::Rtds, b));
         // Another topic with the same symbol and time is another event.
         let c = a.replace("crypto_prices_chainlink", "crypto_prices");
-        assert_ne!(one(Source::Rtds, a).key, one(Source::Rtds, &c).key);
+        assert_ne!(one(Source::Rtds, a), one(Source::Rtds, &c));
     }
 
     #[test]
-    fn rtds_snapshot_points_share_keys_with_live_updates() {
+    fn rtds_snapshot_points_share_keys_and_content_with_live_updates() {
         let snap = r#"{"topic":"crypto_prices","type":"subscribe","timestamp":1,"payload":{"symbol":"btcusdt","data":[{"timestamp":1000,"value":1.5},{"timestamp":2000,"value":1.6}]}}"#;
         let upd = r#"{"topic":"crypto_prices","type":"update","timestamp":9,"payload":{"symbol":"btcusdt","timestamp":2000,"value":1.6}}"#;
         let (_, s) = keys(Source::Rtds, snap);
         assert_eq!(s.len(), 2);
         assert_eq!(s[1], one(Source::Rtds, upd));
+        // Same point, so a recording holding both counts a repeat, not a
+        // collision.
+        assert_eq!(
+            with_content(Source::Rtds, snap)[1],
+            with_content(Source::Rtds, upd)[0]
+        );
     }
 
     const PC: &str = r#"{"market":"0x66", "price_changes":[{"asset_id":"812", "price":"0.44", "size":"309.4", "side":"BUY", "hash":"b620", "best_bid":"0.49", "best_ask":"0.5"}, {"asset_id":"559", "price":"0.56", "size":"309.4", "side":"SELL", "hash":"66c3", "best_bid":"0.5", "best_ask":"0.51"}], "timestamp":"1794206105917", "event_type":"price_change"}"#;
@@ -640,9 +765,9 @@ mod tests {
         let (kind, k) = keys(Source::ClobBook, PC);
         assert_eq!(kind, FrameKind::Venue);
         assert_eq!(k.len(), 2);
-        assert!(k.iter().all(|s| s.key.kind == KeyKind::ClobPriceChange));
-        assert_ne!(k[0].key, k[1].key);
-        assert_eq!(k[0].venue_ts_millis, Some(1794206105917));
+        assert!(k.iter().all(|s| s.kind == KeyKind::ClobPriceChange));
+        assert_ne!(k[0], k[1]);
+        assert_eq!(k[0].ts_millis, Some(1794206105917));
     }
 
     #[test]
@@ -652,8 +777,19 @@ mod tests {
         let other_price = PC.replacen(r#""price":"0.44""#, r#""price":"0.45""#, 1);
         let (_, a) = keys(Source::ClobBook, PC);
         let (_, b) = keys(Source::ClobBook, &other_price);
-        assert_ne!(a[0].key, b[0].key);
-        assert_eq!(a[1].key, b[1].key);
+        assert_ne!(a[0], b[0]);
+        assert_eq!(a[1], b[1]);
+    }
+
+    #[test]
+    fn price_changes_differing_only_in_size_get_different_keys() {
+        // Two states of one price level at one millisecond. Neither may be
+        // dropped as a copy of the other.
+        let bigger = PC.replacen(r#""size":"309.4""#, r#""size":"310""#, 1);
+        let (_, a) = keys(Source::ClobBook, PC);
+        let (_, b) = keys(Source::ClobBook, &bigger);
+        assert_ne!(a[0], b[0]);
+        assert_eq!(a[1], b[1]);
     }
 
     #[test]
@@ -662,16 +798,20 @@ mod tests {
         let (_, a) = keys(Source::ClobBook, PC);
         let (_, b) = keys(Source::ClobBook, &compact);
         assert_eq!(a, b);
+        assert_eq!(
+            with_content(Source::ClobBook, PC),
+            with_content(Source::ClobBook, &compact)
+        );
     }
 
     #[test]
     fn clob_book_best_bid_ask_and_trades_are_keyed() {
         let book = r#"[{"market":"0x66","asset_id":"559","timestamp":"1794206105925","hash":"0055","bids":[{"price":"0.01","size":"9"}],"asks":[],"event_type":"book"}]"#;
-        assert_eq!(one(Source::ClobBook, book).key.kind, KeyKind::ClobBook);
+        assert_eq!(one(Source::ClobBook, book).kind, KeyKind::ClobBook);
         let bba = r#"{"market":"0x66","asset_id":"559","best_bid":"0.5","best_ask":"0.51","spread":"0.01","timestamp":"1794206105921","event_type":"best_bid_ask"}"#;
-        assert_eq!(one(Source::ClobBook, bba).key.kind, KeyKind::ClobBestBidAsk);
+        assert_eq!(one(Source::ClobBook, bba).kind, KeyKind::ClobBestBidAsk);
         let ltp = r#"{"market":"0x66","asset_id":"559","price":"0.5","size":"0.93","fee_rate_bps":"0","side":"SELL","timestamp":"1794206105939","event_type":"last_trade_price","transaction_hash":"0x1203"}"#;
-        assert_eq!(one(Source::ClobBook, ltp).key.kind, KeyKind::ClobLastTrade);
+        assert_eq!(one(Source::ClobBook, ltp).kind, KeyKind::ClobLastTrade);
     }
 
     #[test]
@@ -679,15 +819,16 @@ mod tests {
         let no_hash =
             r#"{"asset_id":"559","timestamp":"1","event_type":"book","bids":[],"asks":[]}"#;
         let k = one(Source::ClobBook, no_hash);
-        assert_eq!(k.key.kind, KeyKind::Unkeyed(Feed::Clob));
+        assert_eq!(k.kind, KeyKind::Unkeyed(Feed::Clob));
+        assert_eq!(k.ts_millis, Some(1));
         let other = r#"{"asset_id":"559","timestamp":"1","event_type":"tick_size_change"}"#;
         assert_eq!(
-            one(Source::ClobBook, other).key.kind,
+            one(Source::ClobBook, other).kind,
             KeyKind::Unkeyed(Feed::Clob)
         );
         let garbage = one(Source::Binance, "not json");
-        assert_eq!(garbage.key.kind, KeyKind::Unkeyed(Feed::Binance));
-        assert_eq!(garbage.venue_ts_millis, None);
+        assert_eq!(garbage.kind, KeyKind::Unkeyed(Feed::Binance));
+        assert_eq!(garbage.ts_millis, None);
         // Same content, same unkeyed id.
         assert_eq!(garbage, one(Source::Binance, "not json"));
     }
@@ -713,13 +854,45 @@ mod tests {
     }
 
     #[test]
-    fn content_fingerprint_changes_with_the_payload() {
-        let mut seen = Vec::new();
-        for_each_event_with_content(Source::ClobBook, PC, |s, c| seen.push((s.key, c)));
-        let bigger = PC.replacen(r#""size":"309.4""#, r#""size":"310""#, 1);
-        let mut again = Vec::new();
-        for_each_event_with_content(Source::ClobBook, &bigger, |s, c| again.push((s.key, c)));
-        assert_eq!(seen[0].0, again[0].0, "size is not part of the key");
+    fn value_without_skips_only_the_named_member() {
+        let v: Value = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
+        let w: Value = serde_json::from_str(r#"{"a":1}"#).unwrap();
+        let mut x = Fingerprint::new();
+        x.value_without(&v, "b");
+        let mut y = Fingerprint::new();
+        y.value(&w);
+        assert_eq!(x.finish(), y.finish());
+        let mut z = Fingerprint::new();
+        z.value_without(&v, "c");
+        assert_eq!(z.finish(), canonical(&[&v]));
+    }
+
+    #[test]
+    fn content_covers_every_field_not_only_the_key_fields() {
+        // best_bid sits in the entry but not in the key. Content must see it,
+        // or a collision on it could never show up.
+        let seen = with_content(Source::ClobBook, PC);
+        let moved = PC.replacen(r#""best_bid":"0.49""#, r#""best_bid":"0.48""#, 1);
+        let again = with_content(Source::ClobBook, &moved);
+        assert_eq!(seen[0].0, again[0].0, "best_bid is not part of the key");
         assert_ne!(seen[0].1, again[0].1, "but it is part of the content");
+        assert_eq!(seen[1], again[1]);
+        // The rest of the frame counts too.
+        let other_market = PC.replacen(r#""market":"0x66""#, r#""market":"0x67""#, 1);
+        let m = with_content(Source::ClobBook, &other_market);
+        assert_eq!(seen[1].0, m[1].0);
+        assert_ne!(seen[1].1, m[1].1);
+    }
+
+    #[test]
+    fn unkeyed_content_is_the_raw_frame() {
+        // Same payload, different connection: one unkeyed key, two contents.
+        let a = r#"{"connection_id":"AAA=","topic":"other","payload":{"x":1}}"#;
+        let b = r#"{"connection_id":"BBB=","topic":"other","payload":{"x":1}}"#;
+        let ca = with_content(Source::Rtds, a);
+        let cb = with_content(Source::Rtds, b);
+        assert_eq!(ca[0].0, cb[0].0);
+        assert_ne!(ca[0].1, cb[0].1);
+        assert_ne!(ca[0].1, ca[0].0.id, "content is not the key id");
     }
 }

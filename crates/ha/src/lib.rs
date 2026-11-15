@@ -9,7 +9,8 @@
 //! - [`merge`]: a client side merger that takes the streams of N nodes and
 //!   delivers each key once, inside a bounded window.
 //! - [`lease`]: a leader lease with a fencing epoch, so exactly one node
-//!   archives and a stale leader's writes are refused.
+//!   archives and a stale leader's writes are refused at the sink, which
+//!   checks each write against the live grant.
 //!
 //! [`keycheck`] measures how well the key assumption holds on a real
 //! recording.
@@ -19,6 +20,9 @@ pub mod keycheck;
 pub mod lease;
 pub mod merge;
 
-pub use key::{EventKey, Feed, FrameKind, KeyKind, Stamped};
-pub use lease::{Clock, Epoch, Fenced, Grant, Lease, LeaseError, ManualClock, MemoryLease};
-pub use merge::{MergeConfig, Merger, Verdict, WindowConfig};
+pub use key::{EventKey, Feed, FrameKind, KeyKind};
+pub use lease::{
+    Clock, Epoch, FenceError, Fenced, Grant, Lease, LeaseError, ManualClock, MemoryLease,
+    SystemClock,
+};
+pub use merge::{FeedCounters, MergeConfig, Merger, Verdict, WindowConfig};

@@ -7,6 +7,12 @@
 //! the merger drop a real event). Same key with the same content is counted
 //! as a repeat: the venue sent the same thing twice, and dropping the
 //! second copy loses nothing.
+//!
+//! Content means the whole venue event, not only the fields that are not in
+//! the key, so a collision on any field shows up. For unkeyed events the key
+//! id is already a fingerprint of the event, so content is the raw frame:
+//! the same unkeyed event inside frames that differ elsewhere is counted as
+//! a collision.
 
 use crate::key::{clob_ts, for_each_event_with_content, EventKey, Feed, Fingerprint, FrameKind};
 use feeds::recording::{ReadError, Record, RecordReader};
@@ -41,6 +47,10 @@ pub struct KeyReport {
     /// timestamp only) would have had. Kept to show why side and price are
     /// in the key.
     pub plan_key_collisions: u64,
+    /// Collisions the price change key would have without size. Kept to
+    /// show that size is in the key by decision, not because this recording
+    /// needed it.
+    pub no_size_key_collisions: u64,
 }
 
 impl KeyReport {
@@ -81,6 +91,11 @@ impl fmt::Display for KeyReport {
             "price_change collisions with the plan's first key (asset, hash, timestamp): {}",
             self.plan_key_collisions
         )?;
+        writeln!(
+            f,
+            "price_change collisions without size in the key: {}",
+            self.no_size_key_collisions
+        )?;
         match self.truncated_tail {
             Some(off) => writeln!(f, "truncated tail at byte {off}"),
             None => writeln!(f, "truncated tail: none"),
@@ -94,6 +109,7 @@ pub struct KeyCheck {
     report: KeyReport,
     first: HashMap<EventKey, u128>,
     plan: HashMap<u128, u128>,
+    no_size: HashMap<u128, u128>,
 }
 
 impl KeyCheck {
@@ -109,14 +125,14 @@ impl KeyCheck {
         let first = &mut self.first;
         let c = &mut self.report.feeds[feed.index()];
         c.frames += 1;
-        let kind = for_each_event_with_content(rec.source, &rec.frame, |s, content| {
+        let kind = for_each_event_with_content(rec.source, &rec.frame, |k, content| {
             c.events += 1;
-            if s.key.kind.is_keyed() {
+            if k.kind.is_keyed() {
                 c.keyed += 1;
             } else {
                 c.unkeyed += 1;
             }
-            match first.entry(s.key) {
+            match first.entry(k) {
                 Entry::Vacant(v) => {
                     v.insert(content);
                 }
@@ -133,10 +149,13 @@ impl KeyCheck {
             c.noise_frames += 1;
         }
         if feed == Feed::Clob {
-            plan_key(
+            older_keys(
                 &rec.frame,
-                &mut self.plan,
-                &mut self.report.plan_key_collisions,
+                [&mut self.plan, &mut self.no_size],
+                [
+                    &mut self.report.plan_key_collisions,
+                    &mut self.report.no_size_key_collisions,
+                ],
             );
         }
     }
@@ -146,8 +165,10 @@ impl KeyCheck {
     }
 }
 
-/// The price change key as first planned, for comparison only.
-fn plan_key(frame: &str, seen: &mut HashMap<u128, u128>, collisions: &mut u64) {
+/// Two older price change keys, for comparison only: the plan's first key
+/// (asset id, hash, timestamp) and the current key without size. Content is
+/// the same as for the real key.
+fn older_keys(frame: &str, seen: [&mut HashMap<u128, u128>; 2], collisions: [&mut u64; 2]) {
     let Ok(root) = serde_json::from_str::<Value>(frame) else {
         return;
     };
@@ -155,6 +176,8 @@ fn plan_key(frame: &str, seen: &mut HashMap<u128, u128>, collisions: &mut u64) {
         Some(a) => a.as_slice(),
         None => std::slice::from_ref(&root),
     };
+    let [plan, no_size] = seen;
+    let [plan_n, no_size_n] = collisions;
     for e in items {
         if e.get("event_type").and_then(Value::as_str) != Some("price_change") {
             continue;
@@ -162,24 +185,32 @@ fn plan_key(frame: &str, seen: &mut HashMap<u128, u128>, collisions: &mut u64) {
         let Some(ts) = clob_ts(e) else { continue };
         let changes = e.get("price_changes").and_then(Value::as_array);
         for c in changes.into_iter().flatten() {
-            let asset = c.get("asset_id").and_then(Value::as_str);
-            let hash = c.get("hash").and_then(Value::as_str);
-            let (Some(asset), Some(hash)) = (asset, hash) else {
+            let field = move |k: &str| c.get(k).and_then(Value::as_str);
+            let (Some(asset), Some(hash)) = (field("asset_id"), field("hash")) else {
                 continue;
             };
+            let mut v = Fingerprint::new();
+            v.value_without(e, "price_changes").value(c);
+            let content = v.finish();
             let mut k = Fingerprint::new();
             k.field(asset.as_bytes()).field(hash.as_bytes()).int(ts);
-            let mut v = Fingerprint::new();
-            v.value(c);
-            match seen.entry(k.finish()) {
-                Entry::Vacant(x) => {
-                    x.insert(v.finish());
-                }
-                Entry::Occupied(o) => {
-                    if *o.get() != v.finish() {
-                        *collisions += 1;
-                    }
-                }
+            count(plan, k.finish(), content, plan_n);
+            if let (Some(side), Some(price)) = (field("side"), field("price")) {
+                k.field(side.as_bytes()).field(price.as_bytes());
+                count(no_size, k.finish(), content, no_size_n);
+            }
+        }
+    }
+}
+
+fn count(seen: &mut HashMap<u128, u128>, key: u128, content: u128, collisions: &mut u64) {
+    match seen.entry(key) {
+        Entry::Vacant(x) => {
+            x.insert(content);
+        }
+        Entry::Occupied(o) => {
+            if *o.get() != content {
+                *collisions += 1;
             }
         }
     }
@@ -231,14 +262,57 @@ mod tests {
 
     #[test]
     fn same_key_different_content_is_a_collision() {
+        let other_bid = PC.replace(r#""best_bid":"0.5""#, r#""best_bid":"0.4""#);
+        let r = check_records(&[rec(Source::ClobBook, PC), rec(Source::ClobBook, &other_bid)]);
+        let c = r.feed(Feed::Clob);
+        assert_eq!((c.events, c.keyed, c.collisions, c.repeats), (2, 2, 1, 0));
+        assert_eq!(r.collisions(), 1);
+    }
+
+    #[test]
+    fn a_different_size_is_a_different_event_not_a_collision() {
         let other_size = PC.replace(r#""size":"309.4""#, r#""size":"1""#);
         let r = check_records(&[
             rec(Source::ClobBook, PC),
             rec(Source::ClobBook, &other_size),
         ]);
-        let c = r.feed(Feed::Clob);
-        assert_eq!((c.events, c.keyed, c.collisions, c.repeats), (2, 2, 1, 0));
-        assert_eq!(r.collisions(), 1);
+        assert_eq!(r.collisions(), 0);
+        // The key without size would have dropped one of them.
+        assert_eq!(r.no_size_key_collisions, 1);
+        assert_eq!(r.plan_key_collisions, 1);
+    }
+
+    #[test]
+    fn collisions_show_on_fields_outside_the_key() {
+        // best_bid_ask: the key holds bid and ask, so the old content check
+        // (bid, ask, spread) could only ever see the spread. Any other field
+        // now counts.
+        let bba = r#"{"market":"0x66","asset_id":"559","best_bid":"0.5","best_ask":"0.51","spread":"0.01","timestamp":"1794206105921","event_type":"best_bid_ask"}"#;
+        let bba2 = bba.replace(r#""market":"0x66""#, r#""market":"0x67""#);
+        let ltp = r#"{"market":"0x66","asset_id":"559","price":"0.5","size":"0.93","fee_rate_bps":"0","side":"SELL","timestamp":"1794206105939","event_type":"last_trade_price","transaction_hash":"0x1203"}"#;
+        let ltp2 = ltp.replace(r#""market":"0x66""#, r#""market":"0x67""#);
+        let r = check_records(&[
+            rec(Source::ClobBook, bba),
+            rec(Source::ClobBook, &bba2),
+            rec(Source::ClobBook, ltp),
+            rec(Source::ClobBook, &ltp2),
+        ]);
+        assert_eq!(r.feed(Feed::Clob).collisions, 2);
+    }
+
+    #[test]
+    fn unkeyed_events_can_collide() {
+        // The same unkeyed payload on two connections. Before, content was
+        // the key id itself, so this was always 0.
+        let a = r#"{"connection_id":"AAA=","topic":"other","payload":{"x":1}}"#;
+        let b = r#"{"connection_id":"BBB=","topic":"other","payload":{"x":1}}"#;
+        let r = check_records(&[
+            rec(Source::Rtds, a),
+            rec(Source::Rtds, b),
+            rec(Source::Rtds, a),
+        ]);
+        let c = r.feed(Feed::Rtds);
+        assert_eq!((c.unkeyed, c.collisions, c.repeats), (3, 1, 1));
     }
 
     #[test]
@@ -257,6 +331,7 @@ mod tests {
         ]);
         assert_eq!(r.collisions(), 0);
         assert_eq!(r.plan_key_collisions, 1);
+        assert_eq!(r.no_size_key_collisions, 0);
     }
 
     #[test]
