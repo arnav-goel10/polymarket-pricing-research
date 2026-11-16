@@ -10,19 +10,32 @@
 //! | `harness.json` | the harness | `invalid` when the run cannot count (A7) |
 //! | `client.json` | `client`, `local` | client counters, merger totals, connection changes |
 //! | `log.jsonl` | `client`, `local` | the delivered log: every Deliver and Late verdict. Private, never an artifact |
+//!
+//! A frame whose events got mixed verdicts is logged as a frame consumer
+//! sees it: the frame cut to its delivered events
+//! ([`ha::client::Event::delivered_frame`]) and keyed again. A cut that kept
+//! a duplicate piece shows in A2 and one that dropped a delivered piece in
+//! A1, so the checks cover the frame unit as well as the key.
 //! | `report.json` | `verify` | counts and timings only |
 //! | `archive.json` | `verify-archive` | the archive verdict, counts only |
 //!
-//! Truth is a `.prec` file: the simulator's manifest in CI.
+//! Truth is a `.prec` file: the simulator's manifest in CI. It is a set of
+//! key texts derived with the same `frame_keys` the client uses, so two
+//! distinct venue events that collapse to one key are one truth entry as
+//! well, and the merger dropping the second is invisible to A1. `keycheck`
+//! on the committed recording is the guard on that, and only for that
+//! recording.
 //!
 //! The window W is cut by the venue timestamp of each key. T0 is `margin`
 //! after every dialed subscription is live, T1 is `margin` after the last
 //! recovery, both on the wall clock. Per feed, a wall time t maps to the
 //! newest venue timestamp among that feed's truth keys broadcast by t, and
 //! a key is in W when `map(T0) < ts <= map(T1)`. For synthetic frames the
-//! venue timestamp is the broadcast time, so this is `T0 <= ts < T1` to the
-//! millisecond. For a played recording, whose timestamps are from the day
-//! it was recorded, the map keeps every key broadcast before T0 out of W.
+//! venue timestamp is the broadcast time, so W runs from just after the
+//! last millisecond broadcast by T0 to the last millisecond broadcast by
+//! T1, inclusive: keys sharing T0's last millisecond are outside. For a
+//! played recording, whose timestamps are from the day it was recorded,
+//! the map keeps every key broadcast before T0 out of W.
 //!
 //! Checks, and the order in which the first failure names the reason:
 //!
@@ -32,13 +45,21 @@
 //! | `missing` | every timed truth key in W was delivered (A1) |
 //! | `duplicate` | no timed key was delivered twice in the whole run (A2) |
 //! | `extra` | every delivered key is in the truth (A3) |
-//! | `faults_not_observed` | executed equals planned, and the client saw each victim go down (A4) |
+//! | `faults_not_observed` | executed equals planned, and the client saw each victim go down, or for a venue cut got a late copy from it (A4) |
 //! | `vacuous` | each node delivered first copies and truth events exist inside every fault (A5) |
 //!
 //! A6 comes first because a broken stream also loses events, and the
 //! protocol counter is the precise name. `vacuous` comes last because it
-//! only matters for a run that would otherwise pass. A7 (two nodes down at
-//! once without the harness meaning it) makes the run invalid, exit 2.
+//! only matters for a run that would otherwise pass. A7 makes the run
+//! invalid, exit 2, from the harness's own conditions: a node exited on its
+//! own, a peer never became ready before a fault, a victim was not ready
+//! after one, or the subscriptions never all went live. Both client
+//! subscriptions down at once is not read from the client's log; such a run
+//! fails `missing` instead, never passes.
+//!
+//! Untimed keys are outside A1 and A2 (the merger can deliver one twice once
+//! it leaves the window). Those delivered more than once are reported as
+//! `untimed_duplicates`, not gated.
 //!
 //! With the archive on, both nodes share a directory store. Its journal
 //! holds every applied HEAD write, and [`verify_archive`] checks it with
@@ -91,6 +112,13 @@ pub enum FaultKind {
     /// SIGSTOP on whichever node `/ha` says leads, for longer than a
     /// takeover, then SIGCONT: the leader wakes as a zombie.
     FreezeLeader,
+    /// The node's RTDS and CLOB venue connections are cut in a relay
+    /// between the node and the simulator; the node and the client's
+    /// connection to it stay up. The node redials, is greeted with the
+    /// venue's history, and that flows live to the client, whose merger
+    /// must drop it as duplicates and late copies. Its recovery is the node
+    /// ready again after both redials.
+    VenueCut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +158,25 @@ pub fn add_leader_freezes(p: &mut Plan, n: usize, ms: u64) {
     for f in p.faults.iter_mut().skip(len.saturating_sub(n)) {
         f.kind = FaultKind::FreezeLeader;
         f.freeze_ms = ms;
+    }
+}
+
+/// Add `n` venue cuts after the last fault, `gap_ms` apart, alternating
+/// nodes from the one after the last fault's.
+pub fn add_venue_cuts(p: &mut Plan, n: usize, gap_ms: i64) {
+    let (mut node, mut at) = match p.faults.last() {
+        Some(f) => (1 - f.node, f.at_ms + gap_ms),
+        None => (0, 1_000),
+    };
+    for _ in 0..n {
+        p.faults.push(PlannedFault {
+            node,
+            kind: FaultKind::VenueCut,
+            at_ms: at,
+            freeze_ms: 0,
+        });
+        node = 1 - node;
+        at += gap_ms;
     }
 }
 
@@ -220,6 +267,10 @@ pub struct Counters {
     pub self_repeats: u64,
     pub disconnects: u64,
     pub frames: u64,
+    #[serde(default)]
+    pub resyncs: u64,
+    #[serde(default)]
+    pub mixed_frames: u64,
 }
 
 impl From<ClientCounters> for Counters {
@@ -235,6 +286,8 @@ impl From<ClientCounters> for Counters {
             self_repeats: c.self_repeats,
             disconnects: c.disconnects,
             frames: c.frames,
+            resyncs: c.resyncs,
+            mixed_frames: c.mixed_frames,
         }
     }
 }
@@ -302,23 +355,45 @@ pub fn key_text(k: &EventKey) -> String {
     }
 }
 
-/// The log lines for one event: Deliver and Late verdicts only.
+/// The log lines for one event: Deliver and Late verdicts only. The
+/// delivered lines of a frame with mixed verdicts are the keys of the frame
+/// cut to its delivered events, not the verdicts themselves.
 pub fn log_lines(e: &Event, wall_us: i64, mono_ms: i64, out: &mut Vec<LogLine>) {
-    for (k, v) in &e.keys {
-        if *v == Verdict::Duplicate {
-            continue;
+    let line = |k: &EventKey, d: bool| LogLine {
+        k: key_text(k),
+        f: k.kind.feed().index() as u8,
+        ts: k.ts_millis,
+        d,
+        n: e.node,
+        w: wall_us,
+        rx: e.rx_micros,
+        m: mono_ms,
+    };
+    let delivered = e
+        .keys
+        .iter()
+        .filter(|(_, v)| *v == Verdict::Deliver)
+        .count();
+    if delivered > 0 && delivered < e.keys.len() {
+        let mut cut = Vec::new();
+        if let Some(f) = e.delivered_frame() {
+            frame_keys(e.src, &f, &mut cut);
         }
-        out.push(LogLine {
-            k: key_text(k),
-            f: k.kind.feed().index() as u8,
-            ts: k.ts_millis,
-            d: *v == Verdict::Deliver,
-            n: e.node,
-            w: wall_us,
-            rx: e.rx_micros,
-            m: mono_ms,
-        });
+        out.extend(cut.iter().map(|k| line(k, true)));
+    } else {
+        out.extend(
+            e.keys
+                .iter()
+                .filter(|(_, v)| *v == Verdict::Deliver)
+                .map(|(k, _)| line(k, true)),
+        );
     }
+    out.extend(
+        e.keys
+            .iter()
+            .filter(|(_, v)| *v == Verdict::Late)
+            .map(|(k, _)| line(k, false)),
+    );
 }
 
 /// One truth frame: broadcast time and its keys.
@@ -423,6 +498,8 @@ pub struct FaultCounts {
     pub cut: usize,
     #[serde(default)]
     pub freeze_leader: usize,
+    #[serde(default)]
+    pub venue_cut: usize,
     pub observed: usize,
 }
 
@@ -444,6 +521,9 @@ pub struct Report {
     pub truth_keys_in_window: usize,
     pub missing: u64,
     pub duplicates: u64,
+    /// Untimed keys delivered more than once. Reported, not gated.
+    #[serde(default)]
+    pub untimed_duplicates: u64,
     pub extra: u64,
     pub late: Late,
     pub added_delay_ms: Spread,
@@ -565,12 +645,10 @@ pub fn verify(inp: &Inputs) -> Report {
         .iter()
         .filter(|e| e.kind == FaultKind::Freeze)
         .count();
-    r.faults.freeze_leader = inp
-        .executed
-        .iter()
-        .filter(|e| e.kind == FaultKind::FreezeLeader)
-        .count();
-    r.faults.cut = r.faults.executed - r.faults.kill9 - r.faults.freeze - r.faults.freeze_leader;
+    let count = |k: FaultKind| inp.executed.iter().filter(|e| e.kind == k).count();
+    r.faults.freeze_leader = count(FaultKind::FreezeLeader);
+    r.faults.cut = count(FaultKind::Cut);
+    r.faults.venue_cut = count(FaultKind::VenueCut);
 
     let invalid = inp.harness.invalid.clone().or_else(|| {
         inp.client
@@ -631,6 +709,15 @@ pub fn verify(inp: &Inputs) -> Report {
         .into_iter()
         .filter(|k| delivered[k] > 1)
         .count() as u64;
+    r.untimed_duplicates = inp
+        .log
+        .iter()
+        .filter(|l| l.d && l.ts.is_none())
+        .map(|l| l.k.as_str())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter(|k| delivered[k] > 1)
+        .count() as u64;
     r.extra = delivered.keys().filter(|k| !all_truth.contains(*k)).count() as u64;
 
     let mut late_seen: HashSet<&str> = HashSet::new();
@@ -651,24 +738,37 @@ pub fn verify(inp: &Inputs) -> Report {
         }
     }
 
-    // A4: executed as planned, and each victim seen going down.
+    // A4: executed as planned, and each victim seen going down. A venue cut
+    // leaves the client's connection up; it is seen as a late copy from the
+    // victim, the venue's history replayed after its redial.
     let as_planned = inp.executed.len() == inp.plan.faults.len()
         && inp.executed.iter().zip(&inp.plan.faults).all(|(e, p)| {
             e.kind == p.kind && (p.kind == FaultKind::FreezeLeader || e.node == p.node)
         });
+    let during =
+        |e: &Executed, m: i64| m >= e.at_mono_ms && m <= e.recovered_mono_ms + OBSERVE_SLACK_MS;
     let downs: Vec<&ConnObs> = inp.client.conn.iter().filter(|c| !c.live).collect();
-    let observed: Vec<Option<&ConnObs>> = inp
+    let observed: Vec<Option<&ConnObs>> =
+        inp.executed
+            .iter()
+            .map(|e| {
+                downs.iter().copied().find(|c| {
+                    e.kind != FaultKind::VenueCut && c.node == e.node && during(e, c.mono_ms)
+                })
+            })
+            .collect();
+    let venue_seen = inp
         .executed
         .iter()
-        .map(|e| {
-            downs.iter().copied().find(|c| {
-                c.node == e.node
-                    && c.mono_ms >= e.at_mono_ms
-                    && c.mono_ms <= e.recovered_mono_ms + OBSERVE_SLACK_MS
-            })
+        .filter(|e| {
+            e.kind == FaultKind::VenueCut
+                && inp
+                    .log
+                    .iter()
+                    .any(|l| !l.d && l.n == e.node && during(e, l.m))
         })
-        .collect();
-    r.faults.observed = observed.iter().flatten().count();
+        .count();
+    r.faults.observed = observed.iter().flatten().count() + venue_seen;
     let faults_ok = as_planned && r.faults.observed == inp.executed.len();
 
     // A5: no vacuous pass.
@@ -1162,6 +1262,112 @@ mod tests {
         use FaultKind::*;
         assert_eq!(kinds, vec![Kill9, Freeze, FreezeLeader, FreezeLeader]);
         assert!(p.faults[2..].iter().all(|f| f.freeze_ms == 9_000));
+    }
+
+    #[test]
+    fn venue_cuts_follow_the_plan_and_are_seen_by_a_late_copy() {
+        let mut p = plan(3, 3, 4_000, 2_000, 15_000, None);
+        add_venue_cuts(&mut p, 2, 4_000);
+        let shape: Vec<(usize, FaultKind)> = p.faults.iter().map(|f| (f.node, f.kind)).collect();
+        use FaultKind::*;
+        assert_eq!(
+            shape,
+            vec![
+                (0, Kill9),
+                (1, Freeze),
+                (0, Cut),
+                (1, VenueCut),
+                (0, VenueCut)
+            ]
+        );
+        assert_eq!(p.faults[3].at_ms, p.faults[2].at_ms + 4_000);
+
+        // The clean run's kill, then a venue cut of node 1 at 30 s that
+        // recovered at 31 s. The client never sees node 1 go down.
+        let mut i = clean();
+        i.plan.faults.push(PlannedFault {
+            node: 1,
+            kind: VenueCut,
+            at_ms: 0,
+            freeze_ms: 0,
+        });
+        i.executed.push(Executed {
+            node: 1,
+            kind: VenueCut,
+            at_wall_ms: 1_700_000_030_000,
+            at_mono_ms: 30_000,
+            recovered_wall_ms: 1_700_000_031_000,
+            recovered_mono_ms: 31_000,
+            takeover_ms: None,
+        });
+        // Without a late copy from node 1 the cut was not observed.
+        let r = verify(&i);
+        assert_eq!(r.verdict.reason.as_deref(), Some("faults_not_observed"));
+        assert_eq!(
+            (r.faults.observed, r.faults.venue_cut, r.faults.kill9),
+            (1, 1, 1)
+        );
+        // A late copy from node 0, or from node 1 long after, does not count.
+        let mut late = i.log[100].clone();
+        late.d = false;
+        late.n = 0;
+        late.m = 30_500;
+        i.log.push(late.clone());
+        assert_eq!(reason(&i).as_deref(), Some("faults_not_observed"));
+        late.n = 1;
+        late.m = 40_000;
+        i.log.push(late.clone());
+        assert_eq!(reason(&i).as_deref(), Some("faults_not_observed"));
+        late.m = 30_500;
+        i.log.push(late);
+        let r = verify(&i);
+        assert_eq!(r.verdict.result, "pass", "{:?}", r.verdict);
+        assert_eq!(r.faults.observed, 2);
+        assert_eq!(r.late.already_delivered, 1);
+        // Rehedge is only timed from a down.
+        assert_eq!(r.rehedge_ms.n, 1);
+    }
+
+    #[test]
+    fn untimed_keys_delivered_twice_are_reported_not_gated() {
+        let mut i = clean();
+        let k = format!("{:?}/{:032x}/-", KeyKind::Unkeyed(Feed::Rtds), 5u128);
+        i.truth.push(TruthFrame {
+            rx_us: 1_700_000_030_000_000,
+            keys: vec![(k.clone(), 0, None)],
+        });
+        let mut l = i.log[0].clone();
+        (l.k, l.f, l.ts) = (k, 0, None);
+        i.log.extend([l.clone(), l]);
+        let r = verify(&i);
+        assert_eq!(r.verdict.result, "pass", "{:?}", r.verdict);
+        assert_eq!((r.untimed_duplicates, r.duplicates), (1, 0));
+    }
+
+    #[test]
+    fn a_mixed_frame_is_logged_as_its_cut() {
+        use feeds::recording::Source;
+        let f = r#"{"topic":"crypto_prices","type":"subscribe","payload":{"symbol":"btcusdt","data":[{"timestamp":1,"value":1},{"timestamp":2,"value":2},{"timestamp":3,"value":3}]}}"#;
+        let mut ks = Vec::new();
+        frame_keys(Source::Rtds, f, &mut ks);
+        let verdicts = [Verdict::Late, Verdict::Deliver, Verdict::Duplicate];
+        let e = Event {
+            node: 1,
+            seq: 9,
+            src: Source::Rtds,
+            rx_micros: 5,
+            snap: false,
+            frame: f.to_string(),
+            keys: ks.iter().copied().zip(verdicts).collect(),
+        };
+        let mut out = Vec::new();
+        log_lines(&e, 7, 8, &mut out);
+        let got: Vec<(String, bool)> = out.iter().map(|l| (l.k.clone(), l.d)).collect();
+        assert_eq!(
+            got,
+            vec![(key_text(&ks[1]), true), (key_text(&ks[0]), false)]
+        );
+        assert!(out.iter().all(|l| (l.n, l.w, l.rx, l.m) == (1, 7, 5, 8)));
     }
 
     fn head(epoch: u64, holder: Option<u32>, t: &[(u64, u32, i64, i64)]) -> Vec<u8> {

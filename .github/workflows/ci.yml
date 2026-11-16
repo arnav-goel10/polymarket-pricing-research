@@ -52,10 +52,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build node, venue_sim and chaos with the seeded faults compiled in
         run: cargo build --locked --release -p app --features mutants --bin node --bin venue_sim --bin chaos
-      - name: Baseline, synthetic, seed 1 at 200 frames/s, 12 faults, one node 20 ms behind
-        run: scripts/chaos_case.sh seed1 pass --seed 1 --rate 200 --faults 12 --lag-ms 20
-      - name: Baseline, synthetic, seed 2 at 2,000 frames/s, 12 faults
-        run: scripts/chaos_case.sh seed2 pass --seed 2 --rate 2000 --faults 12
+      # The two venue cuts at the end replay each venue's greeting to a node
+      # the client is live on, so late copies must show and none be lost.
+      - name: Baseline, synthetic, seed 1 at 200 frames/s, 12 faults and 2 venue cuts, one node 20 ms behind
+        run: scripts/chaos_case.sh seed1 pass+late --seed 1 --rate 200 --faults 12 --venue-cuts 2 --lag-ms 20
+      - name: Baseline, synthetic, seed 2 at 2,000 frames/s, 12 faults and 2 venue cuts
+        run: scripts/chaos_case.sh seed2 pass+late --seed 2 --rate 2000 --faults 12 --venue-cuts 2
       - name: Baseline, fixture playback at 300 frames/s, 3 faults
         run: scripts/chaos_case.sh fixture pass --recording fixtures/live-sample.prec --rate 300 --faults 3
       - name: Seeded faults, each caught by name
@@ -73,6 +75,9 @@ jobs:
           # client, which the cut gives: the node keeps ingesting.
           m stale-resume resume
           m overlap-kill missing 2
+          # A client that delivers late copies is caught once a venue cut
+          # replays history to it.
+          scripts/chaos_case.sh late-deliver duplicate --seed 3 --rate 200 --faults 3 --gap-ms 3000 --venue-cuts 1 --mutant late-deliver || fail=1
           # Control: a node that resends frames under fresh seqs must pass,
           # with the repeats dropped by key.
           m dup-frame pass+self_repeats

@@ -6,9 +6,9 @@
 //! chaos local  --run DIR [--seed 1] [--rate 200] [--faults 12] [--gap-ms 4000]
 //!              [--freeze-ms 2000] [--margin-s 15] [--recording FILE] [--lag-ms 0]
 //!              [--archive 1] [--leader-freezes 0] [--leader-freeze-ms 9000]
-//!              [--mutant NAME] [--bins DIR]
+//!              [--venue-cuts 0] [--mutant NAME] [--bins DIR]
 //! chaos plan   [--seed 1] [--faults 12] [--gap-ms 4000] [--freeze-ms 2000]
-//!              [--margin-s 15] [--mutant NAME]
+//!              [--margin-s 15] [--venue-cuts 0] [--mutant NAME]
 //! chaos client --nodes URL,URL --seconds N --run DIR [--mutant NAME]
 //! chaos verify --run DIR --truth FILE
 //! chaos verify-archive --run DIR [--store DIR]
@@ -25,6 +25,15 @@
 //! drops the client's connection in a loopback relay that sits between the
 //! client and each node, while the node keeps running.
 //!
+//! Each node also reaches the RTDS and CLOB venues through relays of its
+//! own. `--venue-cuts N` adds N `venue_cut` faults after the others, a gap
+//! apart: both of the victim's venue relays drop their connections while
+//! the node and the client stay up, the node redials, and the venue's
+//! greeting (60 RTDS points per series, the latest books) reaches the
+//! client live. Its recovery is both redials seen at the relays and the
+//! node ready again. The harness waits for the client to be live on the
+//! victim first, so the greeting has somewhere to go.
+//!
 //! `--archive 1` points both nodes at one directory store in the run
 //! directory, with 2 s slots and a scaled lease (ttl 4 s, renew 1 s, poll
 //! 0.5 s, margins 1 s and 0.5 s), and adds the archive verdict
@@ -38,7 +47,8 @@
 //! subscriptions never all went live.
 //!
 //! `--mutant` picks one seeded fault and works only in a build with the
-//! `mutants` feature: `no-dedup`, `single-node`, `no-reconnect` (client),
+//! `mutants` feature: `no-dedup`, `single-node`, `no-reconnect`,
+//! `late-deliver` (client),
 //! `seq-skip`, `stale-resume`, `dup-frame`, `no-fence`, `epoch-reuse`
 //! (node, through `POLY_MUTANT`), `overlap-kill` (harness).
 
@@ -108,6 +118,7 @@ fn parse_mutant(name: Option<&str>) -> Result<Mutant, String> {
         "no-dedup" => Mutant::Client(ClientMutant::NoDedup),
         "single-node" => Mutant::Client(ClientMutant::SingleNode),
         "no-reconnect" => Mutant::Client(ClientMutant::NoReconnect),
+        "late-deliver" => Mutant::Client(ClientMutant::LateDeliver),
         "seq-skip" => Mutant::Node("seq-skip"),
         "stale-resume" => Mutant::Node("stale-resume"),
         "dup-frame" => Mutant::Node("dup-frame"),
@@ -270,7 +281,7 @@ fn verify_and_print(run: &Path, truth: &Path) -> i32 {
         serde_json::to_string_pretty(&r).expect("report serializes")
     );
     println!(
-        "chaos: {} reason={} missing={} duplicates={} extra={} late={} late_already_delivered={} late_pre_window={} late_lost={} in_window={} faults={}/{} observed={} rehedge_max_ms={} added_delay_p99_ms={} self_repeats={} merger_duplicates={}",
+        "chaos: {} reason={} missing={} duplicates={} extra={} late={} late_already_delivered={} late_pre_window={} late_lost={} in_window={} faults={}/{} observed={} venue_cuts={} rehedge_max_ms={} added_delay_p99_ms={} self_repeats={} merger_duplicates={} mixed_frames={} resyncs={} untimed_duplicates={}",
         r.verdict.result,
         r.verdict.reason.as_deref().unwrap_or("-"),
         r.missing,
@@ -284,10 +295,14 @@ fn verify_and_print(run: &Path, truth: &Path) -> i32 {
         r.faults.executed,
         r.faults.planned,
         r.faults.observed,
+        r.faults.venue_cut,
         r.rehedge_ms.max.map_or("-".into(), |v| format!("{v:.0}")),
         r.added_delay_ms.p99.map_or("-".into(), |v| format!("{v:.1}")),
         r.counters.self_repeats,
         r.merger.duplicates,
+        r.counters.mixed_frames,
+        r.counters.resyncs,
+        r.untimed_duplicates,
     );
     r.exit_code()
 }
@@ -305,6 +320,11 @@ fn plan_from(o: &Opts) -> Result<Plan, String> {
         &mut p,
         o.num("leader-freezes", 0usize)?,
         o.num("leader-freeze-ms", 9_000u64)?,
+    );
+    chaos::add_venue_cuts(
+        &mut p,
+        o.num("venue-cuts", 0usize)?,
+        o.num("gap-ms", 4_000i64)?,
     );
     Ok(p)
 }
@@ -456,6 +476,8 @@ fn stop_child(child: &mut Child) {
 
 struct NodeProc {
     proxy: Arc<Proxy>,
+    /// Relays from this node to the RTDS and CLOB venues.
+    venue: Vec<Arc<Proxy>>,
     bin: PathBuf,
     args: Vec<String>,
     mutant: Option<&'static str>,
@@ -608,6 +630,7 @@ type Shared = Arc<tokio::sync::Mutex<NodeProc>>;
 #[derive(Default)]
 struct Proxy {
     conns: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    accepted: std::sync::atomic::AtomicU64,
 }
 
 impl Proxy {
@@ -623,6 +646,8 @@ impl Proxy {
                     continue;
                 };
                 let _ = down.set_nodelay(true);
+                p.accepted
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let relay = tokio::spawn(async move {
                     if let Ok(mut up) = tokio::net::TcpStream::connect(target).await {
                         let _ = up.set_nodelay(true);
@@ -635,6 +660,10 @@ impl Proxy {
             }
         });
         Ok((proxy, port))
+    }
+
+    fn accepted(&self) -> u64 {
+        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Drop every relayed connection. Returns how many there were.
@@ -707,6 +736,19 @@ async fn execute(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             signal(pid, "CONT")?;
+        }
+        FaultKind::VenueCut => {
+            let before: Vec<u64> = n.venue.iter().map(|p| p.accepted()).collect();
+            for p in &n.venue {
+                p.cut();
+            }
+            let started = Instant::now();
+            while n.venue.iter().zip(&before).any(|(p, b)| p.accepted() <= *b) {
+                if started.elapsed() > Duration::from_secs(20) {
+                    return Err(format!("node {idx} did not redial its venues within 20 s"));
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
         FaultKind::Cut => {}
     }
@@ -791,6 +833,10 @@ async fn drive(
             }
             if wanted[other] {
                 let _ = tokio::time::timeout(Duration::from_secs(10), live.wait_for(|l| l[other]))
+                    .await;
+            }
+            if f.kind == FaultKind::VenueCut && wanted[victim] {
+                let _ = tokio::time::timeout(Duration::from_secs(10), live.wait_for(|l| l[victim]))
                     .await;
             }
             let node = nodes[victim].clone();
@@ -903,10 +949,19 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
     };
     let mut nodes: Vec<Shared> = Vec::new();
     let mut urls = Vec::new();
+    let venue_addr = |url: &str| -> Result<SocketAddr, String> {
+        url.strip_prefix("ws://")
+            .and_then(|a| a.parse().ok())
+            .ok_or(format!("venue url {url}"))
+    };
+    let (rtds_addr, clob_addr) = (venue_addr(&sim.urls[0])?, venue_addr(&sim.urls[2])?);
     for (i, name) in ["a", "b"].iter().enumerate() {
         let stream = free_port().map_err(|e| e.to_string())?;
         let http = free_port().map_err(|e| e.to_string())?;
         let data = run.join(format!("node-{name}-data"));
+        // The node reaches RTDS and CLOB through relays the harness can cut.
+        let (rtds_relay, rtds_port) = Proxy::start(rtds_addr).await.map_err(|e| e.to_string())?;
+        let (clob_relay, clob_port) = Proxy::start(clob_addr).await.map_err(|e| e.to_string())?;
         let mut args = vec![
             "--data".to_string(),
             data.to_string_lossy().into_owned(),
@@ -917,11 +972,11 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
             "--http".into(),
             format!("127.0.0.1:{http}"),
             "--rtds-url".into(),
-            sim.urls[0].clone(),
+            format!("ws://127.0.0.1:{rtds_port}"),
             "--binance-url".into(),
             sim.urls[1].clone(),
             "--clob-url".into(),
-            sim.urls[2].clone(),
+            format!("ws://127.0.0.1:{clob_port}"),
             "--token".into(),
             token.clone(),
         ];
@@ -939,6 +994,7 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
         let (proxy, relay) = Proxy::start(target).await.map_err(|e| e.to_string())?;
         let mut n = NodeProc {
             proxy,
+            venue: vec![rtds_relay, clob_relay],
             bin: bins.join("node"),
             args,
             mutant: node_mutant,

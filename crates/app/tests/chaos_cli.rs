@@ -35,6 +35,36 @@ fn leader_freezes_take_the_last_faults() {
 }
 
 #[test]
+fn venue_cuts_come_after_the_other_faults() {
+    let out = Command::new(env!("CARGO_BIN_EXE_chaos"))
+        .args([
+            "plan",
+            "--faults",
+            "3",
+            "--venue-cuts",
+            "2",
+            "--gap-ms",
+            "3000",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let p: Plan = serde_json::from_slice(&out.stdout).unwrap();
+    let shape: Vec<(usize, FaultKind)> = p.faults.iter().map(|f| (f.node, f.kind)).collect();
+    use FaultKind::*;
+    assert_eq!(
+        shape,
+        vec![
+            (0, Kill9),
+            (1, Freeze),
+            (0, Cut),
+            (1, VenueCut),
+            (0, VenueCut)
+        ]
+    );
+}
+
+#[test]
 fn unknown_commands_and_options_exit_2() {
     for args in [
         &["nope"][..],
@@ -55,6 +85,7 @@ fn unknown_commands_and_options_exit_2() {
 fn a_build_without_mutants_refuses_a_seeded_fault() {
     for m in [
         "no-dedup",
+        "late-deliver",
         "seq-skip",
         "overlap-kill",
         "no-fence",

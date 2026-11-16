@@ -4,7 +4,10 @@
 #   scripts/chaos_case.sh NAME EXPECT [chaos local options...]
 #
 # EXPECT is `pass`, `pass+self_repeats` (pass, and a node repeated keys on
-# its own stream, which proves dedup is by key), or the reason a seeded
+# its own stream, which proves dedup is by key), `pass+late` (pass, the
+# merger dropped late copies, and none of them was lost: with venue cuts this
+# proves the venue's greeting reached the client live and was dropped, not
+# delivered again), or the reason a seeded
 # fault must fail with (exit 1 and exactly that reason first). With
 # `--archive 1` a stream pass hands the reason to the archive verdict.
 #
@@ -28,6 +31,8 @@ if [ "$reason" = none ] && [ -f "$run/archive.json" ]; then
   reason=$(jq -r '.verdict.reason // "none"' "$run/archive.json" 2>/dev/null || echo none)
 fi
 repeats=$(jq -r '.counters.self_repeats // 0' "$report" 2>/dev/null || echo 0)
+late=$(jq -r '.merger.late // 0' "$report" 2>/dev/null || echo 0)
+late_lost=$(jq -r '.late.lost // 0' "$report" 2>/dev/null || echo 0)
 summary=$(grep '^chaos: ' "$run.out" | tail -n 1)
 archive=$(grep '^chaos archive: ' "$run.out" | tail -n 1)
 [ -n "$archive" ] && summary="$summary $archive"
@@ -36,6 +41,7 @@ ok=0
 case "$expect" in
 pass) [ "$code" = 0 ] && ok=1 ;;
 pass+self_repeats) [ "$code" = 0 ] && [ "$repeats" -gt 0 ] && ok=1 ;;
+pass+late) [ "$code" = 0 ] && [ "$late" -gt 0 ] && [ "$late_lost" = 0 ] && ok=1 ;;
 *) [ "$code" = 1 ] && [ "$reason" = "$expect" ] && ok=1 ;;
 esac
 
