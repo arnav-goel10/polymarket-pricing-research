@@ -550,9 +550,12 @@ mod tests {
                 prop_assert_eq!(*complete, !gap, "complete flag");
                 prop_assert!(!lost || !*complete, "CLOB frames lost but complete");
             }
-            (p, r) => return Err(TestCaseError::fail(format!(
-                "resume {resume:?} with oldest {oldest} head {head}: resumable={r} but plan {p:?}"
-            ))),
+            (p, r) => {
+                let why = format!("resume {resume:?}, oldest {oldest}, head {head}");
+                return Err(TestCaseError::fail(format!(
+                    "{why}: resumable={r}, plan {p:?}"
+                )));
+            }
         }
         Ok(())
     }
