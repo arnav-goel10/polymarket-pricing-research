@@ -49,11 +49,12 @@ Written as a read-only design before the build started; section 9 records what t
 - No `hb` or `ev` for 1 s means the connection is dead. Redial with 100 ms to 2 s jittered backoff.
 - The delivered log records Deliver and Late verdicts (private file, never an artifact).
 - `BookView` helper: drop a CLOB delta whose venue timestamp is below the latest delivered `book` for that asset.
+- Verdicts are per key and a frame can carry several keys, so a frame consumer takes `Event::delivered_frame`, the frame cut to its delivered events. `BookView::admit_event` does that cut first.
 - Not guaranteed and reported: cross-node order (`order_inversions`).
 
 ### 3.6 Simulator (`bin/venue_sim`)
 - Three WS listeners, one generator, deterministic from `--seed`, `--rate` frames/s.
-- **On every new RTDS connection it sends a history snapshot (`payload.data[]`) of the last 60 points, and on every new CLOB connection the latest `book` frames.** This is how real venues behave and is what makes Late verdicts appear in CI.
+- **On every new RTDS connection it sends a history snapshot (`payload.data[]`) of the last 60 points, and on every new CLOB connection the latest `book` frames.** This is how real venues behave. It reaches the client live only when a node reconnects to a venue while the client is connected to that node, which the `venue_cut` fault (section 9, P2 review) produces; the two synthetic baselines run two venue cuts each and must show Late verdicts.
 - `--lag-ms K` delays every second connection. `--manifest out.prec` writes every broadcast frame, so truth is a `.prec` file and CI and live share one verify path.
 - `--recording fixtures/live-sample.prec --rate N` plays real frames once, paced by rate.
 
@@ -70,7 +71,7 @@ Window W is cut by **venue timestamp of the key**, not receive time: `T0 <= ts <
 | A4 | executed == planned, client saw a disconnect per fault | `faults_not_observed` |
 | A5 | each node delivered first copies, truth events exist inside every fault window | `vacuous` |
 | A6 | `seq_gaps`, `resume_violations`, `unkeyed` = 0 | `seq_gap`, `resume`, `unkeyed` |
-| A7 | two nodes down at once | exit 2, invalid |
+| A7 | two nodes down at once | exit 2, invalid (as built, judged from the harness's own conditions; see section 9) |
 
 Late is **not** gated at zero. After the run each Late key is classed `late_already_delivered`, `late_pre_window` (ts < T0) or `late_lost`. `late_lost` keys are a subset of `missing`.
 
@@ -272,8 +273,8 @@ Known limits of P1, from its review:
 - The 1 s dead clock starts at the dial, so a connect into a frozen node is dead after 1 s too and there is no separate connect timeout. Backoff is 100 ms doubling per failed try, capped at 2 s, scaled by a jitter in [0.5, 1] and never under 100 ms. It starts again at 100 ms when a connection goes live.
 - `order_inversions` counts a delivered timed key older than the newest delivered key of its feed when that one came from another node. `self_repeats` counts a key a node sends again on one connection, over its last 8,192 keys.
 - `BookView` treats only `price_change` entries as deltas. An entry is dropped when its frame timestamp is below the latest delivered `book` of its asset; an older book never moves that back.
-- `venue_sim --rate` is Binance and CLOB frames a second, half each. RTDS is fixed at 4 updates a second, three on `crypto_prices` and one on `crypto_prices_chainlink`, so the 60-point greeting covers 15 s of the fast series. That is more than the merger's 10 s span, which is what makes Late verdicts appear when a node reconnects. Content is deterministic from the seed and venue timestamps are the wall clock in milliseconds. There are two CLOB assets and nodes follow the first; each gets a `book` every 25th frame, and price changes carry no `best_bid` or `best_ask`, so the node's book never crosses or prunes. RTDS answers `PING` with `PONG`, so the RTDS idle guard does not fire on a sparse recording. `--start-after N` holds the generator until every venue has had N connections. Greetings are not written to the manifest, since they repeat broadcast frames. In recording mode control records are skipped and `chaos local` gives the nodes the recording's first subscribe token.
-- The window maps wall time to venue time per feed: the newest timestamp among that feed's truth keys broadcast by then. A key is in W when `map(T0) < ts <= map(T1)`. For synthetic frames that is `T0 <= ts < T1` to the millisecond; for a played recording, whose timestamps are from the day it was recorded, it keeps every key broadcast before T0 out of W.
+- `venue_sim --rate` is Binance and CLOB frames a second, half each. RTDS is fixed at 4 updates a second, three on `crypto_prices` and one on `crypto_prices_chainlink`, so the 60-point greeting covers 20 s of the fast series and 60 s of the slow one, which is three times slower. Both are more than the merger's 10 s span, so a greeting that reaches the client live carries Late copies. Content is deterministic from the seed and venue timestamps are the wall clock in milliseconds. There are two CLOB assets and nodes follow the first; each gets a `book` every 25th frame, and price changes carry no `best_bid` or `best_ask`, so the node's book never crosses or prunes. RTDS answers `PING` with `PONG`, so the RTDS idle guard does not fire on a sparse recording. `--start-after N` holds the generator until every venue has had N connections. Greetings are not written to the manifest, since they repeat broadcast frames. In recording mode control records are skipped and `chaos local` gives the nodes the recording's first subscribe token.
+- The window maps wall time to venue time per feed: the newest timestamp among that feed's truth keys broadcast by then. A key is in W when `map(T0) < ts <= map(T1)`. For synthetic frames that runs from just after the last millisecond broadcast by T0 to the last millisecond broadcast by T1, inclusive, so keys sharing T0's last millisecond are outside W (the spec's `T0 <= ts < T1` is off by that one millisecond at each end); for a played recording, whose timestamps are from the day it was recorded, it keeps every key broadcast before T0 out of W.
 - A Late key that is not delivered and whose timestamp is above `map(T1)` is counted as `late_post_window`, so `late_lost` stays a subset of `missing`.
 - The first failing check names the reason, in the order `seq_gap`, `resume`, `unkeyed`, `missing`, `duplicate`, `extra`, `faults_not_observed`, `vacuous`. Protocol counters come first because a broken stream also loses events, and `vacuous` last because it only matters for a run that would otherwise pass. `report.json` lists every failure.
 - `freeze` is built here, not in P3, as 3.7 lists it. A freeze lasts 2 s.
@@ -287,6 +288,22 @@ Known limits of P1, from its review:
 - The `chaos` job builds once with the `mutants` feature; baseline runs set no mutant. The refusal without the feature is tested in the `rust` job for both `node` and `chaos`.
 - The seed 1 baseline runs with `--lag-ms 20`, so one node is always behind and the other supplies most first copies.
 - `verify-archive` is left to P3 with the archive it checks.
+
+P2 review fixes:
+
+- Venue cut. `chaos local` puts a loopback relay between each node and the RTDS and CLOB venues, and `--venue-cuts N` adds N `venue_cut` faults after the others, a gap apart, alternating nodes. A venue cut drops both of the victim's venue relays while the node and the client's connection to it stay up. The harness first waits up to 10 s for the client to be live on the victim. The node redials and is greeted with 60 points per RTDS series and the latest books, and those flow live to the client. Recovery is both redials seen at the relays and the node's `/readyz` at 200 again. A4 counts a venue cut as observed when the client logged a Late copy from the victim between the cut and 5 s after recovery. The seed 1 and seed 2 baselines add two venue cuts each and expect `pass+late`: pass, merger `late > 0` and `late_lost = 0`. A new client mutant, `late-deliver` (a late verdict passed on as a delivery), must fail `duplicate` with one venue cut, since the greeting reaching the client live is certain to carry late copies of keys it already delivered.
+- Frame unit. `Event::delivered_frame` returns the frame cut to its delivered events in the venue's own shape (RTDS history points, CLOB array items, price change entries), `None` when nothing was delivered. Each kept piece is keyed again alone and must match the key at its position, so a cut never passes on a duplicate or late piece; a frame whose pieces do not line up gives `None`. `BookView::admit_event` takes the client's event and applies only that cut. The chaos log writes the delivered lines of a mixed-verdict frame from the keys of its cut, so A1 and A2 judge the cut on real frames, and `mixed_frames` counts such frames. A unit test feeds a history frame with Late, Deliver and Duplicate points and a CLOB array with a duplicate entry, and shows that whole-frame application repeats events while the cut gives each once.
+- A second seq gap at the same `(boot, seq)` makes the next dial ask for a snapshot instead of a resume, so a node that always skips one frame no longer holds the connection in a resume loop. `seq_gaps` still counts every gap.
+- `resyncs` counts snapshots from a boot the client already followed (after `bye lagged`, or the snapshot above). That connection skips the node's frames in between; the other node covers them. It is reported in `report.json`, not gated.
+- `untimed_duplicates` reports untimed keys delivered more than once. A1 and A2 still cover timed keys only, as the merger allows an untimed key twice once it leaves the window. It is not gated.
+- RTDS point timestamps in the generator are strictly increasing per series, so two ticks in one wall millisecond after a stall no longer share a key.
+
+Known limits of P2, from its review:
+
+- A7 is judged from the harness's conditions (a node exited on its own, a peer not ready before a fault, a victim not ready after one, subscriptions never all live), not from overlapping down intervals in the client's own log. A run where both subscriptions were down together fails `missing` rather than exiting 2. That never turns a bad run into a pass, and it keeps `no-reconnect` and `overlap-kill` judged by `missing` as the mutant table says.
+- Truth is a set of key texts made by the same `frame_keys` the client uses. Two distinct venue events that collapse to one key are one truth entry, and the merger dropping the second is invisible to A1. `keycheck` on the committed recording is the only guard, and only for that recording.
+- The synthetic generator emits no untimed or unkeyed frames and no CLOB arrays. Only the fixture case carries those shapes, and the cut path for CLOB arrays is covered by unit tests.
+- Fixture playback at 300 frames/s runs venue time about 6.6 times slower than wall time, so the merger's 10 s span is about 66 s of wall time and a Late verdict is close to impossible there. The fixture baseline says nothing about the Late boundary on real frames; the venue cut baselines carry that check on synthetic frames.
 
 ### P3 (steps 6 and 7)
 
