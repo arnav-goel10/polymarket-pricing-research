@@ -21,6 +21,10 @@
 //! `--keep-slots` are deleted. `--slot-ms` shortens the slot for tests. The
 //! rules, write errors included, are in `app::segments`.
 //!
+//! The WebSocket handshake, the hello and every chunk of a snapshot are
+//! bounded like a live batch: a client that takes over 5 s for one of them
+//! is dropped, so a stalled reader never pins a snapshot.
+//!
 //! With `--store DIR` the node contends for the archive lease on that
 //! directory store (see `app::archiver`), ships closed slots while it
 //! leads, and reports the epoch and leadership in `hb`, `/ha` and
@@ -52,6 +56,7 @@ use ha::key::{frame_keys, EventKey};
 use ha::ring::{Plan, Ring, RingConfig};
 use ha::store::FsStore;
 use ha::wire::{self, Boot, ByeReason, Mode, NodeMsg};
+use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::SocketAddr;
@@ -80,6 +85,8 @@ enum Mutant {
     StaleResume,
     /// Push every 500th venue frame a second time, under the next seq.
     DupFrame,
+    /// Wait without a bound for the handshake, the hello and the snapshot.
+    UnboundedSnapshot,
     /// A lease fault: `no-fence` sends renews and commits with no
     /// condition, `epoch-reuse` keeps the old epoch on a takeover.
     Lease(LeaseMutant),
@@ -98,6 +105,7 @@ fn mutant_from_env() -> Result<Mutant, String> {
         "seq-skip" => Ok(Mutant::SeqSkip),
         "stale-resume" => Ok(Mutant::StaleResume),
         "dup-frame" => Ok(Mutant::DupFrame),
+        "unbounded-snapshot" => Ok(Mutant::UnboundedSnapshot),
         "no-fence" => Ok(Mutant::Lease(LeaseMutant::Unconditional)),
         "epoch-reuse" => Ok(Mutant::Lease(LeaseMutant::ReuseEpoch)),
         _ => Err(format!("unknown POLY_MUTANT {v:?}")),
@@ -310,8 +318,23 @@ where
     .await;
 }
 
+/// `f` bounded by [`SEND_TIMEOUT`], except under the `unbounded-snapshot`
+/// mutant, which waits as long as the client takes.
+async fn bounded<T, E>(mutant: Mutant, f: impl Future<Output = Result<T, E>>) -> Result<T, BoxError>
+where
+    E: Into<BoxError>,
+{
+    if mutant == Mutant::UnboundedSnapshot {
+        return f.await.map_err(Into::into);
+    }
+    match tokio::time::timeout(SEND_TIMEOUT, f).await {
+        Ok(r) => r.map_err(Into::into),
+        Err(_) => Err("client not reading".into()),
+    }
+}
+
 async fn serve_conn(tcp: TcpStream, ctx: &Ctx) -> Result<(), BoxError> {
-    let ws = tokio_tungstenite::accept_async(tcp).await?;
+    let ws = bounded(ctx.mutant, tokio_tungstenite::accept_async(tcp)).await?;
     let (mut tx, mut rx) = ws.split();
     let first = tokio::time::timeout(Duration::from_secs(5), first_text(&mut rx)).await;
     let sub = match first {
@@ -350,16 +373,30 @@ async fn serve_conn(tcp: TcpStream, ctx: &Ctx) -> Result<(), BoxError> {
         head,
         complete,
     };
-    tx.feed(Message::Text(wire::encode(&hello))).await?;
-    if mode == Mode::Snapshot {
-        for e in &frames {
-            let ev = wire::encode_ev(e.seq, e.src, e.rx_micros, true, &e.frame);
-            tx.feed(Message::Text(ev)).await?;
+    // The hello, the snapshot frames and snap_end go out in chunks of a
+    // live batch, each flushed within the send timeout.
+    let snapshot = mode == Mode::Snapshot;
+    let mut msgs = std::iter::once(wire::encode(&hello))
+        .chain(
+            frames
+                .iter()
+                .map(|e| wire::encode_ev(e.seq, e.src, e.rx_micros, true, &e.frame)),
+        )
+        .chain(snapshot.then(|| wire::encode(&NodeMsg::SnapEnd { next })));
+    loop {
+        let chunk: Vec<String> = msgs.by_ref().take(BATCH).collect();
+        if chunk.is_empty() {
+            break;
         }
-        tx.feed(Message::Text(wire::encode(&NodeMsg::SnapEnd { next })))
-            .await?;
+        let send = async {
+            for m in chunk {
+                tx.feed(Message::Text(m)).await?;
+            }
+            tx.flush().await
+        };
+        bounded(ctx.mutant, send).await?;
     }
-    tx.flush().await?;
+    drop(msgs);
     drop(frames);
 
     let mut head_rx = ctx.head.clone();

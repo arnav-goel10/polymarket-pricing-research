@@ -44,6 +44,13 @@ impl Drop for Venues {
 }
 
 async fn venues() -> Venues {
+    venues_with(0).await
+}
+
+/// As [`venues`], with `pad` bytes of padding in every order-book change,
+/// so a stream carries megabytes a second and fills socket buffers fast.
+async fn venues_with(pad: usize) -> Venues {
+    let pad = "x".repeat(pad);
     let (rt, _) = broadcast::channel::<String>(8192);
     let (bn, _) = broadcast::channel::<String>(8192);
     let (cl, _) = broadcast::channel::<String>(8192);
@@ -70,7 +77,7 @@ async fn venues() -> Venues {
                 r#"{{"stream":"btcusdt@aggTrade","data":{{"a":{i},"T":{i},"p":"100000","q":"1","m":false}}}}"#
             ));
             let _ = cl.send(format!(
-                r#"{{"event_type":"price_change","timestamp":"{i}","price_changes":[{{"asset_id":"tok","hash":"h{i}","price":"0.41","size":"{i}","side":"BUY","best_bid":"0.41","best_ask":"0.6"}}]}}"#
+                r#"{{"event_type":"price_change","pad":"{pad}","timestamp":"{i}","price_changes":[{{"asset_id":"tok","hash":"h{i}","price":"0.41","size":"{i}","side":"BUY","best_bid":"0.41","best_ask":"0.6"}}]}}"#
             ));
         }
     });
@@ -515,6 +522,123 @@ async fn resume_from_outside_the_ring_gets_a_snapshot() {
     node.stop();
 }
 
+/// The value of one unlabelled metric line.
+async fn metric(n: &Node, name: &str) -> u64 {
+    let (_, body) = http_get(n.http, "/metrics").await.expect("metrics");
+    body.lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no {name} in {body}"))
+}
+
+/// What a stall run leaves open, held until the check is done.
+struct Stalled {
+    _venues: Venues,
+    _idle: tokio::net::TcpStream,
+    _ws: Ws,
+}
+
+/// Two clients that stop reading: one opens TCP and never sends the
+/// WebSocket handshake, the other subscribes and never reads its
+/// snapshot. The order-book changes carry 8 KiB each and the node has run
+/// 5 s, so the snapshot is about 20 MB, far past the socket buffers.
+/// Returns the node, the clients and the open connection count 12 s
+/// after both connected.
+async fn stalled_clients(mutant: Option<&str>) -> (Node, Stalled, u64) {
+    let v = venues_with(8 * 1024).await;
+    let name = format!("stall-{}", mutant.unwrap_or("real"));
+    let node = spawn_node(&v, &name, &["--ring-bytes", "268435456"], mutant);
+    wait_ready(&node).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let addr = node.stream.strip_prefix("ws://").unwrap().to_string();
+    let idle = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(&node.stream)
+        .await
+        .unwrap();
+    ws.send(Message::Text(wire::encode_sub(None)))
+        .await
+        .unwrap();
+    let started = Instant::now();
+    while metric(&node, "poly_node_connections").await < 2 {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "never connected"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let open = metric(&node, "poly_node_connections").await;
+    let held = Stalled {
+        _venues: v,
+        _idle: idle,
+        _ws: ws,
+    };
+    (node, held, open)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn clients_that_stop_reading_in_the_handshake_or_snapshot_are_dropped() {
+    let (node, held, open) = stalled_clients(None).await;
+    // Each is dropped 5 s after its last progress.
+    assert_eq!(open, 0, "a stalled client still holds its connection");
+    drop(held);
+    node.stop();
+}
+
+/// A client that reads about 500 messages a second against a stream of
+/// 1,500, through a 3,000 frame ring, falls out of the ring. The node must
+/// say `bye lagged`, and the reconnect must land in a snapshot followed by
+/// a contiguous live stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_reader_gets_bye_lagged_and_resyncs_through_a_snapshot() {
+    let v = venues_with(8 * 1024).await;
+    let node = spawn_node(&v, "lagged", &["--ring-frames", "3000"], None);
+    wait_ready(&node).await;
+    let mut seen = Seen::default();
+    let (mut ws, hello) = subscribe(&node.stream, None).await;
+    seen.read_snapshot(&mut ws, &hello).await;
+    let mut expect = hello.next;
+    let started = Instant::now();
+    let reason = loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "never lagged out"
+        );
+        match next_msg(&mut ws).await {
+            NodeMsg::Ev { seq, snap, .. } => {
+                assert!(!snap);
+                if seq != expect {
+                    seen.seq_gaps += 1;
+                }
+                expect = seq + 1;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            NodeMsg::Hb { .. } => {}
+            NodeMsg::Bye { reason } => break reason,
+            m => panic!("unexpected live message: {m:?}"),
+        }
+    };
+    assert_eq!(reason, ByeReason::Lagged);
+    assert_eq!(
+        seen.seq_gaps, 0,
+        "the node skipped instead of saying lagged"
+    );
+    assert_eq!(metric(&node, "poly_node_lagged_total").await, 1);
+    drop(ws);
+    let last = expect - 1;
+    let resume = ResumeFrom {
+        boot: node.boot,
+        seq: last,
+    };
+    let (mut ws, hello) = subscribe(&node.stream, Some(resume)).await;
+    assert_eq!(hello.mode, Mode::Snapshot);
+    assert!(hello.next > last + 1);
+    seen.read_snapshot(&mut ws, &hello).await;
+    seen.read_live(&mut ws, hello.next, hello.next + 300).await;
+    assert_eq!(seen.seq_gaps, 0);
+    drop(ws);
+    node.stop();
+}
+
 #[cfg(not(feature = "mutants"))]
 #[test]
 fn a_build_without_mutants_refuses_poly_mutant() {
@@ -579,6 +703,16 @@ mod mutants {
             seen.duplicate_keys() > 0,
             "the repeated frame must show by key"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unbounded_snapshot_keeps_stalled_clients_forever() {
+        // Control for the stall test: without the bounds both clients are
+        // still connected after the same wait.
+        let (node, held, open) = stalled_clients(Some("unbounded-snapshot")).await;
+        assert_eq!(open, 2, "the stall check would not catch the fault");
+        drop(held);
+        node.stop();
     }
 
     #[tokio::test(flavor = "multi_thread")]
