@@ -5,14 +5,20 @@
 //! The generator's content (trade and book ids, prices, sizes, hashes, which
 //! asset a change is for) is a pure function of the seed and the frame
 //! count. Venue timestamps are the wall clock in milliseconds when a frame
-//! is made, so the HA harness can line them up with its own clock.
+//! is made, so the HA harness can line them up with its own clock. RTDS
+//! point timestamps are strictly increasing per series (a tick in the same
+//! millisecond as the last one takes the next millisecond), since a point's
+//! key is its series and timestamp.
 //!
 //! Greetings. On every new RTDS connection the venue sends, per price
 //! series, one `payload.data[]` snapshot of the last [`RTDS_HISTORY`]
 //! points; on every new CLOB connection, the latest `book` frame of each
 //! asset. Both are copies of frames already broadcast, so their keys are
-//! already in the truth. A node that reconnects therefore gets old events
-//! again, which the client's merger has to drop as duplicates or as late.
+//! already in the truth. A node that reconnects to a venue therefore gets
+//! old events again, which the client's merger has to drop as duplicates or
+//! as late. Whether that reaches the client live depends on the client
+//! being connected to the node at the time: the harness's `venue_cut`
+//! fault makes sure it is, and only runs with venue cuts gate on it.
 
 use feeds::recording::Source;
 use serde_json::Value;
@@ -20,9 +26,11 @@ use std::collections::{BTreeMap, VecDeque};
 
 /// Points per RTDS series in a greeting.
 pub const RTDS_HISTORY: usize = 60;
-/// The fast RTDS series ticks this often, the slow one four times slower,
-/// so a greeting covers 15 s of the fast series, more than the merger's
-/// 10 s span.
+/// RTDS ticks this often. Three ticks in four are on the fast series and
+/// one on the Chainlink series, so the fast series has a point every 333 ms
+/// and the slow one every second, three times slower. A greeting then
+/// covers 20 s of the fast series and 60 s of the slow one, both more than
+/// the merger's 10 s span.
 pub const RTDS_TICK_MS: i64 = 250;
 /// The two CLOB assets. Nodes follow the first.
 pub const ASSETS: [&str; 2] = ["tokA", "tokB"];
@@ -62,6 +70,8 @@ pub struct Synth {
     btc_cents: i64,
     clob_frames: [u64; 2],
     rtds_points: u64,
+    /// Last point timestamp per RTDS series, fast then Chainlink.
+    rtds_last: [i64; 2],
 }
 
 impl Synth {
@@ -73,6 +83,7 @@ impl Synth {
             btc_cents: 10_000_000,
             clob_frames: [0; 2],
             rtds_points: 0,
+            rtds_last: [i64::MIN; 2],
         }
     }
 
@@ -152,6 +163,9 @@ impl Synth {
     pub fn rtds(&mut self, now_ms: i64) -> String {
         let chainlink = self.rtds_points % 4 == 3;
         self.rtds_points += 1;
+        let last = &mut self.rtds_last[chainlink as usize];
+        let now_ms = now_ms.max(last.saturating_add(1));
+        *last = now_ms;
         let v = self.walk();
         let (topic, symbol) = if chainlink {
             ("crypto_prices_chainlink", "btc/usd")
@@ -326,6 +340,26 @@ mod tests {
         ] {
             assert!(kinds.contains(&k), "{k:?} never generated");
         }
+    }
+
+    #[test]
+    fn rtds_ticks_in_one_millisecond_get_distinct_keys() {
+        // After a stall the simulator makes several ticks at once.
+        let mut s = Synth::new(1);
+        let mut seen = HashSet::new();
+        let mut last = [i64::MIN; 2];
+        for _ in 0..12 {
+            let f = s.rtds(5_000);
+            let k = keys(Source::Rtds, &f)[0];
+            assert!(seen.insert(k), "repeated key in {f}");
+            let v: Value = serde_json::from_str(&f).unwrap();
+            let series = (v["topic"] == "crypto_prices_chainlink") as usize;
+            let t = k.ts_millis.unwrap();
+            assert!(t > last[series] && t >= 5_000);
+            last[series] = t;
+        }
+        // A later clock wins again.
+        assert!(s.rtds(9_000).contains("\"timestamp\":9000"));
     }
 
     #[test]

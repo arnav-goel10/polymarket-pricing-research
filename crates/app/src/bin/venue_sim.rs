@@ -1,12 +1,15 @@
 //! Venue simulator for the HA harness: three WebSocket venues (RTDS,
-//! Binance, CLOB order book) fed by one generator, with total truth.
+//! Binance, CLOB order book) fed by one generator, with total truth: every
+//! broadcast frame is in the manifest. Truth is then keyed with the client's
+//! own key rules, so it cannot show two events that share a key (see
+//! `app::chaos`).
 //!
 //! cargo run --release -p app --bin venue_sim -- [--seed 1] [--rate 200]
 //!     [--manifest truth.prec] [--recording fixtures/live-sample.prec]
 //!     [--lag-ms 0] [--start-after 0]
 //!
 //! Synthetic mode makes `--rate` Binance and CLOB frames a second (half
-//! each) plus 5 RTDS frames a second, deterministic from `--seed` (see
+//! each) plus 4 RTDS frames a second, deterministic from `--seed` (see
 //! `app::sim`). With `--recording` it plays the venue frames of a recording
 //! once, `--rate` a second, then stays connected and silent.
 //!
