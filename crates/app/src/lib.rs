@@ -10,6 +10,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod replay_stream;
 pub mod resolution;
+pub mod segments;
 pub mod server;
 pub mod signals;
 pub mod sim;

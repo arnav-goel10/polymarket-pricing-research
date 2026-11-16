@@ -15,10 +15,11 @@
 //! data.
 //!
 //! Segments are `<data>/seg/<slot>.<boot>.prec.open`, where the slot is the
-//! receive minute since the Unix epoch, flushed at most a second after a
-//! frame and renamed to `.prec` when the next minute's first frame arrives
-//! or at shutdown. Slots older than `--keep-slots` are deleted. `--slot-ms`
-//! shortens the slot for tests.
+//! receive minute since the Unix epoch, flushed when a frame arrives a
+//! second or more after the last flush and renamed to `.prec` when the next
+//! minute's first frame arrives or at shutdown. Slots older than
+//! `--keep-slots` are deleted. `--slot-ms` shortens the slot for tests. The
+//! rules, write errors included, are in `app::segments`.
 //!
 //! With `--store DIR` the node contends for the archive lease on that
 //! directory store (see `app::archiver`), ships closed slots while it
@@ -37,20 +38,20 @@
 
 use app::archiver::{Archiver, LeaseView};
 use app::ingest::{shutdown_signal, spawn_feeds, FeedHealth, FeedUrls};
+use app::segments::{self, SegStats, Segments};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use feeds::recorder::queue;
-use feeds::recording::{RecordWriter, Source};
+use feeds::recording::Source;
 use futures_util::{SinkExt, Stream, StreamExt};
 use ha::caslease::{self, CasLease, LeaseMutant, Timing};
 use ha::key::{frame_keys, EventKey};
 use ha::ring::{Plan, Ring, RingConfig};
 use ha::store::FsStore;
 use ha::wire::{self, Boot, ByeReason, Mode, NodeMsg};
-use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::SocketAddr;
@@ -66,7 +67,6 @@ use tracing::{debug, info, warn};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const HEARTBEAT: Duration = Duration::from_millis(250);
-const FLUSH_EVERY: Duration = Duration::from_secs(1);
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const BATCH: usize = 256;
 
@@ -207,87 +207,10 @@ struct NodeStats {
     connections_total: AtomicU64,
     lagged: AtomicU64,
     bad_requests: AtomicU64,
-    segment_errors: AtomicU64,
-    segments_closed: AtomicU64,
 }
 
 fn lock(ring: &Mutex<Ring>) -> MutexGuard<'_, Ring> {
     ring.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Minute segments on local disk.
-struct Segments {
-    dir: PathBuf,
-    boot: Boot,
-    keep: i64,
-    slot_micros: i64,
-    view: Arc<LeaseView>,
-    open: Option<(i64, RecordWriter<File>)>,
-    last_flush: Instant,
-    records: u64,
-    bytes: u64,
-    stats: Arc<NodeStats>,
-}
-
-impl Segments {
-    fn path(&self, slot: i64, open: bool) -> PathBuf {
-        let ext = if open { "prec.open" } else { "prec" };
-        self.dir.join(format!("{slot}.{}.{ext}", self.boot))
-    }
-
-    fn append(&mut self, rx_micros: i64, src: Source, frame: &str) -> io::Result<()> {
-        let slot = rx_micros.div_euclid(self.slot_micros);
-        // A clock that steps back keeps writing into the open slot rather
-        // than reopening a closed one.
-        if self.open.as_ref().is_none_or(|(s, _)| slot > *s) {
-            self.close()?;
-            let w = RecordWriter::create(self.path(slot, true))?;
-            self.open = Some((slot, w));
-            self.view.open_slot.store(slot, Relaxed);
-            self.last_flush = Instant::now();
-            self.prune(slot);
-        }
-        let (_, w) = self.open.as_mut().expect("segment open");
-        w.append(rx_micros, src, frame)?;
-        if self.last_flush.elapsed() >= FLUSH_EVERY {
-            w.flush()?;
-            self.last_flush = Instant::now();
-        }
-        Ok(())
-    }
-
-    fn close(&mut self) -> io::Result<()> {
-        let Some((slot, w)) = self.open.take() else {
-            return Ok(());
-        };
-        let (records, bytes) = w.finish()?;
-        self.records += records;
-        self.bytes += bytes;
-        std::fs::rename(self.path(slot, true), self.path(slot, false))?;
-        self.view.open_slot.store(i64::MIN, Relaxed);
-        self.stats.segments_closed.fetch_add(1, Relaxed);
-        Ok(())
-    }
-
-    /// Delete every segment, from any boot, older than the kept slots.
-    fn prune(&self, current: i64) {
-        let Ok(dir) = std::fs::read_dir(&self.dir) else {
-            return;
-        };
-        for e in dir.flatten() {
-            let name = e.file_name();
-            let Some(slot) = name
-                .to_str()
-                .and_then(|n| n.split('.').next())
-                .and_then(|s| s.parse::<i64>().ok())
-            else {
-                continue;
-            };
-            if slot <= current - self.keep && std::fs::remove_file(e.path()).is_err() {
-                self.stats.segment_errors.fetch_add(1, Relaxed);
-            }
-        }
-    }
 }
 
 /// The recorder thread's per-frame state.
@@ -301,9 +224,9 @@ struct Pipeline {
 }
 
 fn on_frame(p: &mut Pipeline, rx_micros: i64, src: Source, text: String) -> io::Result<()> {
-    // The stream stays up when the disk fails; the error is counted.
-    if let Err(e) = p.seg.append(rx_micros, src, &text) {
-        p.seg.stats.segment_errors.fetch_add(1, Relaxed);
+    // The stream stays up when the disk fails; `Segments` counts the error
+    // and the frames it could not write.
+    if let Err(e) = p.seg.append(Instant::now(), rx_micros, src, &text) {
         warn!(error = %e, "segment write failed");
     }
     p.keys.clear();
@@ -331,6 +254,7 @@ struct Ctx {
     shutdown: watch::Receiver<bool>,
     mutant: Mutant,
     stats: Arc<NodeStats>,
+    seg: Arc<SegStats>,
     health: FeedHealth,
     recorder: Arc<feeds::recorder::RecorderStats>,
     view: Arc<LeaseView>,
@@ -554,14 +478,10 @@ async fn metrics(State(ctx): State<Arc<Ctx>>) -> impl IntoResponse {
     );
     line("poly_node_lagged_total", s.lagged.load(Relaxed));
     line("poly_node_bad_requests_total", s.bad_requests.load(Relaxed));
-    line(
-        "poly_node_segment_errors_total",
-        s.segment_errors.load(Relaxed),
-    );
-    line(
-        "poly_node_segments_closed_total",
-        s.segments_closed.load(Relaxed),
-    );
+    let g = &ctx.seg;
+    line("poly_node_segment_errors_total", g.errors.load(Relaxed));
+    line("poly_node_segment_lost_total", g.lost.load(Relaxed));
+    line("poly_node_segments_closed_total", g.closed.load(Relaxed));
     line(
         "poly_recorder_dropped_total",
         ctx.recorder.dropped.load(Relaxed),
@@ -636,19 +556,17 @@ async fn main() -> Result<(), BoxError> {
     let health = FeedHealth::default();
 
     let (rec, q) = queue(65_536);
+    let seg = Segments::new(
+        seg_dir,
+        boot,
+        args.keep_slots,
+        slot_micros,
+        view.clone(),
+        segments::create_new(),
+    );
+    let seg_stats = seg.stats.clone();
     let pipeline = Pipeline {
-        seg: Segments {
-            dir: seg_dir,
-            boot,
-            keep: args.keep_slots,
-            slot_micros,
-            view: view.clone(),
-            open: None,
-            last_flush: Instant::now(),
-            records: 0,
-            bytes: 0,
-            stats: stats.clone(),
-        },
+        seg,
         ring: ring.clone(),
         head: head_tx,
         keys: Vec::with_capacity(16),
@@ -667,6 +585,7 @@ async fn main() -> Result<(), BoxError> {
         shutdown: shutdown_rx,
         mutant,
         stats: stats.clone(),
+        seg: seg_stats,
         health: health.clone(),
         recorder: rec.stats.clone(),
         view: view.clone(),

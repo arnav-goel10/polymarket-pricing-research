@@ -182,6 +182,11 @@ impl<W: Write> RecordWriter<W> {
         self.records
     }
 
+    /// Bytes of the header and every appended record, buffered or not.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     pub fn into_inner(self) -> io::Result<W> {
         self.out.into_inner().map_err(|e| e.into_error())
     }
