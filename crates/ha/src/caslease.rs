@@ -31,9 +31,11 @@
 //!   conditional write is the truth.
 //! - Unknown outcome: read HEAD. My document (nonce, epoch, holder and
 //!   tenures) means it landed, an ETag still equal to the one I matched on
-//!   means retry the same write, anything else means fenced. A 412 on that
-//!   retry reads HEAD again first, since the first attempt may have landed
-//!   after the retry was sent.
+//!   means retry the same write, anything else means fenced. Such a write
+//!   stays unsettled until a later write of mine lands: while any is
+//!   unsettled, a 412 reads HEAD first, and a HEAD equal to one of them is
+//!   taken as that write landing late (also when a poll finds it), since a
+//!   resend may have been refused at once and a fresh write sent since.
 //! - Release: holder null, epoch kept.
 //!
 //! [`audit`] is the second, weaker model. It knows nothing about clocks or
@@ -52,6 +54,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 pub const HEAD_VERSION: u32 = 1;
+
+/// How many unsettled writes a node remembers. Each needs its own unknown
+/// outcome and none of mine may have landed since, so a few is plenty.
+const MAX_UNSETTLED: usize = 8;
 
 /// The slot range one epoch committed. `n` is the holder node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,8 +144,9 @@ pub enum LeaseMutant {
     /// A contender waits two ttl before taking over (a liveness fault
     /// that the old 30 s settle hid).
     TwoTtlTakeover,
-    /// A 412 on a resent write is taken as a fence without reading HEAD,
-    /// so the write's own late first attempt fences a healthy holder.
+    /// A 412 is taken as a fence without reading HEAD, even on a resent
+    /// write or while an earlier write is unsettled, so a late first
+    /// attempt fences a healthy holder.
     TrustRetry412,
 }
 
@@ -280,6 +287,10 @@ pub struct CasLease {
     last_doc: Option<Head>,
     inflight: Option<Inflight>,
     queued: Option<Queued>,
+    /// Writes of mine whose outcome was unknown and that no later landed
+    /// write has ruled out. Any of them may still land, even after a
+    /// resend of it was refused at once and a fresh write went out.
+    unsettled: Vec<Inflight>,
     want_commit: Option<i64>,
     want_release: bool,
     stopped: bool,
@@ -305,6 +316,7 @@ impl CasLease {
             last_doc: None,
             inflight: None,
             queued: None,
+            unsettled: Vec::new(),
             want_commit: None,
             want_release: false,
             stopped: false,
@@ -583,6 +595,11 @@ impl CasLease {
             self.stats.unreadable_heads += 1;
             return;
         };
+        // My own grant that landed after I had given up on it.
+        if let Some(u) = self.take_unsettled(&doc) {
+            self.landed(now, u, etag);
+            return;
+        }
         if doc.holder.is_none() {
             self.takeover(&doc, etag);
         } else {
@@ -632,11 +649,12 @@ impl CasLease {
         }
         match outcome {
             WriteOutcome::Done(etag) => self.landed(now, f, etag),
-            // An earlier attempt of this write may have landed after it
-            // was resent, which moved the ETag: read HEAD before calling
-            // it a fence.
+            // An earlier attempt of this write, or an earlier write of mine
+            // with an unknown outcome, may have landed late and moved the
+            // ETag: read HEAD before calling it a fence.
             WriteOutcome::PreconditionFailed
-                if f.retried && self.cfg.mutant != LeaseMutant::TrustRetry412 =>
+                if (f.retried || !self.unsettled.is_empty())
+                    && self.cfg.mutant != LeaseMutant::TrustRetry412 =>
             {
                 f.phase = Phase::ResolveAt(now);
                 self.inflight = Some(f);
@@ -645,6 +663,12 @@ impl CasLease {
             WriteOutcome::Unreachable => self.not_applied(now, f),
             WriteOutcome::Unknown => {
                 self.stats.unknown_outcomes += 1;
+                if !self.unsettled.iter().any(|u| u.doc == f.doc) {
+                    if self.unsettled.len() >= MAX_UNSETTLED {
+                        self.unsettled.remove(0);
+                    }
+                    self.unsettled.push(f.clone());
+                }
                 f.phase = Phase::ResolveAt(now);
                 self.inflight = Some(f);
             }
@@ -655,6 +679,9 @@ impl CasLease {
         let Some(doc) = f.doc else {
             return;
         };
+        // Every unsettled write was conditioned on an older ETag (or on no
+        // HEAD), so none of them can land after this one.
+        self.unsettled.clear();
         let t = self.cfg.timing;
         let base = if self.cfg.mutant == LeaseMutant::DeadlineFromReceipt {
             now
@@ -713,7 +740,17 @@ impl CasLease {
         self.last_doc = Some(doc);
     }
 
+    /// Remove and return the unsettled write whose document is `doc`.
+    fn take_unsettled(&mut self, doc: &Head) -> Option<Inflight> {
+        let i = self
+            .unsettled
+            .iter()
+            .position(|u| u.doc.as_ref() == Some(doc))?;
+        Some(self.unsettled.remove(i))
+    }
+
     fn lose_hold(&mut self, now: u64) {
+        self.unsettled.clear();
         self.held = None;
         self.want_commit = None;
         self.seen = None;
@@ -799,8 +836,17 @@ impl CasLease {
                 // holder) is never read as my landed write.
                 let cur = Head::decode(&body);
                 let mine = matches!((&cur, &f.doc), (Some(c), Some(d)) if c == d);
+                let earlier = match (&cur, self.cfg.mutant) {
+                    (Some(c), m) if m != LeaseMutant::TrustRetry412 => self.take_unsettled(c),
+                    _ => None,
+                };
                 if mine {
                     self.landed(now, f, etag);
+                } else if let Some(u) = earlier {
+                    // An earlier write of mine landed late. It is the
+                    // newest state; this write was refused because of it
+                    // and is built again from it by the next poll.
+                    self.landed(now, u, etag);
                 } else if f.cond == Cond::IfMatch(etag) {
                     self.stats.retries += 1;
                     self.queued = Some(retry(&f));

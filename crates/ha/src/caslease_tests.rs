@@ -184,6 +184,76 @@ fn trusting_the_412_on_a_resend_fences_a_healthy_holder() {
     assert_eq!(head(&s).holder, Some(1), "HEAD still names a");
 }
 
+/// a's renew times out, HEAD still shows the old ETag, the resend is
+/// refused at once (nothing applied), and the first attempt then lands.
+/// The next renew goes out on the old ETag and gets a 412.
+fn late_first_attempt_after_refused_resend(m: LeaseMutant) -> (MemStore, CasLease) {
+    let s = MemStore::new();
+    let mut a = CasLease::new(cfg(1).with_mutant(m));
+    step(&mut a, &s, 0);
+    let Some(Request::Write { body, cond }) = a.poll(10_000) else {
+        panic!("a renew is due at 10 s");
+    };
+    a.on_write(15_000, WriteOutcome::Unknown);
+    assert_eq!(a.poll(15_000), Some(Request::Read));
+    a.on_read(15_000, s.read_head());
+    assert!(matches!(a.poll(16_000), Some(Request::Write { .. })));
+    a.on_write(16_000, WriteOutcome::Unreachable);
+    assert!(matches!(s.write_head(&body, &cond), WriteOutcome::Done(_)));
+    // The renew is retried a poll later, on the ETag a last saw.
+    step(&mut a, &s, 21_000);
+    (s, a)
+}
+
+#[test]
+fn a_late_first_attempt_after_a_refused_resend_is_not_read_as_a_fence() {
+    let (s, a) = late_first_attempt_after_refused_resend(LeaseMutant::None);
+    assert_eq!(a.stats().fence_rejected, 0);
+    assert!(a.stats().renews >= 2, "the late write and a fresh renew");
+    assert!(a.leads(21_000));
+    assert_eq!(head(&s).holder, Some(1));
+    assert_eq!(audit(&journal(&s)).reason(), None);
+}
+
+#[test]
+fn trusting_a_412_while_a_write_is_unsettled_fences_a_healthy_holder() {
+    let (s, a) = late_first_attempt_after_refused_resend(LeaseMutant::TrustRetry412);
+    assert_eq!(a.stats().fence_rejected, 1);
+    assert!(!a.leads(21_000));
+    assert_eq!(head(&s).holder, Some(1), "HEAD still names a");
+}
+
+/// a's takeover times out, HEAD still shows b's old ETag, the resend is
+/// refused at once, and the first attempt then lands. a's next poll finds
+/// its own grant.
+#[test]
+fn a_grant_that_lands_after_a_refused_resend_is_taken_up_by_the_next_poll() {
+    let s = MemStore::new();
+    let mut b = CasLease::new(cfg(2));
+    step(&mut b, &s, 0);
+    b.release();
+    step(&mut b, &s, 1_000);
+    assert_eq!(head(&s).holder, None);
+    let mut a = CasLease::new(cfg(1));
+    assert_eq!(a.poll(2_000), Some(Request::Read));
+    a.on_read(2_000, s.read_head());
+    let Some(Request::Write { body, cond }) = a.poll(2_000) else {
+        panic!("a takes over a released lease at once");
+    };
+    a.on_write(7_000, WriteOutcome::Unknown);
+    assert_eq!(a.poll(7_000), Some(Request::Read));
+    a.on_read(7_000, s.read_head());
+    assert!(matches!(a.poll(8_000), Some(Request::Write { .. })));
+    a.on_write(8_000, WriteOutcome::Unreachable);
+    assert!(matches!(s.write_head(&body, &cond), WriteOutcome::Done(_)));
+    step(&mut a, &s, 13_000);
+    assert_eq!(a.held_epoch(), Some(2));
+    assert!(a.leads(13_000));
+    assert_eq!(a.stats().grants, 1);
+    assert_eq!(head(&s).holder, Some(1));
+    assert_eq!(head(&s).epoch, 2);
+}
+
 #[test]
 fn a_landed_write_is_matched_on_the_whole_document_not_the_nonce() {
     // b's takeover happens to carry the nonce of a's lost renew.
