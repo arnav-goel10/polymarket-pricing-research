@@ -326,6 +326,11 @@ fn the_audit_passes_a_clean_history_and_names_each_broken_one() {
 
     let reused = [doc(1, Some(1), &[]), doc(1, Some(2), &[])];
     assert_eq!(audit(&reused).reason(), Some("epoch_two_holders"));
+    // The same node granted the same epoch again after releasing it.
+    let regranted = [doc(1, Some(1), &[]), doc(1, None, &[]), doc(1, Some(1), &[])];
+    assert_eq!(audit(&regranted).reason(), Some("epoch_two_holders"));
+    let renewed = [doc(1, Some(1), &[]), doc(1, Some(1), &[]), doc(1, None, &[])];
+    assert_eq!(audit(&renewed).reason(), None);
 
     let rewritten = [
         doc(1, Some(1), &[(1, 1, 10, 12)]),

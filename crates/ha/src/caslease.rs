@@ -807,7 +807,8 @@ pub struct Audit {
     pub top_epoch: u64,
     /// Writes accepted under an epoch below one already granted.
     pub stale_epoch_commits: u64,
-    /// Epochs written with more than one holder.
+    /// Epochs written with more than one holder, or granted again after
+    /// a release.
     pub epoch_two_holders: u64,
     /// Writes whose tenure list is malformed or rewrites an earlier one.
     pub tenure_violations: u64,
@@ -883,6 +884,12 @@ pub fn audit<'a>(docs: impl IntoIterator<Item = &'a Head>) -> Audit {
                 // Counted once per epoch.
                 Some(&x) if x != h && two.insert(d.epoch) => a.epoch_two_holders += 1,
                 _ => {}
+            }
+            // A grant after a release must raise the epoch, even when the
+            // same node takes it again.
+            let regrant = prev.is_some_and(|p| p.holder.is_none() && p.epoch == d.epoch);
+            if regrant && two.insert(d.epoch) {
+                a.epoch_two_holders += 1;
             }
         }
         let owners_ok = d
