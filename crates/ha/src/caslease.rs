@@ -17,8 +17,9 @@
 //! - Acquire: read HEAD. Take over only after the ETag stayed unchanged for
 //!   `ttl + takeover margin` on my own clock, or at once if `holder` is
 //!   null. The takeover writes `epoch + 1`, holder me, with `If-Match`. A
-//!   missing HEAD is created at epoch 1 with `If-None-Match: *`. A restarted
-//!   node is a plain contender.
+//!   missing HEAD is created at epoch 1 with `If-None-Match: *`, but only by
+//!   a node that has not seen one: after that a missing HEAD is a fault and
+//!   is never recreated. A restarted node is a plain contender.
 //! - Renew every `renew_ms`: same epoch, new nonce, `If-Match`. The holder
 //!   believes it leads until the time its last successful write was **sent**
 //!   plus `ttl - holder margin`.
@@ -28,9 +29,11 @@
 //! - Deadline passed: no new commits; one renew. A 412 means fenced
 //!   (counted), success means nobody took over. Expiry is advisory, the
 //!   conditional write is the truth.
-//! - Unknown outcome: read HEAD. My nonce means it landed, an ETag still
-//!   equal to the one I matched on means retry the same write, anything
-//!   else means fenced.
+//! - Unknown outcome: read HEAD. My document (nonce, epoch, holder and
+//!   tenures) means it landed, an ETag still equal to the one I matched on
+//!   means retry the same write, anything else means fenced. A 412 on that
+//!   retry reads HEAD again first, since the first attempt may have landed
+//!   after the retry was sent.
 //! - Release: holder null, epoch kept.
 //!
 //! [`audit`] is the second, weaker model. It knows nothing about clocks or
@@ -132,6 +135,12 @@ pub enum LeaseMutant {
     ResendOnUnknown,
     /// A contender waits three ttl before taking over (a liveness fault).
     SlowTakeover,
+    /// A contender waits two ttl before taking over (a liveness fault
+    /// that the old 30 s settle hid).
+    TwoTtlTakeover,
+    /// A 412 on a resent write is taken as a fence without reading HEAD,
+    /// so the write's own late first attempt fences a healthy holder.
+    TrustRetry412,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +212,8 @@ pub struct LeaseStats {
     pub unknown_outcomes: u64,
     pub retries: u64,
     pub unreadable_heads: u64,
+    /// Polls that found no HEAD after this node had seen one.
+    pub missing_heads: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +244,9 @@ struct Inflight {
     /// When this write (same nonce) was first sent. A landed write landed
     /// after this, whichever attempt carried it.
     first_sent: u64,
+    /// An earlier attempt of this write had an unknown outcome, so it may
+    /// still land, and a 412 may be that attempt's own ETag.
+    retried: bool,
     phase: Phase,
 }
 
@@ -242,6 +256,7 @@ struct Queued {
     doc: Head,
     cond: Cond,
     first_sent: Option<u64>,
+    retried: bool,
     not_before: u64,
 }
 
@@ -434,6 +449,7 @@ impl CasLease {
         doc: Head,
         cond: Cond,
         first_sent: Option<u64>,
+        retried: bool,
     ) -> Request {
         let body = doc.encode();
         self.inflight = Some(Inflight {
@@ -441,6 +457,7 @@ impl CasLease {
             doc: Some(doc),
             cond: cond.clone(),
             first_sent: first_sent.unwrap_or(now),
+            retried,
             phase: Phase::Sent,
         });
         Request::Write { body, cond }
@@ -462,7 +479,7 @@ impl CasLease {
                 self.queued = Some(q);
                 return None;
             }
-            return Some(self.send(now, q.op, q.doc, q.cond, q.first_sent));
+            return Some(self.send(now, q.op, q.doc, q.cond, q.first_sent, q.retried));
         }
         if let Some(h) = self.held.clone() {
             if now < h.retry_at {
@@ -486,7 +503,7 @@ impl CasLease {
                 self.holder_cond(&h)
             };
             let doc = self.holder_doc(&h, op);
-            return Some(self.send(now, op, doc, cond, None));
+            return Some(self.send(now, op, doc, cond, None, false));
         }
         if self.stopped || now < self.next_poll {
             return None;
@@ -496,6 +513,7 @@ impl CasLease {
             doc: None,
             cond: Cond::Unconditional,
             first_sent: now,
+            retried: false,
             phase: Phase::Sent,
         });
         Some(Request::Read)
@@ -520,6 +538,7 @@ impl CasLease {
             doc: new,
             cond: Cond::IfMatch(etag),
             first_sent: None,
+            retried: false,
             not_before: 0,
         });
     }
@@ -531,6 +550,13 @@ impl CasLease {
         }
         let (body, etag) = match r {
             Err(_) => return,
+            Ok(None) if self.last_doc.is_some() => {
+                // HEAD was there before. A missing one now is a store fault
+                // or a misread path, and creating it again would send the
+                // epoch back to 1.
+                self.stats.missing_heads += 1;
+                return;
+            }
             Ok(None) => {
                 let doc = Head {
                     v: HEAD_VERSION,
@@ -545,6 +571,7 @@ impl CasLease {
                     doc,
                     cond: Cond::IfNoneMatch,
                     first_sent: None,
+                    retried: false,
                     not_before: 0,
                 });
                 return;
@@ -569,6 +596,7 @@ impl CasLease {
                     let wait = match self.cfg.mutant {
                         LeaseMutant::ShortWatch => 0,
                         LeaseMutant::SlowTakeover => 3 * doc.ttl_ms,
+                        LeaseMutant::TwoTtlTakeover => 2 * doc.ttl_ms,
                         _ => doc.ttl_ms + self.cfg.timing.takeover_margin_ms,
                     };
                     if now.saturating_sub(since) >= wait {
@@ -604,6 +632,15 @@ impl CasLease {
         }
         match outcome {
             WriteOutcome::Done(etag) => self.landed(now, f, etag),
+            // An earlier attempt of this write may have landed after it
+            // was resent, which moved the ETag: read HEAD before calling
+            // it a fence.
+            WriteOutcome::PreconditionFailed
+                if f.retried && self.cfg.mutant != LeaseMutant::TrustRetry412 =>
+            {
+                f.phase = Phase::ResolveAt(now);
+                self.inflight = Some(f);
+            }
             WriteOutcome::PreconditionFailed => self.refused(now, f),
             WriteOutcome::Unreachable => self.not_applied(now, f),
             WriteOutcome::Unknown => {
@@ -733,6 +770,7 @@ impl CasLease {
             doc: f.doc.clone().expect("a write has a doc"),
             cond: f.cond.clone(),
             first_sent: Some(f.first_sent),
+            retried: true,
             not_before,
         };
         match r {
@@ -756,8 +794,11 @@ impl CasLease {
                     self.queued = Some(q);
                     return;
                 }
+                // Mine only when the whole document is the one I sent, so a
+                // nonce that collides with another node's write (another
+                // holder) is never read as my landed write.
                 let cur = Head::decode(&body);
-                let mine = matches!((&cur, &f.doc), (Some(c), Some(d)) if c.nonce == d.nonce);
+                let mine = matches!((&cur, &f.doc), (Some(c), Some(d)) if c == d);
                 if mine {
                     self.landed(now, f, etag);
                 } else if f.cond == Cond::IfMatch(etag) {

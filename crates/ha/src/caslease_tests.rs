@@ -144,6 +144,70 @@ fn an_unknown_outcome_that_was_lost_is_retried_on_the_same_etag() {
     assert!(a.leads(16_000));
 }
 
+/// a's renew times out before reaching the store, HEAD still shows the old
+/// ETag, so a resends it; the first attempt then lands before the resend.
+fn late_first_attempt(m: LeaseMutant) -> (MemStore, CasLease) {
+    let s = MemStore::new();
+    let mut a = CasLease::new(cfg(1).with_mutant(m));
+    step(&mut a, &s, 0);
+    let Some(Request::Write { body, cond }) = a.poll(10_000) else {
+        panic!("a renew is due at 10 s");
+    };
+    a.on_write(15_000, WriteOutcome::Unknown);
+    assert_eq!(a.poll(15_000), Some(Request::Read));
+    a.on_read(15_000, s.read_head());
+    assert_eq!(a.stats().retries, 1);
+    // The resend waits a fifth of a poll; the first attempt lands now.
+    assert_eq!(a.poll(15_000), None);
+    assert!(matches!(s.write_head(&body, &cond), WriteOutcome::Done(_)));
+    step(&mut a, &s, 16_000);
+    (s, a)
+}
+
+#[test]
+fn a_late_first_attempt_is_not_read_as_a_fence() {
+    let (s, a) = late_first_attempt(LeaseMutant::None);
+    assert_eq!(a.stats().fence_rejected, 0);
+    assert_eq!(a.stats().renews, 1);
+    assert!(a.leads(16_000));
+    // The deadline counts from the first send of the write that landed.
+    assert!(a.leads(37_999) && !a.leads(38_000));
+    assert_eq!(s.journal().len(), 2);
+    assert_eq!(head(&s).holder, Some(1));
+}
+
+#[test]
+fn trusting_the_412_on_a_resend_fences_a_healthy_holder() {
+    let (s, a) = late_first_attempt(LeaseMutant::TrustRetry412);
+    assert_eq!(a.stats().fence_rejected, 1);
+    assert!(!a.leads(16_000));
+    assert_eq!(head(&s).holder, Some(1), "HEAD still names a");
+}
+
+#[test]
+fn a_landed_write_is_matched_on_the_whole_document_not_the_nonce() {
+    // b's takeover happens to carry the nonce of a's lost renew.
+    let s = MemStore::new();
+    let mut a = CasLease::new(cfg(1));
+    step(&mut a, &s, 0);
+    let Some(Request::Write { body, .. }) = a.poll(10_000) else {
+        panic!("a renew is due at 10 s");
+    };
+    a.on_write(15_000, WriteOutcome::Unknown);
+    let mut other = Head::decode(&body).unwrap();
+    other.epoch += 1;
+    other.holder = Some(2);
+    let (_, etag) = s.read_head().unwrap().unwrap();
+    assert!(matches!(
+        s.write_head(&other.encode(), &Cond::IfMatch(etag)),
+        WriteOutcome::Done(_)
+    ));
+    step(&mut a, &s, 15_000);
+    assert_eq!(a.stats().fence_rejected, 1);
+    assert_eq!(a.stats().renews, 0);
+    assert!(!a.leads(15_000));
+}
+
 /// a's renew is lost and its outcome unknown; b takes over before a can
 /// read HEAD again.
 fn unknown_then_takeover(m: LeaseMutant) -> (MemStore, CasLease) {
@@ -177,6 +241,30 @@ fn resending_on_an_unknown_outcome_overwrites_the_new_leader() {
     let (s, _) = unknown_then_takeover(LeaseMutant::ResendOnUnknown);
     assert_eq!(head(&s).holder, Some(1));
     assert_eq!(audit(&journal(&s)).reason(), Some("stale_epoch_commit"));
+}
+
+#[test]
+fn a_head_that_disappears_after_it_was_seen_is_not_created_again() {
+    let s = MemStore::new();
+    let mut a = CasLease::new(cfg(1));
+    let mut b = CasLease::new(cfg(2));
+    step(&mut a, &s, 0);
+    step(&mut b, &s, 0);
+    assert_eq!(b.poll(5_000), Some(Request::Read));
+    b.on_read(5_000, Ok(None));
+    assert_eq!(b.poll(5_000), None, "no create at epoch 1");
+    assert_eq!(b.stats().missing_heads, 1);
+    // A node that never saw a HEAD still creates one.
+    let mut c = CasLease::new(cfg(3));
+    assert_eq!(c.poll(0), Some(Request::Read));
+    c.on_read(0, Ok(None));
+    assert!(matches!(
+        c.poll(0),
+        Some(Request::Write {
+            cond: Cond::IfNoneMatch,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -327,9 +415,17 @@ fn the_audit_passes_a_clean_history_and_names_each_broken_one() {
     let reused = [doc(1, Some(1), &[]), doc(1, Some(2), &[])];
     assert_eq!(audit(&reused).reason(), Some("epoch_two_holders"));
     // The same node granted the same epoch again after releasing it.
-    let regranted = [doc(1, Some(1), &[]), doc(1, None, &[]), doc(1, Some(1), &[])];
+    let regranted = [
+        doc(1, Some(1), &[]),
+        doc(1, None, &[]),
+        doc(1, Some(1), &[]),
+    ];
     assert_eq!(audit(&regranted).reason(), Some("epoch_two_holders"));
-    let renewed = [doc(1, Some(1), &[]), doc(1, Some(1), &[]), doc(1, None, &[])];
+    let renewed = [
+        doc(1, Some(1), &[]),
+        doc(1, Some(1), &[]),
+        doc(1, None, &[]),
+    ];
     assert_eq!(audit(&renewed).reason(), None);
 
     let rewritten = [
@@ -382,24 +478,27 @@ fn the_reader_rule_counts_holes_and_orphans() {
 // 50 ms steps of real time. Each node's clock runs at its own rate (up to
 // 1% off) from its own offset. Requests land after a latency and replies
 // come back after another; a reply can be slow (up to 3 s past the
-// timeout), lost (the write may still apply), refused at once, or cut by a
-// partition. Nodes pause (frozen VMs), crash and restart, and sometimes
-// release first. The leader commits a slot every 2 s, uploading its object
-// first.
+// timeout), lost (the write may still apply), refused at once, cut by a
+// partition, or land late: after its sender timed out, with no reply. Nodes
+// pause (frozen VMs), crash and restart, and sometimes release first. The
+// leader commits a slot every 2 s, uploading its object first.
 //
 // Checked:
 // - safety, always: the audit of every applied write is clean (epochs
 //   never go back, one holder per epoch, tenures only grow) and no
 //   committed slot lacks its object;
+// - no false fence, always: a node never counts a fence while HEAD is its
+//   own write under the epoch it held;
 // - belief, when no node pauses: at most one node believes it leads;
 // - liveness, in a calm tail: after `silent_at` faults stop and the holder
-//   freezes for good. Once the others have had 30 s to settle, a
-//   different node holds HEAD within ttl + 1 s + 2 polls (plus 2 s slack).
+//   freezes for good. The contenders are ready once each is up, has no
+//   request out from before the calm and holds nothing. From the later of
+//   that and the last applied write, a different node holds HEAD within
+//   ttl + 1 s + 2 polls (plus 3 s for round trips and clock rate).
 // ---------------------------------------------------------------------
 
 const STEP: u64 = 50;
 const OFFSET: [i64; 3] = [1_000_000, 50_000_000, 7_000];
-const SETTLE: u64 = 30_000;
 
 #[derive(Debug, Clone)]
 struct Sched {
@@ -412,6 +511,8 @@ struct Sched {
     slow_pct: u64,
     drop_pct: u64,
     fail_pct: u64,
+    /// Requests that land after their sender timed out, with no reply.
+    late_pct: u64,
     timeout_ms: u64,
     seed: u64,
     silent_at: Option<u64>,
@@ -453,12 +554,16 @@ fn scheds() -> impl Strategy<Value = Sched> {
         0u64..60,
         0u64..20,
         0u64..10,
+        0u64..10,
         any::<bool>(),
         any::<u64>(),
         prop::option::weighted(0.3, 60_000u64..200_000),
     );
     (faults, rates).prop_map(
-        |((rate_ppm, pause, pauses, parts, restarts), (slow, lost, fail, long, seed, silent))| {
+        |(
+            (rate_ppm, pause, pauses, parts, restarts),
+            (slow, lost, fail, late, long, seed, silent),
+        )| {
             Sched {
                 rate_ppm,
                 pauses: if pause { pauses } else { Vec::new() },
@@ -467,6 +572,7 @@ fn scheds() -> impl Strategy<Value = Sched> {
                 slow_pct: slow,
                 drop_pct: lost,
                 fail_pct: fail,
+                late_pct: late,
                 timeout_ms: if long { 10_000 } else { 5_000 },
                 seed,
                 silent_at: silent,
@@ -497,6 +603,7 @@ impl Rng {
 #[derive(Debug)]
 struct Flight {
     write: Option<(Vec<u8>, Cond)>,
+    sent: u64,
     land_at: u64,
     applies: bool,
     landed: bool,
@@ -517,6 +624,8 @@ struct SimNode {
 struct World {
     head: Option<(Vec<u8>, Etag)>,
     version: u64,
+    /// When HEAD was last written.
+    last_write: u64,
     journal: Vec<Head>,
     objects: HashSet<(u64, i64)>,
 }
@@ -541,6 +650,7 @@ impl World {
             return;
         }
         self.version += 1;
+        self.last_write = f.land_at;
         let etag = Etag(format!("\"{}\"", self.version));
         self.head = Some((body.clone(), etag.clone()));
         self.journal
@@ -549,10 +659,11 @@ impl World {
     }
 
     fn holder(&self) -> Option<u32> {
-        self.head
-            .as_ref()
-            .and_then(|(b, _)| Head::decode(b))
-            .and_then(|h| h.holder)
+        self.doc().and_then(|h| h.holder)
+    }
+
+    fn doc(&self) -> Option<Head> {
+        self.head.as_ref().and_then(|(b, _)| Head::decode(b))
     }
 }
 
@@ -563,6 +674,7 @@ fn make_flight(node: usize, req: Request, t: u64, s: &Sched, rng: &mut Rng, calm
     };
     let mut f = Flight {
         write,
+        sent: t,
         land_at: t,
         applies: true,
         landed: false,
@@ -597,6 +709,12 @@ fn make_flight(node: usize, req: Request, t: u64, s: &Sched, rng: &mut Rng, calm
         return f;
     }
     let d1 = quick(rng);
+    if rng.pct(s.late_pct) {
+        // Lands after the sender timed out; no reply comes back.
+        f.land_at = f.timeout_at + rng.below(3_000);
+        f.applies = !s.parted(node, f.land_at);
+        return f;
+    }
     let d2 = if rng.pct(s.slow_pct) {
         3_000 + rng.below(s.timeout_ms)
     } else {
@@ -635,15 +753,14 @@ fn sim(s: &Sched, mutant: LeaseMutant) -> Result<(), String> {
     let mut w = World {
         head: None,
         version: 0,
+        last_write: 0,
         journal: Vec::new(),
         objects: HashSet::new(),
     };
     let mut rng = Rng(s.seed);
     let mut victim: Option<usize> = None;
-    let bound = s.silent_at.map(|a| {
-        let b = a + SETTLE + timing.ttl_ms + timing.takeover_margin_ms + 2 * timing.poll_ms + 2_000;
-        b - b % STEP
-    });
+    let mut ready_at: Option<u64> = None;
+    let bound = timing.ttl_ms + timing.takeover_margin_ms + 2 * timing.poll_ms + 3_000;
     let mut t = 0;
     while t <= s.duration() {
         let calm = s.silent_at.is_some_and(|a| t >= a);
@@ -711,16 +828,37 @@ fn sim(s: &Sched, mutant: LeaseMutant) -> Result<(), String> {
                 (replied, replied || t >= f.timeout_at)
             });
             if let Some((replied, true)) = done {
-                let f = nd.flight.take().expect("flight");
+                let mut f = nd.flight.take().expect("flight");
                 let is_read = f.write.is_none();
+                let fences = nd.m.stats().fence_rejected;
+                let held = nd.m.held_epoch();
                 match (is_read, replied) {
                     (true, true) => nd.m.on_read(
                         now,
-                        f.read.unwrap_or_else(|| Err(StoreError("lost".into()))),
+                        f.read
+                            .take()
+                            .unwrap_or_else(|| Err(StoreError("lost".into()))),
                     ),
                     (true, false) => nd.m.on_read(now, Err(StoreError("timed out".into()))),
-                    (false, true) => nd.m.on_write(now, f.wrote.unwrap_or(WriteOutcome::Unknown)),
+                    (false, true) => {
+                        nd.m.on_write(now, f.wrote.take().unwrap_or(WriteOutcome::Unknown))
+                    }
                     (false, false) => nd.m.on_write(now, WriteOutcome::Unknown),
+                }
+                if nd.m.stats().fence_rejected > fences {
+                    let me = Some(i as u32 + 1);
+                    if w.doc()
+                        .is_some_and(|h| h.holder == me && Some(h.epoch) == held)
+                    {
+                        return Err(format!(
+                            "node {} counted a fence at {t} ms while HEAD is its own epoch {held:?}",
+                            i + 1
+                        ));
+                    }
+                }
+                // A write that timed out before landing may still land.
+                if !is_read && !f.landed {
+                    orphans.push(f);
                 }
             }
             if nd.flight.is_none() && nd.m.can_commit(now) && now >= nd.last_commit + 2_000 {
@@ -748,18 +886,37 @@ fn sim(s: &Sched, mutant: LeaseMutant) -> Result<(), String> {
                 return Err(format!("{leaders} nodes believe they lead at {t} ms"));
             }
         }
-        if let (Some(b), Some(v)) = (bound, victim) {
-            if t == b {
+        if let (Some(a), Some(v)) = (s.silent_at, victim) {
+            let ready = nodes.iter().enumerate().all(|(i, nd)| {
+                i == v
+                    || (nd.down_until.is_none()
+                        && !nd.m.is_stopped()
+                        && nd.m.held_epoch().is_none()
+                        && nd.flight.as_ref().is_none_or(|f| f.sent >= a))
+            });
+            if ready_at.is_none() && ready {
+                ready_at = Some(t);
+            }
+            if let Some(r) = ready_at {
                 let h = w.holder();
-                if h.is_none() || h == Some(v as u32 + 1) {
+                let from = r.max(w.last_write);
+                if (h.is_none() || h == Some(v as u32 + 1)) && t >= from + bound {
                     return Err(format!(
-                        "silent holder {} not replaced by {b} ms (HEAD holder {h:?})",
-                        v + 1
+                        "silent holder {} not replaced by {t} ms: contenders ready at {r} ms, \
+                         last write at {} ms (HEAD holder {h:?})",
+                        v + 1,
+                        w.last_write
                     ));
                 }
             }
         }
         t += STEP;
+    }
+    if let (Some(v), None) = (victim, ready_at) {
+        let h = w.holder();
+        if h.is_none() || h == Some(v as u32 + 1) {
+            return Err("the contenders never became ready in the calm tail".into());
+        }
     }
 
     let a = audit(&w.journal);
@@ -811,6 +968,7 @@ fn pinned() -> Vec<Sched> {
             slow_pct: 50,
             drop_pct: 0,
             fail_pct: 0,
+            late_pct: 0,
             timeout_ms: 30_000,
             seed,
             silent_at: None,
@@ -869,4 +1027,14 @@ fn the_schedule_property_catches_a_resend_after_an_unknown_outcome() {
 #[test]
 fn the_schedule_property_catches_a_slow_takeover() {
     assert!(caught(LeaseMutant::SlowTakeover).0);
+}
+
+#[test]
+fn the_schedule_property_catches_a_takeover_after_two_ttl() {
+    assert!(caught(LeaseMutant::TwoTtlTakeover).0);
+}
+
+#[test]
+fn the_schedule_property_catches_a_fence_read_from_a_late_first_attempt() {
+    assert!(caught(LeaseMutant::TrustRetry412).0);
 }
