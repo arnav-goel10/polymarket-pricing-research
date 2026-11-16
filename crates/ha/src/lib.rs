@@ -22,8 +22,11 @@
 //!
 //! The archive leader is picked by [`caslease`], a lease on one HEAD
 //! document changed only by conditional writes to a [`store`], so the
-//! grant, the epoch and each archive commit are one atomic write.
+//! grant, the epoch and each archive commit are one atomic write. [`azure`]
+//! is that store on Azure Blob Storage, where the conditional write is an
+//! `If-Match` Put Blob.
 
+pub mod azure;
 pub mod caslease;
 pub mod client;
 pub mod key;
