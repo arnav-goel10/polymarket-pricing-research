@@ -20,8 +20,28 @@ fn plan_prints_the_faults_it_will_run() {
 }
 
 #[test]
+fn leader_freezes_take_the_last_faults() {
+    let out = Command::new(env!("CARGO_BIN_EXE_chaos"))
+        .args(["plan", "--faults", "3", "--leader-freezes", "2"])
+        .args(["--leader-freeze-ms", "8000"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let p: Plan = serde_json::from_slice(&out.stdout).unwrap();
+    let kinds: Vec<FaultKind> = p.faults.iter().map(|f| f.kind).collect();
+    use FaultKind::*;
+    assert_eq!(kinds, vec![Kill9, FreezeLeader, FreezeLeader]);
+    assert_eq!(p.faults[2].freeze_ms, 8_000);
+}
+
+#[test]
 fn unknown_commands_and_options_exit_2() {
-    for args in [&["nope"][..], &["plan", "--seed"][..], &["verify"][..]] {
+    for args in [
+        &["nope"][..],
+        &["plan", "--seed"][..],
+        &["verify"][..],
+        &["verify-archive"][..],
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_chaos"))
             .args(args)
             .output()
@@ -33,7 +53,13 @@ fn unknown_commands_and_options_exit_2() {
 #[cfg(not(feature = "mutants"))]
 #[test]
 fn a_build_without_mutants_refuses_a_seeded_fault() {
-    for m in ["no-dedup", "seq-skip", "overlap-kill"] {
+    for m in [
+        "no-dedup",
+        "seq-skip",
+        "overlap-kill",
+        "no-fence",
+        "epoch-reuse",
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_chaos"))
             .args(["plan", "--mutant", m])
             .output()

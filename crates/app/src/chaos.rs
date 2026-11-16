@@ -11,6 +11,7 @@
 //! | `client.json` | `client`, `local` | client counters, merger totals, connection changes |
 //! | `log.jsonl` | `client`, `local` | the delivered log: every Deliver and Late verdict. Private, never an artifact |
 //! | `report.json` | `verify` | counts and timings only |
+//! | `archive.json` | `verify-archive` | the archive verdict, counts only |
 //!
 //! Truth is a `.prec` file: the simulator's manifest in CI.
 //!
@@ -38,7 +39,23 @@
 //! protocol counter is the precise name. `vacuous` comes last because it
 //! only matters for a run that would otherwise pass. A7 (two nodes down at
 //! once without the harness meaning it) makes the run invalid, exit 2.
+//!
+//! With the archive on, both nodes share a directory store. Its journal
+//! holds every applied HEAD write, and [`verify_archive`] checks it with
+//! the lease's second model ([`ha::caslease::audit`]) and the reader rule:
+//!
+//! | Reason | Rule |
+//! | --- | --- |
+//! | `stale_epoch_commit` | no write accepted under an epoch below one already granted |
+//! | `epoch_two_holders` | each epoch has one holder |
+//! | `tenure` | the tenure list only grows at its end, apart from trimming |
+//! | `no_takeover` | the peer took over during every leader freeze |
+//! | `fence_not_observed` | fenced writes counted by the nodes >= leader freezes |
+//! | `vacuous_archive` | slots were archived, and a freeze run saw two grants |
+//!
+//! Holes and orphans are reported, not gated.
 
+use ha::caslease::{self, ArchiveView, Audit, Head};
 use ha::client::{ClientCounters, Event};
 use ha::key::{frame_keys, EventKey, Feed, KeyKind};
 use ha::merge::{FeedCounters, Verdict};
@@ -53,6 +70,7 @@ pub const HARNESS: &str = "harness.json";
 pub const CLIENT: &str = "client.json";
 pub const LOG: &str = "log.jsonl";
 pub const REPORT: &str = "report.json";
+pub const ARCHIVE: &str = "archive.json";
 
 /// Delay after the fault instant over which added delay is measured.
 const DELAY_WINDOW_MS: i64 = 5_000;
@@ -70,6 +88,9 @@ pub enum FaultKind {
     /// them; the node keeps running. Its recovery is the client live on it
     /// again.
     Cut,
+    /// SIGSTOP on whichever node `/ha` says leads, for longer than a
+    /// takeover, then SIGCONT: the leader wakes as a zombie.
+    FreezeLeader,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +121,16 @@ fn mix(seed: u64, i: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+/// Make the last `n` faults leader freezes of `ms` each. The victim is
+/// chosen when the fault runs, so `node` is not checked for them.
+pub fn add_leader_freezes(p: &mut Plan, n: usize, ms: u64) {
+    let len = p.faults.len();
+    for f in p.faults.iter_mut().skip(len.saturating_sub(n)) {
+        f.kind = FaultKind::FreezeLeader;
+        f.freeze_ms = ms;
+    }
 }
 
 /// Faults alternate nodes, and kinds go kill, freeze, cut, kill, freeze,
@@ -154,6 +185,10 @@ pub struct Executed {
     /// client was live on it again).
     pub recovered_wall_ms: i64,
     pub recovered_mono_ms: i64,
+    /// For a leader freeze: from the freeze to the peer's `/ha` showing a
+    /// higher epoch and `leader: true`, on the harness's monotonic clock.
+    #[serde(default)]
+    pub takeover_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -386,6 +421,8 @@ pub struct FaultCounts {
     pub kill9: usize,
     pub freeze: usize,
     pub cut: usize,
+    #[serde(default)]
+    pub freeze_leader: usize,
     pub observed: usize,
 }
 
@@ -528,7 +565,12 @@ pub fn verify(inp: &Inputs) -> Report {
         .iter()
         .filter(|e| e.kind == FaultKind::Freeze)
         .count();
-    r.faults.cut = r.faults.executed - r.faults.kill9 - r.faults.freeze;
+    r.faults.freeze_leader = inp
+        .executed
+        .iter()
+        .filter(|e| e.kind == FaultKind::FreezeLeader)
+        .count();
+    r.faults.cut = r.faults.executed - r.faults.kill9 - r.faults.freeze - r.faults.freeze_leader;
 
     let invalid = inp.harness.invalid.clone().or_else(|| {
         inp.client
@@ -611,11 +653,9 @@ pub fn verify(inp: &Inputs) -> Report {
 
     // A4: executed as planned, and each victim seen going down.
     let as_planned = inp.executed.len() == inp.plan.faults.len()
-        && inp
-            .executed
-            .iter()
-            .zip(&inp.plan.faults)
-            .all(|(e, p)| e.node == p.node && e.kind == p.kind);
+        && inp.executed.iter().zip(&inp.plan.faults).all(|(e, p)| {
+            e.kind == p.kind && (p.kind == FaultKind::FreezeLeader || e.node == p.node)
+        });
     let downs: Vec<&ConnObs> = inp.client.conn.iter().filter(|c| !c.live).collect();
     let observed: Vec<Option<&ConnObs>> = inp
         .executed
@@ -731,6 +771,128 @@ pub fn verify(inp: &Inputs) -> Report {
     r
 }
 
+/// The archive verdict.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveReport {
+    pub verdict: Outcome,
+    pub audit: Audit,
+    pub view: ArchiveView,
+    pub committed_to: Option<i64>,
+    pub final_epoch: u64,
+    /// `fenced` lines in the nodes' `lease.jsonl`.
+    pub fence_rejected: u64,
+    pub leader_freezes: usize,
+    pub takeovers_seen: usize,
+    pub takeover_ms: Spread,
+}
+
+impl ArchiveReport {
+    pub fn exit_code(&self) -> i32 {
+        if self.verdict.result == "pass" {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+/// Everything the archive verdict is computed from.
+pub struct ArchiveInputs {
+    pub journal: Vec<Vec<u8>>,
+    pub head: Option<Head>,
+    pub objects: Vec<String>,
+    pub lease_log: Vec<String>,
+    pub executed: Vec<Executed>,
+}
+
+/// Read the store's journal, HEAD and objects, and every `lease.jsonl`
+/// in the run's node data directories.
+pub fn load_archive(run: &Path, store: &Path) -> io::Result<ArchiveInputs> {
+    use ha::store::{FsStore, HeadStore, ObjectStore};
+    let fs = FsStore::open(store)?;
+    let head = fs
+        .read_head()
+        .map_err(io::Error::other)?
+        .and_then(|(b, _)| Head::decode(&b));
+    let objects = fs.list("seg/").map_err(io::Error::other)?;
+    let mut lease_log = Vec::new();
+    for e in std::fs::read_dir(run)?.flatten() {
+        let p = e.path().join("lease.jsonl");
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            lease_log.extend(text.lines().map(str::to_string));
+        }
+    }
+    Ok(ArchiveInputs {
+        journal: FsStore::read_journal(store)?,
+        head,
+        objects,
+        lease_log,
+        executed: if run.join(FAULTS).exists() {
+            read_jsonl(&run.join(FAULTS))?
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+pub fn verify_archive(inp: &ArchiveInputs) -> ArchiveReport {
+    let mut r = ArchiveReport {
+        audit: caslease::audit_bodies(&inp.journal),
+        ..ArchiveReport::default()
+    };
+    if let Some(h) = &inp.head {
+        r.view = caslease::read_archive(h, &inp.objects);
+        r.committed_to = h.committed_to();
+        r.final_epoch = h.epoch;
+    }
+    r.fence_rejected = inp
+        .lease_log
+        .iter()
+        .filter(|l| l.contains("\"ev\":\"fenced\""))
+        .count() as u64;
+    let freezes: Vec<&Executed> = inp
+        .executed
+        .iter()
+        .filter(|e| e.kind == FaultKind::FreezeLeader)
+        .collect();
+    r.leader_freezes = freezes.len();
+    let takeovers: Vec<f64> = freezes
+        .iter()
+        .filter_map(|e| e.takeover_ms.map(|t| t as f64))
+        .collect();
+    r.takeovers_seen = takeovers.len();
+    r.takeover_ms = spread(takeovers);
+
+    let checks = [
+        ("stale_epoch_commit", r.audit.stale_epoch_commits == 0),
+        ("epoch_two_holders", r.audit.epoch_two_holders == 0),
+        (
+            "tenure",
+            r.audit.tenure_violations == 0 && r.audit.unreadable == 0,
+        ),
+        ("no_takeover", r.takeovers_seen == r.leader_freezes),
+        (
+            "fence_not_observed",
+            r.fence_rejected >= r.leader_freezes as u64,
+        ),
+        (
+            "vacuous_archive",
+            r.view.archived > 0 && (r.leader_freezes == 0 || r.audit.grants >= 2),
+        ),
+    ];
+    let failures: Vec<String> = checks
+        .iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(n, _)| n.to_string())
+        .collect();
+    r.verdict = Outcome {
+        result: if failures.is_empty() { "pass" } else { "fail" }.into(),
+        reason: failures.first().cloned(),
+        failures,
+    };
+    r
+}
+
 /// The feed a log line belongs to, for tests and summaries.
 pub fn feed_name(f: u8) -> &'static str {
     Feed::ALL.get(f as usize).map_or("?", |f| f.name())
@@ -788,6 +950,7 @@ mod tests {
                 at_mono_ms: 20_000,
                 recovered_wall_ms: base + 22_000,
                 recovered_mono_ms: 22_000,
+                takeover_ms: None,
             }],
             harness: Harness::default(),
             client: ClientRecord {
@@ -989,6 +1152,91 @@ mod tests {
         assert!(o.overlap);
         assert!(o.faults.iter().all(|f| f.kind == Kill9));
         assert_eq!(o.faults[1].at_ms - o.faults[0].at_ms, 300);
+    }
+
+    #[test]
+    fn leader_freezes_replace_the_last_faults_and_skip_the_node_check() {
+        let mut p = plan(3, 4, 4_000, 2_000, 15_000, None);
+        add_leader_freezes(&mut p, 2, 9_000);
+        let kinds: Vec<FaultKind> = p.faults.iter().map(|f| f.kind).collect();
+        use FaultKind::*;
+        assert_eq!(kinds, vec![Kill9, Freeze, FreezeLeader, FreezeLeader]);
+        assert!(p.faults[2..].iter().all(|f| f.freeze_ms == 9_000));
+    }
+
+    fn head(epoch: u64, holder: Option<u32>, t: &[(u64, u32, i64, i64)]) -> Vec<u8> {
+        Head {
+            v: 1,
+            epoch,
+            holder,
+            ttl_ms: 4_000,
+            nonce: String::new(),
+            tenures: t
+                .iter()
+                .map(|&(e, n, from, to)| caslease::Tenure { e, n, from, to })
+                .collect(),
+        }
+        .encode()
+    }
+
+    fn freeze(takeover_ms: Option<i64>) -> Executed {
+        Executed {
+            node: 1,
+            kind: FaultKind::FreezeLeader,
+            at_wall_ms: 0,
+            at_mono_ms: 0,
+            recovered_wall_ms: 9_000,
+            recovered_mono_ms: 9_000,
+            takeover_ms,
+        }
+    }
+
+    fn archive_inputs(
+        journal: Vec<Vec<u8>>,
+        fenced: usize,
+        takeover: Option<i64>,
+    ) -> ArchiveInputs {
+        let head = journal.last().and_then(|b| Head::decode(b));
+        ArchiveInputs {
+            objects: vec![caslease::object_name(1, 10), caslease::object_name(2, 11)],
+            journal,
+            head,
+            lease_log: (0..fenced)
+                .map(|_| r#"{"wall_ms":1,"node":1,"ev":"fenced","epoch":1}"#.to_string())
+                .collect(),
+            executed: vec![freeze(takeover)],
+        }
+    }
+
+    #[test]
+    fn the_archive_verdict_passes_a_clean_takeover_and_names_each_failure() {
+        let clean = vec![
+            head(1, Some(1), &[]),
+            head(1, Some(1), &[(1, 1, 10, 10)]),
+            head(2, Some(2), &[(1, 1, 10, 10)]),
+            head(2, Some(2), &[(1, 1, 10, 10), (2, 2, 11, 11)]),
+        ];
+        let r = verify_archive(&archive_inputs(clean.clone(), 1, Some(5_000)));
+        assert_eq!(r.verdict.result, "pass", "{:?}", r.verdict);
+        assert_eq!(r.view.archived, 2);
+        assert_eq!(r.takeover_ms.max, Some(5_000.0));
+
+        let mut stale = clean.clone();
+        stale.push(head(1, Some(1), &[(1, 1, 10, 12)]));
+        let r = verify_archive(&archive_inputs(stale, 1, Some(5_000)));
+        assert_eq!(r.verdict.reason.as_deref(), Some("stale_epoch_commit"));
+
+        let mut reused = clean[..2].to_vec();
+        reused.push(head(1, Some(2), &[(1, 1, 10, 10)]));
+        let r = verify_archive(&archive_inputs(reused, 1, Some(5_000)));
+        assert_eq!(r.verdict.reason.as_deref(), Some("epoch_two_holders"));
+
+        let r = verify_archive(&archive_inputs(clean.clone(), 1, None));
+        assert_eq!(r.verdict.reason.as_deref(), Some("no_takeover"));
+        let r = verify_archive(&archive_inputs(clean.clone(), 0, Some(5_000)));
+        assert_eq!(r.verdict.reason.as_deref(), Some("fence_not_observed"));
+        let r = verify_archive(&archive_inputs(clean[..2].to_vec(), 1, Some(5_000)));
+        assert_eq!(r.verdict.reason.as_deref(), Some("vacuous_archive"));
     }
 
     #[test]

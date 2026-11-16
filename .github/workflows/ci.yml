@@ -21,6 +21,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace --all-targets
+      - name: Lease schedule property, and each seeded lease fault caught
+        run: cargo test --locked -p ha caslease -- --nocapture
       - name: Seeded node faults must each be caught
         run: |
           cargo clippy --locked -p app --all-targets --features mutants -- -D warnings
@@ -35,7 +37,8 @@ jobs:
   # client, checked against the simulator's total truth. The baselines must
   # pass with 0 missing and 0 duplicates; each seeded fault must fail with
   # exactly its reason. One build carries the faults; a run without
-  # --mutant uses none of them.
+  # --mutant uses none of them. The archive cases add the lease and the
+  # archive on a shared directory store, judged from its journal.
   chaos:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -71,6 +74,19 @@ jobs:
           # Control: a node that resends frames under fresh seqs must pass,
           # with the repeats dropped by key.
           m dup-frame pass+self_repeats
+          exit "$fail"
+      - name: Archive, both nodes on one directory store, a kill, a freeze and two leader freezes
+        run: scripts/chaos_case.sh archive pass --seed 4 --rate 200 --faults 4 --gap-ms 4000 --archive 1 --leader-freezes 2
+      - name: Seeded archive faults, each caught by name
+        run: |
+          fail=0
+          # One leader freeze: the peer takes over and the frozen leader
+          # wakes as a zombie.
+          a() {
+            scripts/chaos_case.sh "$1" "$2" --seed 5 --rate 200 --faults 1 --gap-ms 3000 --archive 1 --leader-freezes 1 --mutant "$1" || fail=1
+          }
+          a no-fence stale_epoch_commit
+          a epoch-reuse epoch_two_holders
           exit "$fail"
 
   benches:

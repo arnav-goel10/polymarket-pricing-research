@@ -5,6 +5,7 @@
 //!     [--listen 127.0.0.1:9100] [--http 127.0.0.1:9101] [--keep-slots 60]
 //!     [--ring-frames 200000] [--ring-bytes 67108864]
 //!     [--rtds-url URL] [--binance-url URL] [--clob-url URL] [--token ID]
+//!     [--store DIR] [--slot-ms 60000] [--lease-timing TTL,RENEW,POLL,HOLD,TAKE]
 //!
 //! Every frame, in order: append to the open segment, compute its keys,
 //! push it to the ring (see `ha::ring`), which numbers venue frames. Clients
@@ -16,7 +17,14 @@
 //! Segments are `<data>/seg/<slot>.<boot>.prec.open`, where the slot is the
 //! receive minute since the Unix epoch, flushed at most a second after a
 //! frame and renamed to `.prec` when the next minute's first frame arrives
-//! or at shutdown. Slots older than `--keep-slots` are deleted.
+//! or at shutdown. Slots older than `--keep-slots` are deleted. `--slot-ms`
+//! shortens the slot for tests.
+//!
+//! With `--store DIR` the node contends for the archive lease on that
+//! directory store (see `app::archiver`), ships closed slots while it
+//! leads, and reports the epoch and leadership in `hb`, `/ha` and
+//! `/metrics`. `--lease-timing` sets ttl, renew, poll, holder margin and
+//! takeover margin in milliseconds (default 30000,10000,5000,2000,1000).
 //!
 //! On start the node prints one line, `node <id> boot <hex> stream <addr>
 //! http <addr>`, with the bound addresses. On SIGINT or SIGTERM it sends
@@ -27,6 +35,7 @@
 //! only in a build with the `mutants` feature. Any other build refuses to
 //! start when it is set.
 
+use app::archiver::{Archiver, LeaseView};
 use app::ingest::{shutdown_signal, spawn_feeds, FeedHealth, FeedUrls};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -36,15 +45,17 @@ use axum::Router;
 use feeds::recorder::queue;
 use feeds::recording::{RecordWriter, Source};
 use futures_util::{SinkExt, Stream, StreamExt};
+use ha::caslease::{self, CasLease, LeaseMutant, Timing};
 use ha::key::{frame_keys, EventKey};
 use ha::ring::{Plan, Ring, RingConfig};
+use ha::store::FsStore;
 use ha::wire::{self, Boot, ByeReason, Mode, NodeMsg};
 use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -54,7 +65,6 @@ use tracing::{debug, info, warn};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const SLOT_MICROS: i64 = 60_000_000;
 const HEARTBEAT: Duration = Duration::from_millis(250);
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,6 +80,9 @@ enum Mutant {
     StaleResume,
     /// Push every 500th venue frame a second time, under the next seq.
     DupFrame,
+    /// A lease fault: `no-fence` sends renews and commits with no
+    /// condition, `epoch-reuse` keeps the old epoch on a takeover.
+    Lease(LeaseMutant),
 }
 
 fn mutant_from_env() -> Result<Mutant, String> {
@@ -85,6 +98,8 @@ fn mutant_from_env() -> Result<Mutant, String> {
         "seq-skip" => Ok(Mutant::SeqSkip),
         "stale-resume" => Ok(Mutant::StaleResume),
         "dup-frame" => Ok(Mutant::DupFrame),
+        "no-fence" => Ok(Mutant::Lease(LeaseMutant::Unconditional)),
+        "epoch-reuse" => Ok(Mutant::Lease(LeaseMutant::ReuseEpoch)),
         _ => Err(format!("unknown POLY_MUTANT {v:?}")),
     }
 }
@@ -97,6 +112,27 @@ struct Args {
     keep_slots: i64,
     ring: RingConfig,
     urls: FeedUrls,
+    store: Option<PathBuf>,
+    slot_ms: i64,
+    timing: Timing,
+}
+
+fn parse_timing(v: &str) -> Option<Timing> {
+    let n: Vec<u64> = v
+        .split(',')
+        .map(|x| x.trim().parse().ok())
+        .collect::<Option<_>>()?;
+    let [ttl_ms, renew_ms, poll_ms, holder_margin_ms, takeover_margin_ms] = n[..] else {
+        return None;
+    };
+    let ok = holder_margin_ms < ttl_ms && renew_ms < ttl_ms - holder_margin_ms && poll_ms > 0;
+    ok.then_some(Timing {
+        ttl_ms,
+        renew_ms,
+        poll_ms,
+        holder_margin_ms,
+        takeover_margin_ms,
+    })
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -109,6 +145,9 @@ fn parse_args() -> Result<Args, String> {
         keep_slots: 60,
         ring: RingConfig::default(),
         urls: FeedUrls::default(),
+        store: None,
+        slot_ms: 60_000,
+        timing: Timing::default(),
     };
     while let Some(arg) = it.next() {
         let mut val = || it.next().ok_or(format!("{arg} needs a value"));
@@ -127,6 +166,11 @@ fn parse_args() -> Result<Args, String> {
             "--binance-url" => a.urls.binance = val()?,
             "--clob-url" => a.urls.clob = val()?,
             "--token" => a.urls.token = Some(val()?),
+            "--store" => a.store = Some(PathBuf::from(val()?)),
+            "--slot-ms" => a.slot_ms = val()?.parse().map_err(|_| bad("--slot-ms"))?,
+            "--lease-timing" => {
+                a.timing = parse_timing(&val()?).ok_or_else(|| bad("--lease-timing"))?
+            }
             s => return Err(format!("unknown argument {s}")),
         }
     }
@@ -136,8 +180,10 @@ fn parse_args() -> Result<Args, String> {
             a.listen
         ));
     }
-    if a.keep_slots < 1 || a.ring.max_frames < 1 {
-        return Err("--keep-slots and --ring-frames must be at least 1".into());
+    if a.keep_slots < 1 || a.ring.max_frames < 1 || a.slot_ms < 1_000 {
+        return Err(
+            "--keep-slots and --ring-frames must be at least 1, --slot-ms at least 1000".into(),
+        );
     }
     Ok(a)
 }
@@ -174,6 +220,8 @@ struct Segments {
     dir: PathBuf,
     boot: Boot,
     keep: i64,
+    slot_micros: i64,
+    view: Arc<LeaseView>,
     open: Option<(i64, RecordWriter<File>)>,
     last_flush: Instant,
     records: u64,
@@ -188,13 +236,14 @@ impl Segments {
     }
 
     fn append(&mut self, rx_micros: i64, src: Source, frame: &str) -> io::Result<()> {
-        let slot = rx_micros.div_euclid(SLOT_MICROS);
+        let slot = rx_micros.div_euclid(self.slot_micros);
         // A clock that steps back keeps writing into the open slot rather
         // than reopening a closed one.
         if self.open.as_ref().is_none_or(|(s, _)| slot > *s) {
             self.close()?;
             let w = RecordWriter::create(self.path(slot, true))?;
             self.open = Some((slot, w));
+            self.view.open_slot.store(slot, Relaxed);
             self.last_flush = Instant::now();
             self.prune(slot);
         }
@@ -215,6 +264,7 @@ impl Segments {
         self.records += records;
         self.bytes += bytes;
         std::fs::rename(self.path(slot, true), self.path(slot, false))?;
+        self.view.open_slot.store(i64::MIN, Relaxed);
         self.stats.segments_closed.fetch_add(1, Relaxed);
         Ok(())
     }
@@ -283,6 +333,7 @@ struct Ctx {
     stats: Arc<NodeStats>,
     health: FeedHealth,
     recorder: Arc<feeds::recorder::RecorderStats>,
+    view: Arc<LeaseView>,
 }
 
 async fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
@@ -442,8 +493,8 @@ async fn serve_conn(tcp: TcpStream, ctx: &Ctx) -> Result<(), BoxError> {
         if last_hb.elapsed() >= HEARTBEAT {
             let hb = NodeMsg::Hb {
                 head: *head_rx.borrow(),
-                epoch: 0,
-                leader: false,
+                epoch: ctx.view.epoch.load(Relaxed),
+                leader: ctx.view.leader.load(Relaxed),
             };
             tokio::time::timeout(SEND_TIMEOUT, tx.send(Message::Text(wire::encode(&hb))))
                 .await
@@ -475,8 +526,8 @@ async fn ha_status(State(ctx): State<Arc<Ctx>>) -> impl IntoResponse {
         "boot": boot.to_string(),
         "head": head,
         "oldest": oldest,
-        "epoch": 0,
-        "leader": false,
+        "epoch": ctx.view.epoch.load(Relaxed),
+        "leader": ctx.view.leader.load(Relaxed),
     });
     ([("content-type", "application/json")], body.to_string())
 }
@@ -516,6 +567,21 @@ async fn metrics(State(ctx): State<Arc<Ctx>>) -> impl IntoResponse {
         ctx.recorder.dropped.load(Relaxed),
     );
     line("poly_recorder_queue_depth", ctx.recorder.queue_depth());
+    let v = &ctx.view;
+    line("poly_lease_epoch", v.epoch.load(Relaxed));
+    line("poly_lease_leader", v.leader.load(Relaxed) as u64);
+    line("poly_fence_rejected_total", v.fence_rejected.load(Relaxed));
+    line(
+        "poly_lease_unknown_outcomes_total",
+        v.unknown_outcomes.load(Relaxed),
+    );
+    line("poly_archive_commits_total", v.commits.load(Relaxed));
+    line("poly_archive_uploads_total", v.uploads.load(Relaxed));
+    line(
+        "poly_archive_upload_errors_total",
+        v.upload_errors.load(Relaxed),
+    );
+    line("poly_archive_holes_total", v.holes.load(Relaxed));
     for m in ctx.health.all() {
         let snap = m.snapshot();
         let _ = writeln!(
@@ -562,6 +628,8 @@ async fn main() -> Result<(), BoxError> {
     ensure_dir(&seg_dir)?;
 
     let stats = Arc::new(NodeStats::default());
+    let view = Arc::new(LeaseView::default());
+    let slot_micros = args.slot_ms * 1_000;
     let ring = Arc::new(Mutex::new(Ring::new(boot, args.ring)));
     let (head_tx, head_rx) = watch::channel(0u64);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -573,6 +641,8 @@ async fn main() -> Result<(), BoxError> {
             dir: seg_dir,
             boot,
             keep: args.keep_slots,
+            slot_micros,
+            view: view.clone(),
             open: None,
             last_flush: Instant::now(),
             records: 0,
@@ -599,7 +669,41 @@ async fn main() -> Result<(), BoxError> {
         stats: stats.clone(),
         health: health.clone(),
         recorder: rec.stats.clone(),
+        view: view.clone(),
     });
+
+    let stop_archiver = Arc::new(AtomicBool::new(false));
+    let archiver = match &args.store {
+        None => None,
+        Some(dir) => {
+            let store = FsStore::open(dir)?;
+            let mut lcfg =
+                caslease::Config::new(args.node, random_boot().0 ^ boot.0).with_timing(args.timing);
+            // Tenures older than three days are dropped.
+            lcfg.keep_slots = (3 * 24 * 3_600_000 / args.slot_ms).max(1);
+            let lease_mutant = match mutant {
+                Mutant::Lease(m) => m,
+                _ => LeaseMutant::None,
+            };
+            #[cfg(feature = "mutants")]
+            let lcfg = lcfg.with_mutant(lease_mutant);
+            #[cfg(not(feature = "mutants"))]
+            let _ = lease_mutant;
+            let a = Archiver {
+                lease: CasLease::new(lcfg),
+                store,
+                seg_dir: args.data.join("seg"),
+                tmp_dir: args.data.join("archive-tmp"),
+                log: args.data.join("lease.jsonl"),
+                node: args.node,
+                slot_micros,
+                lookback: 60,
+                view: view.clone(),
+                stop: stop_archiver.clone(),
+            };
+            Some(std::thread::spawn(move || a.run()))
+        }
+    };
 
     let stream = TcpListener::bind(args.listen).await?;
     let http = TcpListener::bind(args.http).await?;
@@ -643,6 +747,10 @@ async fn main() -> Result<(), BoxError> {
     let dropped = rec.stats.dropped.load(Relaxed);
     drop(rec);
     let (records, bytes) = tokio::task::spawn_blocking(move || task.finish()).await??;
+    stop_archiver.store(true, Relaxed);
+    if let Some(a) = archiver {
+        let _ = tokio::task::spawn_blocking(move || a.join()).await;
+    }
     // Give connections a moment to deliver their bye.
     let deadline = Instant::now() + Duration::from_secs(2);
     while stats.connections.load(Relaxed) > 0 && Instant::now() < deadline {

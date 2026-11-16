@@ -518,16 +518,18 @@ async fn resume_from_outside_the_ring_gets_a_snapshot() {
 #[cfg(not(feature = "mutants"))]
 #[test]
 fn a_build_without_mutants_refuses_poly_mutant() {
-    let out = Command::new(env!("CARGO_BIN_EXE_node"))
-        .args(["--data", temp_dir("refuse").to_str().unwrap()])
-        .args(["--listen", "127.0.0.1:0", "--http", "127.0.0.1:0"])
-        .env("POLY_MUTANT", "seq-skip")
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("refusing to start"), "{err}");
-    assert!(out.stdout.is_empty(), "started anyway");
+    for m in ["seq-skip", "no-fence", "epoch-reuse"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_node"))
+            .args(["--data", temp_dir("refuse").to_str().unwrap()])
+            .args(["--listen", "127.0.0.1:0", "--http", "127.0.0.1:0"])
+            .env("POLY_MUTANT", m)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("refusing to start"), "{err}");
+        assert!(out.stdout.is_empty(), "started anyway");
+    }
 }
 
 #[test]

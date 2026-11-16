@@ -5,7 +5,8 @@
 #
 # EXPECT is `pass`, `pass+self_repeats` (pass, and a node repeated keys on
 # its own stream, which proves dedup is by key), or the reason a seeded
-# fault must fail with (exit 1 and exactly that reason first).
+# fault must fail with (exit 1 and exactly that reason first). With
+# `--archive 1` a stream pass hands the reason to the archive verdict.
 #
 # The run directory, with the private delivered log, stays in the runner's
 # temp directory and is never uploaded.
@@ -23,8 +24,13 @@ code=$?
 
 report="$run/report.json"
 reason=$(jq -r '.verdict.reason // "none"' "$report" 2>/dev/null || echo none)
+if [ "$reason" = none ] && [ -f "$run/archive.json" ]; then
+  reason=$(jq -r '.verdict.reason // "none"' "$run/archive.json" 2>/dev/null || echo none)
+fi
 repeats=$(jq -r '.counters.self_repeats // 0' "$report" 2>/dev/null || echo 0)
 summary=$(grep '^chaos: ' "$run.out" | tail -n 1)
+archive=$(grep '^chaos archive: ' "$run.out" | tail -n 1)
+[ -n "$archive" ] && summary="$summary $archive"
 
 ok=0
 case "$expect" in
@@ -41,7 +47,7 @@ fi
 if [ "$ok" != 1 ]; then
   echo "::error::$name expected $expect but got exit $code, reason $reason"
   cat "$run.out"
-  for f in "$run"/sim.log "$run"/node-*.log; do
+  for f in "$run"/sim.log "$run"/node-*.log "$run"/node-*-data/lease.jsonl; do
     [ -f "$f" ] && { echo "== $f"; tail -n 40 "$f"; }
   done
   exit 1

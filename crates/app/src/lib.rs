@@ -1,4 +1,5 @@
 pub mod adaptive;
+pub mod archiver;
 pub mod backtest;
 pub mod chaos;
 pub mod convergence;

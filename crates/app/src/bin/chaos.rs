@@ -5,11 +5,13 @@
 //! ```text
 //! chaos local  --run DIR [--seed 1] [--rate 200] [--faults 12] [--gap-ms 4000]
 //!              [--freeze-ms 2000] [--margin-s 15] [--recording FILE] [--lag-ms 0]
+//!              [--archive 1] [--leader-freezes 0] [--leader-freeze-ms 9000]
 //!              [--mutant NAME] [--bins DIR]
 //! chaos plan   [--seed 1] [--faults 12] [--gap-ms 4000] [--freeze-ms 2000]
 //!              [--margin-s 15] [--mutant NAME]
 //! chaos client --nodes URL,URL --seconds N --run DIR [--mutant NAME]
 //! chaos verify --run DIR --truth FILE
+//! chaos verify-archive --run DIR [--store DIR]
 //! ```
 //!
 //! `local` does the whole run on this machine: it starts `venue_sim` with a
@@ -23,14 +25,22 @@
 //! drops the client's connection in a loopback relay that sits between the
 //! client and each node, while the node keeps running.
 //!
+//! `--archive 1` points both nodes at one directory store in the run
+//! directory, with 2 s slots and a scaled lease (ttl 4 s, renew 1 s, poll
+//! 0.5 s, margins 1 s and 0.5 s), and adds the archive verdict
+//! (`verify-archive`) after the stream verdict. `--leader-freezes N` turns
+//! the last N faults into `freeze_leader`: SIGSTOP on whichever node `/ha`
+//! says leads, for `--leader-freeze-ms`, while the harness times the
+//! peer's takeover through its `/ha`.
+//!
 //! Exit 0 pass, 1 fail (the reason is printed and in `report.json`),
 //! 2 invalid: a node exited on its own, a peer never became ready, or the
 //! subscriptions never all went live.
 //!
 //! `--mutant` picks one seeded fault and works only in a build with the
 //! `mutants` feature: `no-dedup`, `single-node`, `no-reconnect` (client),
-//! `seq-skip`, `stale-resume`, `dup-frame` (node, through `POLY_MUTANT`),
-//! `overlap-kill` (harness).
+//! `seq-skip`, `stale-resume`, `dup-frame`, `no-fence`, `epoch-reuse`
+//! (node, through `POLY_MUTANT`), `overlap-kill` (harness).
 
 use app::chaos::{self, ClientRecord, ConnObs, Executed, FaultKind, Harness, LogLine, Plan};
 use ha::client::{self, ClientConfig, ClientMutant, Output};
@@ -101,6 +111,8 @@ fn parse_mutant(name: Option<&str>) -> Result<Mutant, String> {
         "seq-skip" => Mutant::Node("seq-skip"),
         "stale-resume" => Mutant::Node("stale-resume"),
         "dup-frame" => Mutant::Node("dup-frame"),
+        "no-fence" => Mutant::Node("no-fence"),
+        "epoch-reuse" => Mutant::Node("epoch-reuse"),
         chaos::OVERLAP_KILL => Mutant::Harness,
         _ => return Err(format!("unknown mutant {name}")),
     })
@@ -281,14 +293,63 @@ fn verify_and_print(run: &Path, truth: &Path) -> i32 {
 }
 
 fn plan_from(o: &Opts) -> Result<Plan, String> {
-    Ok(chaos::plan(
+    let mut p = chaos::plan(
         o.num("seed", 1u64)?,
         o.num("faults", 12usize)?,
         o.num("gap-ms", 4_000i64)?,
         o.num("freeze-ms", 2_000u64)?,
         o.num("margin-s", 15i64)? * 1_000,
         o.str("mutant"),
-    ))
+    );
+    chaos::add_leader_freezes(
+        &mut p,
+        o.num("leader-freezes", 0usize)?,
+        o.num("leader-freeze-ms", 9_000u64)?,
+    );
+    Ok(p)
+}
+
+fn archive_and_print(run: &Path, store: &Path) -> i32 {
+    let inputs = match chaos::load_archive(run, store) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("chaos verify-archive: {e}");
+            return 2;
+        }
+    };
+    let r = chaos::verify_archive(&inputs);
+    if let Err(e) = chaos::write_json(&run.join(chaos::ARCHIVE), &r) {
+        eprintln!("chaos verify-archive: writing the report: {e}");
+        return 2;
+    }
+    println!(
+        "chaos archive: {} reason={} writes={} grants={} epoch={} committed_to={} archived={} holes={} orphans={} stale_epoch_commits={} epoch_two_holders={} fence_rejected={} leader_freezes={} takeovers={} takeover_max_ms={}",
+        r.verdict.result,
+        r.verdict.reason.as_deref().unwrap_or("-"),
+        r.audit.writes,
+        r.audit.grants,
+        r.final_epoch,
+        r.committed_to.map_or("-".into(), |v| v.to_string()),
+        r.view.archived,
+        r.view.holes,
+        r.view.orphans,
+        r.audit.stale_epoch_commits,
+        r.audit.epoch_two_holders,
+        r.fence_rejected,
+        r.leader_freezes,
+        r.takeovers_seen,
+        r.takeover_ms.max.map_or("-".into(), |v| format!("{v:.0}")),
+    );
+    r.exit_code()
+}
+
+fn cmd_verify_archive(o: &Opts) -> Result<i32, String> {
+    let run = PathBuf::from(o.need("run")?);
+    let store = o
+        .str("store")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| run.join("store"));
+    Ok(archive_and_print(&run, &store))
 }
 
 fn cmd_plan(o: &Opts) -> Result<i32, String> {
@@ -459,19 +520,55 @@ impl Drop for NodeProc {
     }
 }
 
-async fn http_get(addr: SocketAddr, path: &str) -> Option<u16> {
+/// The whole HTTP response, or `None` after a second.
+async fn http_text(addr: SocketAddr, path: &str) -> Option<String> {
     let io = async {
         let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
         let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         s.write_all(req.as_bytes()).await.ok()?;
         let mut buf = String::new();
         s.read_to_string(&mut buf).await.ok()?;
-        buf.split_whitespace().nth(1)?.parse().ok()
+        Some(buf)
     };
     tokio::time::timeout(Duration::from_secs(1), io)
         .await
         .ok()
         .flatten()
+}
+
+async fn http_get(addr: SocketAddr, path: &str) -> Option<u16> {
+    http_text(addr, path)
+        .await?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// A node's `/ha` epoch and leadership.
+async fn ha_state(addr: SocketAddr) -> Option<(u64, bool)> {
+    let text = http_text(addr, "/ha").await?;
+    let body = text.split("\r\n\r\n").nth(1)?;
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    Some((v.get("epoch")?.as_u64()?, v.get("leader")?.as_bool()?))
+}
+
+/// The node that says it leads, and its epoch, waiting up to 15 s.
+async fn find_leader(nodes: &[Shared]) -> Option<(usize, u64)> {
+    let mut https = Vec::new();
+    for n in nodes {
+        https.push(n.lock().await.http);
+    }
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(15) {
+        for (i, h) in https.iter().enumerate() {
+            if let Some((e, true)) = ha_state(*h).await {
+                return Some((i, e));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
 }
 
 /// Wait until `/readyz` is 200, up to `limit`.
@@ -550,6 +647,8 @@ impl Proxy {
     }
 }
 
+/// Run one fault. `takeover_watch` is the peer's HTTP address and the victim's
+/// epoch, for timing a takeover during a leader freeze.
 async fn execute(
     node: Shared,
     idx: usize,
@@ -557,6 +656,7 @@ async fn execute(
     freeze_ms: u64,
     epoch: Instant,
     mut live: watch::Receiver<Vec<bool>>,
+    takeover_watch: Option<(SocketAddr, u64)>,
 ) -> Result<Executed, String> {
     let mut n = node.lock().await;
     let at_wall_ms = wall_ms();
@@ -575,8 +675,10 @@ async fn execute(
             at_mono_ms,
             recovered_wall_ms: wall_ms(),
             recovered_mono_ms: mono_ms(epoch, Instant::now()),
+            takeover_ms: None,
         });
     }
+    let mut takeover_ms = None;
     match kind {
         FaultKind::Kill9 => {
             n.kill9();
@@ -587,6 +689,23 @@ async fn execute(
             let pid = n.pid()?;
             signal(pid, "STOP")?;
             tokio::time::sleep(Duration::from_millis(freeze_ms)).await;
+            signal(pid, "CONT")?;
+        }
+        FaultKind::FreezeLeader => {
+            let pid = n.pid()?;
+            signal(pid, "STOP")?;
+            let t0 = Instant::now();
+            let until = t0 + Duration::from_millis(freeze_ms);
+            while Instant::now() < until {
+                if let (None, Some((peer, e0))) = (takeover_ms, takeover_watch) {
+                    if let Some((e, true)) = ha_state(peer).await {
+                        if e > e0 {
+                            takeover_ms = Some(t0.elapsed().as_millis() as i64);
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
             signal(pid, "CONT")?;
         }
         FaultKind::Cut => {}
@@ -603,6 +722,7 @@ async fn execute(
         at_mono_ms,
         recovered_wall_ms: wall_ms(),
         recovered_mono_ms: mono_ms(epoch, Instant::now()),
+        takeover_ms,
     })
 }
 
@@ -643,6 +763,7 @@ async fn drive(
                 f.freeze_ms,
                 epoch,
                 live.clone(),
+                None,
             )));
         }
         for t in tasks {
@@ -652,20 +773,29 @@ async fn drive(
         for f in &plan.faults {
             tokio::time::sleep_until(due(f.at_ms)).await;
             check_alive(nodes).await?;
-            let other = 1 - f.node;
+            // A leader freeze picks its victim when it runs.
+            let (victim, leader_epoch) = if f.kind == FaultKind::FreezeLeader {
+                let (i, e) = find_leader(nodes)
+                    .await
+                    .ok_or("no node leads before a leader freeze")?;
+                (i, Some(e))
+            } else {
+                (f.node, None)
+            };
+            let other = 1 - victim;
             let http = nodes[other].lock().await.http;
             if !ready_for(http, Duration::from_millis(500), Duration::from_secs(20)).await {
                 return Err(format!(
-                    "node {other} not ready before a fault on node {}",
-                    f.node
+                    "node {other} not ready before a fault on node {victim}"
                 ));
             }
             if wanted[other] {
                 let _ = tokio::time::timeout(Duration::from_secs(10), live.wait_for(|l| l[other]))
                     .await;
             }
-            let node = nodes[f.node].clone();
-            let done = execute(node, f.node, f.kind, f.freeze_ms, epoch, live.clone()).await?;
+            let node = nodes[victim].clone();
+            let tw = leader_epoch.map(|e| (http, e));
+            let done = execute(node, victim, f.kind, f.freeze_ms, epoch, live.clone(), tw).await?;
             executed.push(done);
         }
     }
@@ -747,6 +877,8 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
         None => app::sim::ASSETS[0].to_string(),
     };
     let truth = run.join("truth.prec");
+    let archive = o.num("archive", 0u8)? == 1;
+    let store = run.join("store");
 
     let mut sim_args = vec![
         "--seed".to_string(),
@@ -775,7 +907,7 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
         let stream = free_port().map_err(|e| e.to_string())?;
         let http = free_port().map_err(|e| e.to_string())?;
         let data = run.join(format!("node-{name}-data"));
-        let args = vec![
+        let mut args = vec![
             "--data".to_string(),
             data.to_string_lossy().into_owned(),
             "--node".into(),
@@ -793,6 +925,16 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
             "--token".into(),
             token.clone(),
         ];
+        if archive {
+            args.extend([
+                "--store".into(),
+                store.to_string_lossy().into_owned(),
+                "--slot-ms".into(),
+                "2000".into(),
+                "--lease-timing".into(),
+                "4000,1000,500,1000,500".into(),
+            ]);
+        }
         let target: SocketAddr = format!("127.0.0.1:{stream}").parse().expect("addr");
         let (proxy, relay) = Proxy::start(target).await.map_err(|e| e.to_string())?;
         let mut n = NodeProc {
@@ -833,7 +975,12 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
     };
     chaos::write_json(&run.join(chaos::HARNESS), &harness).map_err(|e| e.to_string())?;
     write_client(&run, &rec, &log).map_err(|e| e.to_string())?;
-    Ok(verify_and_print(&run, &truth))
+    let stream = verify_and_print(&run, &truth);
+    if !archive {
+        return Ok(stream);
+    }
+    let arch = archive_and_print(&run, &store);
+    Ok(if stream != 0 { stream } else { arch })
 }
 
 #[tokio::main]
@@ -854,8 +1001,9 @@ async fn main() {
         "plan" => cmd_plan(&opts),
         "client" => cmd_client(&opts).await,
         "verify" => cmd_verify(&opts),
+        "verify-archive" => cmd_verify_archive(&opts),
         "local" => cmd_local(&opts).await,
-        _ => Err("usage: chaos local|plan|client|verify [options]".into()),
+        _ => Err("usage: chaos local|plan|client|verify|verify-archive [options]".into()),
     };
     match res {
         Ok(code) => std::process::exit(code),
