@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -319,6 +319,10 @@ pub struct FsStore {
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// How much of the journal's end is read to mend it. A HEAD body is a few
+/// kilobytes at most, so the last line always fits.
+const MEND_TAIL: u64 = 1 << 20;
+
 impl FsStore {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
@@ -379,12 +383,61 @@ impl FsStore {
         Ok(Some((buf[nl + 1..].to_vec(), Etag(etag))))
     }
 
+    /// Under the lock, make the journal end with the current HEAD body. A
+    /// writer killed between its rename and its append left that applied
+    /// write out of the journal, and one killed mid-append left a torn line
+    /// that the next line would run into. Both are mended before a line is
+    /// added, so the journal misses no applied write but the very last.
+    fn mend_journal(&self, current: Option<&[u8]>) -> io::Result<()> {
+        let mut j = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(Self::journal_path(&self.root))?;
+        let len = j.metadata()?.len();
+        let from = len.saturating_sub(MEND_TAIL);
+        j.seek(SeekFrom::Start(from))?;
+        let mut tail = Vec::new();
+        j.read_to_end(&mut tail)?;
+        let keep = match tail.iter().rposition(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            None if from == 0 => 0,
+            // One line longer than the tail: not a HEAD body, leave it.
+            None => return Ok(()),
+        };
+        let mut changed = false;
+        if keep < tail.len() {
+            j.set_len(from + keep as u64)?;
+            tail.truncate(keep);
+            changed = true;
+        }
+        let last = tail[..keep.saturating_sub(1)]
+            .rsplit(|&b| b == b'\n')
+            .next()
+            .filter(|l| !l.is_empty());
+        if let Some(cur) = current {
+            if last != Some(cur) {
+                j.seek(SeekFrom::End(0))?;
+                let mut line = cur.to_vec();
+                line.push(b'\n');
+                j.write_all(&line)?;
+                changed = true;
+            }
+        }
+        if changed {
+            j.sync_data()?;
+        }
+        Ok(())
+    }
+
     fn write_locked(&self, body: &[u8], cond: &Cond) -> io::Result<WriteOutcome> {
         let _lock = self.lock()?;
         let current = self.read_raw()?;
         if !cond_holds(cond, current.as_ref().map(|(_, e)| e)) {
             return Ok(WriteOutcome::PreconditionFailed);
         }
+        self.mend_journal(current.as_ref().map(|(b, _)| b.as_slice()))?;
         let version = match &current {
             Some((_, Etag(e))) => e.trim_matches('"').parse::<u64>().unwrap_or(0) + 1,
             None => 1,
@@ -591,6 +644,36 @@ mod tests {
         // Every applied write is in the journal: the create and one update.
         let j = FsStore::read_journal(s.root()).unwrap();
         assert_eq!(j, vec![b"{\"x\":1}".to_vec(), b"{\"x\":3}".to_vec()]);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    fn write(s: &FsStore, body: &[u8]) {
+        let cond = match s.read_head().unwrap() {
+            Some((_, e)) => Cond::IfMatch(e),
+            None => Cond::IfNoneMatch,
+        };
+        assert!(matches!(s.write_head(body, &cond), WriteOutcome::Done(_)));
+    }
+
+    #[test]
+    fn the_journal_is_mended_before_the_next_write() {
+        let d = scratch("mend");
+        let s = FsStore::open(d.join("store")).unwrap();
+        let jp = FsStore::journal_path(s.root());
+        write(&s, b"aaaa");
+        write(&s, b"bbbb");
+        // A writer killed after its rename, before its append.
+        std::fs::write(&jp, b"aaaa\n").unwrap();
+        write(&s, b"cccc");
+        write(&s, b"dddd");
+        // A writer killed mid-append.
+        std::fs::write(&jp, b"aaaa\nbbbb\ncccc\ndd").unwrap();
+        write(&s, b"eeee");
+        let want: Vec<Vec<u8>> = ["aaaa", "bbbb", "cccc", "dddd", "eeee"]
+            .iter()
+            .map(|l| l.as_bytes().to_vec())
+            .collect();
+        assert_eq!(FsStore::read_journal(s.root()).unwrap(), want);
         let _ = std::fs::remove_dir_all(d);
     }
 
