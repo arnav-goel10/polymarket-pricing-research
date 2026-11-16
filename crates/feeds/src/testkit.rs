@@ -80,7 +80,6 @@ pub async fn serve_broadcast<G>(frames: tokio::sync::broadcast::Sender<String>, 
 where
     G: Fn() -> Vec<String> + Send + Sync + 'static,
 {
-    use tokio::sync::broadcast::error::RecvError;
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let greet = std::sync::Arc::new(greet);
@@ -105,14 +104,10 @@ where
                         return;
                     }
                 }
-                loop {
-                    match live.recv().await {
-                        Ok(t) => {
-                            if tx.send(Message::Text(t)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(RecvError::Lagged(_)) | Err(RecvError::Closed) => break,
+                // A lagged or closed channel ends the connection.
+                while let Ok(t) = live.recv().await {
+                    if tx.send(Message::Text(t)).await.is_err() {
+                        break;
                     }
                 }
                 drain.abort();
