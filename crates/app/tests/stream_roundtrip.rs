@@ -430,12 +430,11 @@ async fn node_streams_resumes_and_matches_its_segments() {
     // Shutdown tells the client why.
     let data = node.data.clone();
     let stop = tokio::task::spawn_blocking(move || node.stop());
-    let mut said_bye = false;
+    // next_msg panics if the stream ends without a bye.
     loop {
         match next_msg(&mut ws).await {
             NodeMsg::Bye { reason } => {
                 assert_eq!(reason, ByeReason::Shutdown);
-                said_bye = true;
                 break;
             }
             NodeMsg::Ev {
@@ -446,7 +445,6 @@ async fn node_streams_resumes_and_matches_its_segments() {
             _ => {}
         }
     }
-    assert!(said_bye);
     let out = stop.await.unwrap();
     assert!(out.contains("node stopped"), "{out}");
     assert!(out.contains("dropped 0"), "{out}");
