@@ -42,7 +42,11 @@ const RELEASE_WAIT_MS: u64 = 2_000;
 pub struct LeaseView {
     /// The newest epoch in HEAD as this node last saw it.
     pub epoch: AtomicU64,
-    pub leader: AtomicBool,
+    /// Milliseconds after `start` until which this node believes it leads;
+    /// 0 when it does not. Read through [`LeaseView::leader`].
+    pub leader_until: AtomicU64,
+    /// The monotonic origin the lease runs on.
+    pub start: Instant,
     pub fence_rejected: AtomicU64,
     pub commits: AtomicU64,
     pub uploads: AtomicU64,
@@ -53,11 +57,21 @@ pub struct LeaseView {
     pub open_slot: AtomicI64,
 }
 
+impl LeaseView {
+    /// Whether this node believes it leads right now. Judged at the moment
+    /// of asking, so a node frozen past its deadline stops saying it leads
+    /// as soon as it wakes, before the archiver thread has run again.
+    pub fn leader(&self) -> bool {
+        (self.start.elapsed().as_millis() as u64) < self.leader_until.load(Relaxed)
+    }
+}
+
 impl Default for LeaseView {
     fn default() -> Self {
         LeaseView {
             epoch: AtomicU64::new(0),
-            leader: AtomicBool::new(false),
+            leader_until: AtomicU64::new(0),
+            start: Instant::now(),
             fence_rejected: AtomicU64::new(0),
             commits: AtomicU64::new(0),
             uploads: AtomicU64::new(0),
@@ -162,7 +176,8 @@ impl Archiver {
         caslease::drive(&mut self.lease, &self.store, &mut || Self::now(start));
         let now = Self::now(start);
         let v = &self.view;
-        v.leader.store(self.lease.leads(now), Relaxed);
+        v.leader_until
+            .store(self.lease.lead_until(now).unwrap_or(0), Relaxed);
         if let Some(h) = self.lease.last_head() {
             v.epoch.store(h.epoch, Relaxed);
         }
@@ -280,7 +295,7 @@ impl Archiver {
         if let Err(e) = std::fs::create_dir_all(&self.tmp_dir) {
             tracing::warn!(error = %e, "archive temp dir");
         }
-        let start = Instant::now();
+        let start = self.view.start;
         let mut last_pass: Option<u64> = None;
         let mut release_by: Option<u64> = None;
         loop {
@@ -292,7 +307,7 @@ impl Archiver {
             self.drive(start);
             if let Some(by) = release_by {
                 if self.lease.is_stopped() || Self::now(start) >= by {
-                    self.view.leader.store(false, Relaxed);
+                    self.view.leader_until.store(0, Relaxed);
                     return;
                 }
             } else if last_pass.is_none_or(|t| now >= t + ARCHIVE_EVERY_MS) {
@@ -386,10 +401,10 @@ mod tests {
         while view.commits.load(Relaxed) < 4 && started.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(view.leader.load(Relaxed));
+        assert!(view.leader());
         stop.store(true, Relaxed);
         t.join().unwrap();
-        assert!(!view.leader.load(Relaxed));
+        assert!(!view.leader());
         let (body, _) = store.read_head().unwrap().unwrap();
         let head = Head::decode(&body).unwrap();
         assert_eq!(head.holder, None, "released on stop");

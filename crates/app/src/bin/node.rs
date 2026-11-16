@@ -494,7 +494,7 @@ async fn serve_conn(tcp: TcpStream, ctx: &Ctx) -> Result<(), BoxError> {
             let hb = NodeMsg::Hb {
                 head: *head_rx.borrow(),
                 epoch: ctx.view.epoch.load(Relaxed),
-                leader: ctx.view.leader.load(Relaxed),
+                leader: ctx.view.leader(),
             };
             tokio::time::timeout(SEND_TIMEOUT, tx.send(Message::Text(wire::encode(&hb))))
                 .await
@@ -527,7 +527,7 @@ async fn ha_status(State(ctx): State<Arc<Ctx>>) -> impl IntoResponse {
         "head": head,
         "oldest": oldest,
         "epoch": ctx.view.epoch.load(Relaxed),
-        "leader": ctx.view.leader.load(Relaxed),
+        "leader": ctx.view.leader(),
     });
     ([("content-type", "application/json")], body.to_string())
 }
@@ -569,7 +569,7 @@ async fn metrics(State(ctx): State<Arc<Ctx>>) -> impl IntoResponse {
     line("poly_recorder_queue_depth", ctx.recorder.queue_depth());
     let v = &ctx.view;
     line("poly_lease_epoch", v.epoch.load(Relaxed));
-    line("poly_lease_leader", v.leader.load(Relaxed) as u64);
+    line("poly_lease_leader", v.leader() as u64);
     line("poly_fence_rejected_total", v.fence_rejected.load(Relaxed));
     line(
         "poly_lease_unknown_outcomes_total",

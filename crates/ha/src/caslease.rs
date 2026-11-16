@@ -318,6 +318,17 @@ impl CasLease {
         !releasing && self.held.as_ref().is_some_and(|h| now < h.deadline)
     }
 
+    /// The time on this node's clock until which it believes it leads, if
+    /// it believes it leads at all. Lets a reader judge belief at the
+    /// moment it asks, even if the caller has not run since.
+    pub fn lead_until(&self, now: u64) -> Option<u64> {
+        if self.leads(now) {
+            self.held.as_ref().map(|h| h.deadline)
+        } else {
+            None
+        }
+    }
+
     /// The epoch this node holds, if it holds one (believed or not).
     pub fn held_epoch(&self) -> Option<u64> {
         self.held.as_ref().map(|h| h.epoch)
