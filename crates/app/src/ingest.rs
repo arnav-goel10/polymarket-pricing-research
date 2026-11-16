@@ -102,26 +102,6 @@ impl Backlog {
     }
 }
 
-#[cfg(test)]
-mod backlog_tests {
-    use super::*;
-    use std::time::Instant;
-
-    #[test]
-    fn a_drop_or_a_deep_queue_makes_the_node_not_ready() {
-        let mut b = Backlog::default();
-        let t = Instant::now();
-        let s = |ms| t + Duration::from_millis(ms);
-        assert!(b.healthy(t, 0, 0, 65_536));
-        assert!(b.healthy(s(10), 0, 4_096, 65_536));
-        assert!(!b.healthy(s(20), 0, 4_097, 65_536), "a stalled writer");
-        assert!(!b.healthy(s(30), 3, 0, 65_536), "a drop");
-        assert!(!b.healthy(s(5_029), 3, 0, 65_536));
-        assert!(b.healthy(s(5_030), 3, 0, 65_536), "held 5 s, then clear");
-        assert!(!b.healthy(s(6_000), 4, 0, 65_536), "a later drop again");
-    }
-}
-
 fn opts(metrics: Option<&Arc<FeedMetrics>>) -> ConnOpts {
     match metrics {
         Some(m) => ConnOpts::with_metrics(m.clone()),
@@ -248,5 +228,25 @@ pub async fn shutdown_signal() -> &'static str {
     {
         let _ = tokio::signal::ctrl_c().await;
         "SIGINT"
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn a_drop_or_a_deep_queue_makes_the_node_not_ready() {
+        let mut b = Backlog::default();
+        let t = Instant::now();
+        let s = |ms| t + Duration::from_millis(ms);
+        assert!(b.healthy(t, 0, 0, 65_536));
+        assert!(b.healthy(s(10), 0, 4_096, 65_536));
+        assert!(!b.healthy(s(20), 0, 4_097, 65_536), "a stalled writer");
+        assert!(!b.healthy(s(30), 3, 0, 65_536), "a drop");
+        assert!(!b.healthy(s(5_029), 3, 0, 65_536));
+        assert!(b.healthy(s(5_030), 3, 0, 65_536), "held 5 s, then clear");
+        assert!(!b.healthy(s(6_000), 4, 0, 65_536), "a later drop again");
     }
 }
