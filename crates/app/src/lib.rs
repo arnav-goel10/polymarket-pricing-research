@@ -1,5 +1,6 @@
 pub mod adaptive;
 pub mod backtest;
+pub mod chaos;
 pub mod convergence;
 pub mod engine;
 pub mod ingest;
@@ -10,6 +11,7 @@ pub mod replay_stream;
 pub mod resolution;
 pub mod server;
 pub mod signals;
+pub mod sim;
 pub mod state;
 pub mod window_clock;
 

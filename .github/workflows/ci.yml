@@ -31,6 +31,45 @@ jobs:
       - name: Check event keys on the committed live recording
         run: cargo run --locked --release -p ha --bin keycheck -- fixtures/live-sample.prec --fail-on-collision
 
+  # Milestone B gate: two nodes under kills and freezes behind the hedged
+  # client, checked against the simulator's total truth. The baselines must
+  # pass with 0 missing and 0 duplicates; each seeded fault must fail with
+  # exactly its reason. One build carries the faults; a run without
+  # --mutant uses none of them.
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CHAOS_BIN: target/release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build node, venue_sim and chaos with the seeded faults compiled in
+        run: cargo build --locked --release -p app --features mutants --bin node --bin venue_sim --bin chaos
+      - name: Baseline, synthetic, seed 1 at 200 frames/s, 12 faults, one node 20 ms behind
+        run: scripts/chaos_case.sh seed1 pass --seed 1 --rate 200 --faults 12 --lag-ms 20
+      - name: Baseline, synthetic, seed 2 at 2,000 frames/s, 12 faults
+        run: scripts/chaos_case.sh seed2 pass --seed 2 --rate 2000 --faults 12
+      - name: Baseline, fixture playback at 300 frames/s, 3 faults
+        run: scripts/chaos_case.sh fixture pass --recording fixtures/live-sample.prec --rate 300 --faults 3
+      - name: Seeded faults, each caught by name
+        run: |
+          fail=0
+          m() {
+            scripts/chaos_case.sh "$1" "$2" --seed 3 --rate 200 --faults 2 --gap-ms 3000 --mutant "$1" || fail=1
+          }
+          m no-dedup duplicate
+          m single-node missing
+          m no-reconnect missing
+          m seq-skip seq_gap
+          m stale-resume resume
+          m overlap-kill missing
+          # Control: a node that resends frames under fresh seqs must pass,
+          # with the repeats dropped by key.
+          m dup-frame pass+self_repeats
+          exit "$fail"
+
   benches:
     runs-on: ubuntu-latest
     timeout-minutes: 25
