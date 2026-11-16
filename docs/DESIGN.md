@@ -144,7 +144,7 @@ A collision would mean two different events sharing a key, so the merger would d
 
 Limits, stated plainly:
 
-- The fixture is about 10 minutes from one session. It has no Binance trades and only 5 RTDS frames, so those keys are checked by unit tests and by the venue's documented semantics more than by data. The CLOB numbers are the strong evidence.
+- The fixture is 9,941 records over 4.99 s of receive time from one session, about 2,000 frames a second. It has no Binance trades and only 5 RTDS frames, so those keys are checked by unit tests and by the venue's documented semantics more than by data. The CLOB numbers are the strong evidence.
 - Key uniqueness on one node's recording does not prove two nodes see the same fields. That needs two simultaneous recordings, which is milestone B.
 - Unkeyed events merge by content. Without a venue time they are not protected against late copies and can come out twice. None occurred in the fixture.
 - Late events are dropped. Size the span above the worst node lag and watch the late counter.
