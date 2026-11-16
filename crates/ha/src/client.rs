@@ -21,6 +21,14 @@
 //!   starts that clock too, so a connect that hangs is dead as well.
 //! - Redial waits 100 ms to 2 s, doubling per failed attempt, with jitter,
 //!   and starts again at 100 ms once a connection goes live.
+//! - A second gap at the same `seq` of the same boot means the resume
+//!   cannot get past it, so the next dial asks for a snapshot instead.
+//!
+//! The merger's unit is a key and one frame can carry several (an RTDS
+//! history snapshot, a CLOB array, a two-entry price change), so one frame
+//! can come back with mixed verdicts. A consumer that applies frames uses
+//! [`Event::delivered_frame`], the frame cut down to its delivered events;
+//! applying the whole frame would apply the duplicate parts twice.
 //!
 //! Not guaranteed, and counted instead: order across nodes
 //! (`order_inversions`, a delivered timed key older than the newest
@@ -57,6 +65,8 @@ pub enum ClientMutant {
     SingleNode,
     /// Dial each node once and never again.
     NoReconnect,
+    /// Deliver late copies: a late verdict is passed on as a delivery.
+    LateDeliver,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +138,13 @@ pub struct ClientCounters {
     pub disconnects: u64,
     /// `ev` messages offered to the merger.
     pub frames: u64,
+    /// Snapshots from a boot the client already followed (after `bye
+    /// lagged`, or a dial with no resume point). That connection skips the
+    /// node's frames between; the other node covers them.
+    pub resyncs: u64,
+    /// Frames with some events delivered and some not, which a frame
+    /// consumer must cut (see [`Event::delivered_frame`]).
+    pub mixed_frames: u64,
 }
 
 /// One `ev` and what the merger did with each of its keys.
@@ -140,6 +157,130 @@ pub struct Event {
     pub snap: bool,
     pub frame: String,
     pub keys: Vec<(EventKey, Verdict)>,
+}
+
+impl Event {
+    /// The frame cut down to the events the merger delivered, in the
+    /// venue's own shape: `None` when none was, the frame as received when
+    /// all were. Otherwise RTDS history points and CLOB array items and
+    /// price change entries that were not delivered are removed, and a
+    /// price change left with no entry goes too.
+    ///
+    /// Each piece kept is keyed again on its own and must be the key at its
+    /// position in `keys`, so the cut never hands on a duplicate or late
+    /// piece. If the pieces do not line up with `keys` (which the key rules
+    /// never produce) the result is `None`: the frame is lost, not doubled.
+    pub fn delivered_frame(&self) -> Option<String> {
+        let n = self
+            .keys
+            .iter()
+            .filter(|(_, v)| *v == Verdict::Deliver)
+            .count();
+        if n == 0 {
+            return None;
+        }
+        if n == self.keys.len() {
+            return Some(self.frame.clone());
+        }
+        cut_frame(self.src, &self.frame, &self.keys)
+    }
+}
+
+/// Walks the pieces of a frame in the order `frame_keys` emits their keys.
+struct Cutter<'a> {
+    src: Source,
+    keys: std::slice::Iter<'a, (EventKey, Verdict)>,
+    buf: Vec<EventKey>,
+    ok: bool,
+}
+
+impl Cutter<'_> {
+    /// Whether `piece`, one event as a frame of its own, is delivered.
+    fn keep(&mut self, piece: &serde_json::Value) -> bool {
+        self.buf.clear();
+        frame_keys(self.src, &piece.to_string(), &mut self.buf);
+        if self.buf.len() != 1 {
+            self.ok = false;
+            return false;
+        }
+        match self.keys.next() {
+            Some((k, v)) if *k == self.buf[0] => *v == Verdict::Deliver,
+            _ => {
+                self.ok = false;
+                false
+            }
+        }
+    }
+
+    /// One CLOB event. `None` drops it.
+    fn clob_item(&mut self, mut e: serde_json::Value) -> Option<serde_json::Value> {
+        use serde_json::Value;
+        let split = e.get("event_type").and_then(Value::as_str) == Some("price_change")
+            && matches!(e.get("price_changes"), Some(Value::Array(_)));
+        if !split {
+            return self.keep(&e).then_some(e);
+        }
+        let changes = match e.get_mut("price_changes").map(Value::take) {
+            Some(Value::Array(c)) => c,
+            _ => Vec::new(),
+        };
+        let mut kept = Vec::with_capacity(changes.len());
+        for c in changes {
+            e["price_changes"] = Value::Array(vec![c]);
+            if self.keep(&e) {
+                if let Some(Value::Array(mut one)) = e.get_mut("price_changes").map(Value::take) {
+                    kept.append(&mut one);
+                }
+            }
+        }
+        if kept.is_empty() {
+            return None;
+        }
+        e["price_changes"] = Value::Array(kept);
+        Some(e)
+    }
+}
+
+fn cut_frame(src: Source, frame: &str, keys: &[(EventKey, Verdict)]) -> Option<String> {
+    use serde_json::Value;
+    let mut root: Value = serde_json::from_str(frame).ok()?;
+    let mut cut = Cutter {
+        src,
+        keys: keys.iter(),
+        buf: Vec::with_capacity(4),
+        ok: true,
+    };
+    match Feed::from_source(src)? {
+        Feed::Rtds => {
+            let points = match root.pointer_mut("/payload/data") {
+                Some(Value::Array(p)) => std::mem::take(p),
+                _ => return None,
+            };
+            let mut kept = Vec::with_capacity(points.len());
+            for p in points {
+                root["payload"]["data"] = Value::Array(vec![p]);
+                if cut.keep(&root) {
+                    if let Some(Value::Array(mut one)) =
+                        root.pointer_mut("/payload/data").map(Value::take)
+                    {
+                        kept.append(&mut one);
+                    }
+                }
+            }
+            root["payload"]["data"] = Value::Array(kept);
+        }
+        Feed::Clob => {
+            root = match root {
+                Value::Array(items) => {
+                    Value::Array(items.into_iter().filter_map(|e| cut.clob_item(e)).collect())
+                }
+                e => cut.clob_item(e)?,
+            };
+        }
+        // A Binance frame is one event.
+        Feed::Binance => return None,
+    }
+    (cut.ok && cut.keys.next().is_none()).then(|| root.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +313,10 @@ struct Conn {
     /// Last `ev` or `hb`.
     last_msg: Option<Instant>,
     dials: u64,
+    /// Where the last seq gap was, as (boot, last contiguous seq).
+    gap_at: Option<(Boot, u64)>,
+    /// The next dial asks for a snapshot, not a resume.
+    no_resume: bool,
     recent: HashSet<EventKey>,
     recent_order: VecDeque<EventKey>,
 }
@@ -187,6 +332,8 @@ impl Conn {
             heard_at: now,
             last_msg: None,
             dials: 0,
+            gap_at: None,
+            no_resume: false,
             recent: HashSet::new(),
             recent_order: VecDeque::new(),
         }
@@ -276,8 +423,8 @@ impl Core {
         }
         c.state = ConnState::Handshake;
         c.heard_at = now;
-        let resume = match (c.boot, c.last_seq) {
-            (Some(boot), Some(seq)) => Some(ResumeFrom { boot, seq }),
+        let resume = match (c.boot, c.last_seq, std::mem::take(&mut c.no_resume)) {
+            (Some(boot), Some(seq), false) => Some(ResumeFrom { boot, seq }),
             _ => None,
         };
         c.resume_sent = resume;
@@ -335,6 +482,7 @@ impl Core {
                     ..
                 },
             ) => {
+                let same_boot = c.boot == Some(boot);
                 if c.boot.is_some_and(|b| b != boot) {
                     self.counters.resets += 1;
                 }
@@ -354,6 +502,9 @@ impl Core {
                         out.push(Output::Live { node });
                     }
                     Mode::Snapshot => {
+                        if same_boot {
+                            self.counters.resyncs += 1;
+                        }
                         if !complete {
                             self.counters.incomplete_snapshots += 1;
                         }
@@ -395,6 +546,13 @@ impl Core {
                 c.last_msg = Some(now);
                 if seq != c.expect {
                     self.counters.seq_gaps += 1;
+                    // A resume that ends in the same gap again would loop
+                    // forever; the next dial takes a snapshot instead.
+                    let at = c.boot.zip(c.last_seq);
+                    if at.is_some() && c.gap_at == at {
+                        c.no_resume = true;
+                    }
+                    c.gap_at = at;
                     return self.down(node, DownReason::SeqGap, out);
                 }
                 c.expect = seq + 1;
@@ -427,6 +585,7 @@ impl Core {
         self.keys.clear();
         frame_keys(source, &frame, &mut self.keys);
         let mut keys = Vec::with_capacity(self.keys.len());
+        let mut delivered = 0;
         for &k in &self.keys {
             if !k.kind.is_keyed() {
                 self.counters.unkeyed += 1;
@@ -435,9 +594,12 @@ impl Core {
                 self.counters.self_repeats += 1;
             }
             let mut v = self.merger.offer(node, k);
-            if v == Verdict::Duplicate && self.cfg.mutant == ClientMutant::NoDedup {
-                v = Verdict::Deliver;
+            match (v, self.cfg.mutant) {
+                (Verdict::Duplicate, ClientMutant::NoDedup)
+                | (Verdict::Late, ClientMutant::LateDeliver) => v = Verdict::Deliver,
+                _ => {}
             }
+            delivered += (v == Verdict::Deliver) as usize;
             if let (Verdict::Deliver, Some(t)) = (v, k.ts_millis) {
                 let f = k.kind.feed().index();
                 match self.newest[f] {
@@ -450,6 +612,9 @@ impl Core {
                 }
             }
             keys.push((k, v));
+        }
+        if delivered > 0 && delivered < keys.len() {
+            self.counters.mixed_frames += 1;
         }
         out.push(Output::Event(Event {
             node,
@@ -618,7 +783,8 @@ where
 
 /// Order-book view over a merged stream: drops a CLOB price change whose
 /// venue timestamp is below the latest delivered `book` for its asset. Feed
-/// it delivered CLOB frames only.
+/// it CLOB events with [`BookView::admit_event`], or frames already cut to
+/// their delivered events with [`BookView::admit`].
 #[derive(Debug, Default)]
 pub struct BookView {
     latest_book: HashMap<String, i64>,
@@ -634,6 +800,15 @@ impl BookView {
     /// The timestamp of the latest delivered book for `asset`.
     pub fn book_ts(&self, asset: &str) -> Option<i64> {
         self.latest_book.get(asset).copied()
+    }
+
+    /// Take one CLOB event from the client: only its delivered part is
+    /// applied (see [`Event::delivered_frame`]).
+    pub fn admit_event(&mut self, e: &Event) -> Vec<serde_json::Value> {
+        match e.delivered_frame() {
+            Some(f) => self.admit(&f),
+            None => Vec::new(),
+        }
     }
 
     /// Take one delivered CLOB frame (one event or an array). Returns the
@@ -695,6 +870,7 @@ impl BookView {
 mod tests {
     use super::*;
     use crate::key::KeyKind;
+    use std::collections::HashSet;
 
     const B1: Boot = Boot(0x1111);
     const B2: Boot = Boot(0x2222);
@@ -972,6 +1148,196 @@ mod tests {
 
         let real = Core::new(ClientConfig::new(2));
         assert!(real.should_dial(0) && real.should_dial(1));
+
+        // A copy older than the window: dropped as late, unless the mutant
+        // passes it on.
+        for (mutant, want) in [(ClientMutant::None, 1), (ClientMutant::LateDeliver, 2)] {
+            let mut t = T::with(ClientConfig::new(1).with_mutant(mutant));
+            t.open(0, B1, 1);
+            t.send(0, &ev(1, &trade(20_000), false));
+            t.send(0, &ev(2, &trade(1), false));
+            assert_eq!(t.delivered().len(), want, "{mutant:?}");
+            assert_eq!(t.core.merger().totals().late, 1);
+        }
+    }
+
+    #[test]
+    fn a_gap_at_the_same_seq_twice_takes_a_snapshot_next() {
+        let mut t = T::new(1);
+        t.open(0, B1, 10);
+        t.send(0, &ev(10, &trade(10), false));
+        t.send(0, &ev(12, &trade(12), false));
+        let sub = wire::decode_sub(&t.core.dial(0, t.now)).unwrap();
+        assert_eq!(sub.resume, Some(ResumeFrom { boot: B1, seq: 10 }));
+        // The node resumes honestly and skips the same frame again.
+        t.send(0, &hello(B1, Mode::Resume, 11, true));
+        t.send(0, &ev(12, &trade(12), false));
+        assert_eq!(t.core.counters().seq_gaps, 2);
+        let sub = wire::decode_sub(&t.core.dial(0, t.now)).unwrap();
+        assert_eq!(sub.resume, None, "a third resume would hit the same gap");
+        // The snapshot moves the stream past it, counted as a resync.
+        t.send(0, &hello(B1, Mode::Snapshot, 13, true));
+        t.send(0, &snap_end(13));
+        t.send(0, &ev(13, &trade(13), false));
+        let c = t.core.counters();
+        assert_eq!((c.seq_gaps, c.resyncs, c.resets), (2, 1, 0));
+        // Progress since the gap means the next gap resumes again.
+        t.send(0, &ev(15, &trade(15), false));
+        let sub = wire::decode_sub(&t.core.dial(0, t.now)).unwrap();
+        assert_eq!(sub.resume, Some(ResumeFrom { boot: B1, seq: 13 }));
+    }
+
+    fn rtds_update(ts: i64) -> String {
+        format!(
+            r#"{{"topic":"crypto_prices","type":"update","timestamp":{ts},"payload":{{"symbol":"btcusdt","timestamp":{ts},"value":1.5}}}}"#
+        )
+    }
+
+    fn rtds_history(ts: &[i64]) -> String {
+        let pts: Vec<String> = ts
+            .iter()
+            .map(|t| format!(r#"{{"timestamp":{t},"value":1.5}}"#))
+            .collect();
+        format!(
+            r#"{{"topic":"crypto_prices","type":"subscribe","payload":{{"symbol":"btcusdt","data":[{}]}}}}"#,
+            pts.join(",")
+        )
+    }
+
+    fn last_event(t: &T) -> Event {
+        t.out
+            .iter()
+            .rev()
+            .find_map(|o| match o {
+                Output::Event(e) => Some(e.clone()),
+                _ => None,
+            })
+            .expect("an event")
+    }
+
+    fn keys_of(src: Source, frame: &str) -> Vec<EventKey> {
+        let mut out = Vec::new();
+        frame_keys(src, frame, &mut out);
+        out
+    }
+
+    /// Every event a frame consumer applies, keyed, with whole frames
+    /// (`whole`) or with each frame cut to its delivered events.
+    fn applied(t: &T, whole: bool) -> Vec<EventKey> {
+        let mut out = Vec::new();
+        for o in &t.out {
+            let Output::Event(e) = o else { continue };
+            let f = if whole {
+                e.keys
+                    .iter()
+                    .any(|(_, v)| *v == Verdict::Deliver)
+                    .then(|| e.frame.clone())
+            } else {
+                e.delivered_frame()
+            };
+            if let Some(f) = f {
+                out.extend(keys_of(e.src, &f));
+            }
+        }
+        out
+    }
+
+    fn once_each(keys: &[EventKey]) -> bool {
+        let set: HashSet<_> = keys.iter().collect();
+        set.len() == keys.len()
+    }
+
+    #[test]
+    fn a_mixed_verdict_frame_is_cut_to_its_delivered_events() {
+        let mut t = T::new(2);
+        t.open(0, B1, 1);
+        t.open(1, B2, 1);
+        let rtds = |seq, f: &str| wire::encode_ev(seq, Source::Rtds, 0, false, f);
+        // Node 0 delivers two live updates; node 1, just reconnected to the
+        // venue, sends its history snapshot of three points.
+        t.send(0, &rtds(1, &rtds_update(1_000)));
+        t.send(0, &rtds(2, &rtds_update(20_000)));
+        t.send(1, &rtds(1, &rtds_history(&[1_000, 15_000, 20_000])));
+        let e = last_event(&t);
+        let v: Vec<Verdict> = e.keys.iter().map(|(_, v)| *v).collect();
+        assert_eq!(v, vec![Verdict::Late, Verdict::Deliver, Verdict::Duplicate]);
+        let cut = e.delivered_frame().expect("one point delivered");
+        assert_eq!(
+            keys_of(Source::Rtds, &cut),
+            keys_of(Source::Rtds, &rtds_update(15_000))
+        );
+        assert!(cut.contains(r#""type":"subscribe""#), "venue shape kept");
+
+        // A CLOB array: a book and a two-entry price change, one entry of
+        // which node 0 already delivered.
+        let c1 = r#"{"asset_id":"a","price":"0.40","size":"5","side":"BUY","hash":"h1"}"#;
+        let c2 = r#"{"asset_id":"a","price":"0.41","size":"6","side":"BUY","hash":"h2"}"#;
+        let pc = |cs: &[&str]| {
+            format!(
+                r#"{{"event_type":"price_change","timestamp":"50","price_changes":[{}]}}"#,
+                cs.join(",")
+            )
+        };
+        let book = r#"{"event_type":"book","asset_id":"a","hash":"x","timestamp":"40","bids":[],"asks":[]}"#;
+        let clob = |seq, f: &str| wire::encode_ev(seq, Source::ClobBook, 0, false, f);
+        t.send(0, &clob(3, &pc(&[c1])));
+        t.send(1, &clob(2, &format!("[{book},{}]", pc(&[c1, c2]))));
+        let e = last_event(&t);
+        let v: Vec<Verdict> = e.keys.iter().map(|(_, v)| *v).collect();
+        assert_eq!(
+            v,
+            vec![Verdict::Deliver, Verdict::Duplicate, Verdict::Deliver]
+        );
+        let cut = e.delivered_frame().unwrap();
+        let mut want = keys_of(Source::ClobBook, book);
+        want.extend(keys_of(Source::ClobBook, &pc(&[c2])));
+        assert_eq!(keys_of(Source::ClobBook, &cut), want);
+        let mut view = BookView::new();
+        let items = view.admit_event(&e);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1]["price_changes"].as_array().unwrap().len(), 1);
+        assert_eq!(items[1]["price_changes"][0]["hash"], "h2");
+        assert_eq!(t.core.counters().mixed_frames, 2);
+
+        // A frame with nothing delivered gives nothing, a whole one itself.
+        t.send(1, &clob(3, &pc(&[c1])));
+        assert_eq!(last_event(&t).delivered_frame(), None);
+        assert!(view.admit_event(&last_event(&t)).is_empty());
+        t.send(0, &clob(4, &pc(&["{\"asset_id\":\"b\",\"price\":\"0.5\",\"size\":\"1\",\"side\":\"SELL\",\"hash\":\"h3\"}"])));
+        let e = last_event(&t);
+        assert_eq!(e.delivered_frame().as_deref(), Some(e.frame.as_str()));
+
+        // The point of the cut: a consumer applying whole frames applies
+        // the duplicate and late parts again; the cut applies each once.
+        assert!(!once_each(&applied(&t, true)));
+        let cut_all = applied(&t, false);
+        assert!(once_each(&cut_all));
+        let mut delivered: Vec<EventKey> = t.delivered().into_iter().map(|(_, k)| k).collect();
+        let mut got = cut_all.clone();
+        delivered.sort_by_key(|k| (k.ts_millis, k.id));
+        got.sort_by_key(|k| (k.ts_millis, k.id));
+        assert_eq!(got, delivered);
+    }
+
+    #[test]
+    fn a_cut_that_does_not_line_up_with_the_keys_gives_nothing() {
+        let f = rtds_history(&[1, 2]);
+        let mut keys: Vec<(EventKey, Verdict)> = keys_of(Source::Rtds, &f)
+            .into_iter()
+            .zip([Verdict::Deliver, Verdict::Duplicate])
+            .collect();
+        let e = |keys: Vec<(EventKey, Verdict)>| Event {
+            node: 0,
+            seq: 1,
+            src: Source::Rtds,
+            rx_micros: 0,
+            snap: false,
+            frame: f.clone(),
+            keys,
+        };
+        assert!(e(keys.clone()).delivered_frame().is_some());
+        keys.swap(0, 1);
+        assert_eq!(e(keys).delivered_frame(), None);
     }
 
     #[test]
