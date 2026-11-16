@@ -11,10 +11,22 @@
 //! segments, so a failover leaves no hole while the outage is shorter than
 //! the local retention.
 //!
-//! A slot is closed once it is at least two slots old and is not the slot
-//! the node's own writer has open. A slot with no local file is committed
-//! without an object and counted as a hole; with no committed head yet the
-//! archiver waits for local data instead.
+//! A slot is closed once it is at least two slots old and below the slot
+//! the node's own writer has open: the writer only ever adds to its open
+//! file, so every slot below it is final on disk. With no slot open (just
+//! booted, or pausing after a disk error) nothing is closed. A closed slot
+//! with no local file is committed without an object and counted as a
+//! hole; with no committed head yet the archiver waits for local data
+//! instead. A shipped slot whose files may miss frames (a writer killed or
+//! a file abandoned in it, or no writer already running when it began) is
+//! counted as partial and logged.
+//!
+//! A new leader's first commit is preceded by an overlap object: its own
+//! copy of the previous tenure's last slot, under its own epoch. Each node
+//! files a frame by its own receive time, so near a slot boundary the old
+//! leader can file an event one slot later than the new leader; the old
+//! leader's copy is then in no committed object and the new leader's copy
+//! is in the overlap. Readers merge an overlap with its slot by key.
 //!
 //! Every lease event is appended to `lease.jsonl` in the data directory.
 //! On stop the archiver releases the lease (holder null, epoch kept) and
@@ -26,6 +38,7 @@ use flate2::Compression;
 use ha::caslease::{self, CasLease, LeaseEvent};
 use ha::store::{FsStore, ObjectStore, PutOutcome};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -52,6 +65,9 @@ pub struct LeaseView {
     pub uploads: AtomicU64,
     pub upload_errors: AtomicU64,
     pub holes: AtomicU64,
+    /// Shipped slots whose local files may miss frames.
+    pub partials: AtomicU64,
+    pub overlaps: AtomicU64,
     pub unknown_outcomes: AtomicU64,
     /// The slot the node's segment writer has open, or `i64::MIN`.
     pub open_slot: AtomicI64,
@@ -77,6 +93,8 @@ impl Default for LeaseView {
             uploads: AtomicU64::new(0),
             upload_errors: AtomicU64::new(0),
             holes: AtomicU64::new(0),
+            partials: AtomicU64::new(0),
+            overlaps: AtomicU64::new(0),
             unknown_outcomes: AtomicU64::new(0),
             open_slot: AtomicI64::new(i64::MIN),
         }
@@ -114,7 +132,7 @@ fn wall_micros() -> i64 {
 }
 
 /// The slot number of a segment file name, `<slot>.<boot>.prec[.open]`.
-fn file_slot(name: &str) -> Option<i64> {
+pub fn file_slot(name: &str) -> Option<i64> {
     if !(name.ends_with(".prec") || name.ends_with(".prec.open")) {
         return None;
     }
@@ -132,6 +150,40 @@ fn slot_files(dir: &Path, slot: i64) -> Vec<PathBuf> {
         .collect();
     out.sort();
     out
+}
+
+/// Whether a slot's local files may miss frames: a writer was killed in it
+/// (a dead boot's `.open` file; the live writer's open slot is never
+/// shipped), a writer abandoned a file in it (a part file), or no boot with
+/// a file in it has a file in an earlier slot, so no writer was already
+/// running when it began.
+fn may_be_partial(dir: &Path, slot: i64, files: &[PathBuf]) -> bool {
+    let names: Vec<String> = files
+        .iter()
+        .filter_map(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .collect();
+    let cut = |n: &String| {
+        n.ends_with(".open") || n.split('.').nth(2).is_some_and(|p| p.starts_with('r'))
+    };
+    if names.iter().any(cut) {
+        return true;
+    }
+    let boots: HashSet<String> = names
+        .iter()
+        .filter_map(|n| n.split('.').nth(1))
+        .map(str::to_string)
+        .collect();
+    let earlier = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            file_slot(&n).is_some_and(|s| s < slot)
+                && n.split('.').nth(1).is_some_and(|b| boots.contains(b))
+        });
+    !earlier
 }
 
 /// The oldest slot with a local file.
@@ -197,6 +249,10 @@ impl Archiver {
             LeaseEvent::Fenced { epoch } => ("fenced", epoch, None),
             LeaseEvent::Released { epoch } => ("release", epoch, None),
         };
+        self.log_line(ev, epoch, slot);
+    }
+
+    fn log_line(&self, ev: &'static str, epoch: u64, slot: Option<i64>) {
         let line = LogLine {
             wall_ms: wall_micros() / 1_000,
             node: self.node,
@@ -222,8 +278,14 @@ impl Archiver {
     /// leads.
     fn archive_pass(&mut self, start: Instant) {
         let now_slot = wall_micros().div_euclid(self.slot_micros);
-        let newest = now_slot - 2;
         let open = self.view.open_slot.load(Relaxed);
+        if open == i64::MIN {
+            // Just booted, or pausing after a disk error: frames may still
+            // be queued for any slot.
+            return;
+        }
+        let newest = (now_slot - 2).min(open - 1);
+        let floor = now_slot - 2 - self.lookback + 1;
         loop {
             if !self.lease.can_commit(Self::now(start)) {
                 return;
@@ -231,29 +293,52 @@ impl Archiver {
             let Some(epoch) = self.lease.held_epoch() else {
                 return;
             };
-            let next = match self.lease.committed_to() {
+            let committed = self.lease.committed_to();
+            let next = match committed {
                 Some(c) => c + 1,
                 None => match oldest_slot(&self.seg_dir) {
                     Some(s) => s,
                     None => return,
                 },
             };
-            let next = next.max(newest - self.lookback + 1);
-            if next > newest || next == open {
+            let next = next.max(floor);
+            if next > newest {
                 return;
             }
-            let skipped = next - self.lease.committed_to().map_or(next, |c| c + 1);
+            // Before this epoch's first commit, its copy of the slot the
+            // previous tenure ended on.
+            let first = self
+                .lease
+                .last_head()
+                .and_then(|h| h.tenures.last())
+                .is_none_or(|t| t.e != epoch);
+            if let (true, Some(c)) = (first, committed) {
+                let files = slot_files(&self.seg_dir, c);
+                if !files.is_empty() {
+                    if !self.upload(epoch, c, &files) {
+                        return;
+                    }
+                    self.view.overlaps.fetch_add(1, Relaxed);
+                    self.log_line("overlap", epoch, Some(c));
+                }
+            }
+            let skipped = next - committed.map_or(next, |c| c + 1);
             let files = slot_files(&self.seg_dir, next);
             if files.is_empty() {
-                if self.lease.committed_to().is_none() {
+                if committed.is_none() {
                     return;
                 }
                 self.view.holes.fetch_add(1 + skipped as u64, Relaxed);
+                self.log_line("hole", epoch, Some(next));
             } else {
                 if !self.upload(epoch, next, &files) {
                     return;
                 }
                 self.view.holes.fetch_add(skipped as u64, Relaxed);
+                if may_be_partial(&self.seg_dir, next, &files) {
+                    self.view.partials.fetch_add(1, Relaxed);
+                    self.log_line("partial", epoch, Some(next));
+                }
             }
             self.lease.commit(next);
             self.drive(start);
@@ -367,6 +452,119 @@ mod tests {
         let (recs, err) = feeds::recording::read_bytes(&raw);
         assert!(err.is_none());
         assert_eq!(recs.len(), 5);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    fn archiver(d: &Path, node: u32, slot_micros: i64, view: Arc<LeaseView>) -> Archiver {
+        Archiver {
+            lease: CasLease::new(Config::new(node, node as u64)),
+            store: FsStore::open(d.join("store")).unwrap(),
+            seg_dir: d.join("seg"),
+            tmp_dir: d.join("tmp"),
+            log: d.join("lease.jsonl"),
+            node,
+            slot_micros,
+            lookback: 60,
+            view,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// An hour, so the wall-clock slot does not roll during a test.
+    const HOUR: i64 = 3_600_000_000;
+
+    #[test]
+    fn nothing_at_or_above_the_writers_open_slot_is_committed() {
+        let d = scratch("open");
+        let seg = d.join("seg");
+        std::fs::create_dir_all(&seg).unwrap();
+        let now_slot = wall_micros().div_euclid(HOUR);
+        write_seg(&seg.join(format!("{}.aaaa.prec", now_slot - 6)), 3, false);
+        write_seg(&seg.join(format!("{}.aaaa.prec", now_slot - 5)), 3, false);
+        write_seg(&seg.join(format!("{}.bbbb.prec", now_slot - 5)), 3, false);
+        // A boot that started and was killed inside now-4.
+        write_seg(
+            &seg.join(format!("{}.cccc.prec.open", now_slot - 4)),
+            3,
+            true,
+        );
+        let view = Arc::new(LeaseView::default());
+        let mut a = archiver(&d, 1, HOUR, view.clone());
+        std::fs::create_dir_all(&a.tmp_dir).unwrap();
+        let start = view.start;
+        a.drive(start);
+        assert_eq!(a.lease.held_epoch(), Some(1));
+        // Just booted: no slot open, so frames may be queued for any slot.
+        a.archive_pass(start);
+        assert_eq!(a.lease.committed_to(), None);
+        // The writer is behind, with now-4 open: now-3 and now-2 are not
+        // written yet and must not be committed as holes.
+        view.open_slot.store(now_slot - 4, Relaxed);
+        a.archive_pass(start);
+        assert_eq!(a.lease.committed_to(), Some(now_slot - 5));
+        assert_eq!(view.holes.load(Relaxed), 0);
+        // now-6 began before any writer here was running.
+        assert_eq!(view.partials.load(Relaxed), 1);
+        // The writer moves on: now-3 and now-2 are final and empty.
+        view.open_slot.store(now_slot, Relaxed);
+        a.archive_pass(start);
+        assert_eq!(a.lease.committed_to(), Some(now_slot - 2));
+        assert_eq!(view.holes.load(Relaxed), 2);
+        // now-4 holds a killed writer's file.
+        assert_eq!(view.partials.load(Relaxed), 2);
+        assert_eq!(view.overlaps.load(Relaxed), 0);
+        let log = std::fs::read_to_string(d.join("lease.jsonl")).unwrap();
+        assert_eq!(log.matches("\"partial\"").count(), 2);
+        assert_eq!(log.matches("\"hole\"").count(), 2);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_new_leader_ships_its_copy_of_the_previous_last_slot_as_an_overlap() {
+        let d = scratch("overlap");
+        let seg = d.join("seg");
+        std::fs::create_dir_all(&seg).unwrap();
+        let now_slot = wall_micros().div_euclid(HOUR);
+        for s in now_slot - 7..=now_slot - 2 {
+            write_seg(&seg.join(format!("{s}.bbbb.prec")), 2, false);
+        }
+        // Node 1 led epoch 1 up to now-6 and released.
+        let store = FsStore::open(d.join("store")).unwrap();
+        let prev = Head {
+            v: 1,
+            epoch: 1,
+            holder: None,
+            ttl_ms: 30_000,
+            nonce: "n".into(),
+            tenures: vec![caslease::Tenure {
+                e: 1,
+                n: 1,
+                from: now_slot - 8,
+                to: now_slot - 6,
+            }],
+        };
+        assert!(matches!(
+            store.write_head(&prev.encode(), &ha::store::Cond::IfNoneMatch),
+            ha::store::WriteOutcome::Done(_)
+        ));
+        let view = Arc::new(LeaseView::default());
+        view.open_slot.store(now_slot, Relaxed);
+        let mut a = archiver(&d, 2, HOUR, view.clone());
+        std::fs::create_dir_all(&a.tmp_dir).unwrap();
+        let start = view.start;
+        a.drive(start);
+        assert_eq!(a.lease.held_epoch(), Some(2));
+        a.archive_pass(start);
+        assert_eq!(a.lease.committed_to(), Some(now_slot - 2));
+        let (body, _) = store.read_head().unwrap().unwrap();
+        let head = Head::decode(&body).unwrap();
+        assert_eq!(head.tenures[1].from, now_slot - 5);
+        let names = store.list("seg/").unwrap();
+        assert!(names.contains(&caslease::object_name(2, now_slot - 6)));
+        let v = caslease::read_archive(&head, &names);
+        // Slots now-8 to now-6 have no epoch-1 objects in this store.
+        assert_eq!((v.archived, v.holes, v.overlaps, v.orphans), (4, 3, 1, 0));
+        assert_eq!(view.overlaps.load(Relaxed), 1);
         let _ = std::fs::remove_dir_all(d);
     }
 

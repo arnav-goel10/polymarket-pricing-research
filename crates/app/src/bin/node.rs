@@ -556,6 +556,8 @@ async fn metrics(State(ctx): State<Arc<Ctx>>) -> impl IntoResponse {
         v.upload_errors.load(Relaxed),
     );
     line("poly_archive_holes_total", v.holes.load(Relaxed));
+    line("poly_archive_partial_total", v.partials.load(Relaxed));
+    line("poly_archive_overlaps_total", v.overlaps.load(Relaxed));
     for m in ctx.health.all() {
         let snap = m.snapshot();
         let _ = writeln!(
