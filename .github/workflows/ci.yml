@@ -56,15 +56,18 @@ jobs:
       - name: Seeded faults, each caught by name
         run: |
           fail=0
+          # Kill a, freeze b, cut a: one fault of each kind.
           m() {
-            scripts/chaos_case.sh "$1" "$2" --seed 3 --rate 200 --faults 2 --gap-ms 3000 --mutant "$1" || fail=1
+            scripts/chaos_case.sh "$1" "$2" --seed 3 --rate 200 --faults "${3:-3}" --gap-ms 3000 --mutant "$1" || fail=1
           }
           m no-dedup duplicate
           m single-node missing
           m no-reconnect missing
           m seq-skip seq_gap
+          # A resume only shows a stale answer when the node is ahead of the
+          # client, which the cut gives: the node keeps ingesting.
           m stale-resume resume
-          m overlap-kill missing
+          m overlap-kill missing 2
           # Control: a node that resends frames under fresh seqs must pass,
           # with the repeats dropped by key.
           m dup-frame pass+self_repeats

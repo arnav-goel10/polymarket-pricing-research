@@ -6,7 +6,7 @@
 //! | File | Written by | What |
 //! | --- | --- | --- |
 //! | `plan.json` | `plan`, `local` | the faults to run |
-//! | `faults.jsonl` | the harness | each fault as executed, with when its node was ready again |
+//! | `faults.jsonl` | the harness | each fault as executed, with when it recovered |
 //! | `harness.json` | the harness | `invalid` when the run cannot count (A7) |
 //! | `client.json` | `client`, `local` | client counters, merger totals, connection changes |
 //! | `log.jsonl` | `client`, `local` | the delivered log: every Deliver and Late verdict. Private, never an artifact |
@@ -66,6 +66,10 @@ pub enum FaultKind {
     Kill9,
     /// SIGSTOP, then SIGCONT after `freeze_ms`.
     Freeze,
+    /// The client's connection to the node is cut on the path between
+    /// them; the node keeps running. Its recovery is the client live on it
+    /// again.
+    Cut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,9 +102,9 @@ fn mix(seed: u64, i: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Faults alternate nodes, and kinds go kill, freeze, freeze, kill, so each
-/// node gets both kinds. Fault i is due `1 s + i * gap` after T0 plus a
-/// jitter below a quarter gap from the seed.
+/// Faults alternate nodes, and kinds go kill, freeze, cut, kill, freeze,
+/// cut, so over six faults each node gets every kind. Fault i is due
+/// `1 s + i * gap` after T0 plus a jitter below a quarter gap from the seed.
 pub fn plan(
     seed: u64,
     faults: usize,
@@ -112,9 +116,10 @@ pub fn plan(
     let overlap = mutant == Some(OVERLAP_KILL);
     let faults = (0..faults)
         .map(|i| {
-            let kind = match (overlap, i % 4) {
-                (true, _) | (false, 0 | 3) => FaultKind::Kill9,
-                _ => FaultKind::Freeze,
+            let kind = match (overlap, i % 3) {
+                (true, _) | (false, 0) => FaultKind::Kill9,
+                (false, 1) => FaultKind::Freeze,
+                _ => FaultKind::Cut,
             };
             let at_ms = if overlap {
                 1_000 + 300 * i as i64
@@ -145,7 +150,8 @@ pub struct Executed {
     pub kind: FaultKind,
     pub at_wall_ms: i64,
     pub at_mono_ms: i64,
-    /// When the node's `/readyz` answered 200 again.
+    /// When the node's `/readyz` answered 200 again (for a cut, when the
+    /// client was live on it again).
     pub recovered_wall_ms: i64,
     pub recovered_mono_ms: i64,
 }
@@ -379,6 +385,7 @@ pub struct FaultCounts {
     pub executed: usize,
     pub kill9: usize,
     pub freeze: usize,
+    pub cut: usize,
     pub observed: usize,
 }
 
@@ -516,7 +523,12 @@ pub fn verify(inp: &Inputs) -> Report {
         .iter()
         .filter(|e| e.kind == FaultKind::Kill9)
         .count();
-    r.faults.freeze = r.faults.executed - r.faults.kill9;
+    r.faults.freeze = inp
+        .executed
+        .iter()
+        .filter(|e| e.kind == FaultKind::Freeze)
+        .count();
+    r.faults.cut = r.faults.executed - r.faults.kill9 - r.faults.freeze;
 
     let invalid = inp.harness.invalid.clone().or_else(|| {
         inp.client
@@ -865,7 +877,8 @@ mod tests {
         assert!(r.verdict.failures.contains(&"vacuous".to_string()));
 
         // A6 counters, each by name, and first in the order.
-        let cases: [(&str, fn(&mut Counters)); 3] = [
+        type Set = fn(&mut Counters);
+        let cases: [(&str, Set); 3] = [
             ("seq_gap", |c| c.seq_gaps = 1),
             ("resume", |c| c.resume_violations = 1),
             ("unkeyed", |c| c.unkeyed = 1),
@@ -958,12 +971,12 @@ mod tests {
             vec![
                 (0, Kill9),
                 (1, Freeze),
-                (0, Freeze),
+                (0, Cut),
                 (1, Kill9),
-                (0, Kill9),
-                (1, Freeze),
                 (0, Freeze),
-                (1, Kill9)
+                (1, Cut),
+                (0, Kill9),
+                (1, Freeze)
             ]
         );
         assert!(p

@@ -19,7 +19,9 @@
 //! Before each fault the other node's `/readyz` must have answered 200 for
 //! 500 ms, and the harness waits up to 10 s for the client to be live on
 //! it (a client that never rehedges still meets the fault). `kill9` is
-//! SIGKILL and a respawn 1 s later; `freeze` is SIGSTOP then SIGCONT.
+//! SIGKILL and a respawn 1 s later; `freeze` is SIGSTOP then SIGCONT; `cut`
+//! drops the client's connection in a loopback relay that sits between the
+//! client and each node, while the node keeps running.
 //!
 //! Exit 0 pass, 1 fail (the reason is printed and in `report.json`),
 //! 2 invalid: a node exited on its own, a peer never became ready, or the
@@ -386,6 +388,7 @@ fn stop_child(child: &mut Child) {
 }
 
 struct NodeProc {
+    proxy: Arc<Proxy>,
     bin: PathBuf,
     args: Vec<String>,
     mutant: Option<&'static str>,
@@ -497,16 +500,77 @@ async fn ready_for(http: SocketAddr, hold: Duration, limit: Duration) -> bool {
 
 type Shared = Arc<tokio::sync::Mutex<NodeProc>>;
 
+/// A loopback TCP relay between the client and one node, so the harness
+/// can cut the path between them while the node keeps running.
+#[derive(Default)]
+struct Proxy {
+    conns: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl Proxy {
+    async fn start(target: SocketAddr) -> std::io::Result<(Arc<Proxy>, u16)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let proxy = Arc::new(Proxy::default());
+        let p = proxy.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut down, _)) = listener.accept().await else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                };
+                let _ = down.set_nodelay(true);
+                let relay = tokio::spawn(async move {
+                    if let Ok(mut up) = tokio::net::TcpStream::connect(target).await {
+                        let _ = up.set_nodelay(true);
+                        let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+                    }
+                });
+                let mut conns = p.conns.lock().unwrap_or_else(|e| e.into_inner());
+                conns.retain(|h| !h.is_finished());
+                conns.push(relay.abort_handle());
+            }
+        });
+        Ok((proxy, port))
+    }
+
+    /// Drop every relayed connection. Returns how many there were.
+    fn cut(&self) -> usize {
+        let conns = std::mem::take(&mut *self.conns.lock().unwrap_or_else(|e| e.into_inner()));
+        for h in &conns {
+            h.abort();
+        }
+        conns.len()
+    }
+}
+
 async fn execute(
     node: Shared,
     idx: usize,
     kind: FaultKind,
     freeze_ms: u64,
     epoch: Instant,
+    mut live: watch::Receiver<Vec<bool>>,
 ) -> Result<Executed, String> {
     let mut n = node.lock().await;
     let at_wall_ms = wall_ms();
     let at_mono_ms = mono_ms(epoch, Instant::now());
+    if kind == FaultKind::Cut {
+        n.proxy.cut();
+        drop(n);
+        // Recovered once the client is live on the node again, or after
+        // 10 s for a client that does not come back.
+        let _ = tokio::time::timeout(Duration::from_secs(2), live.wait_for(|l| !l[idx])).await;
+        let _ = tokio::time::timeout(Duration::from_secs(10), live.wait_for(|l| l[idx])).await;
+        return Ok(Executed {
+            node: idx,
+            kind,
+            at_wall_ms,
+            at_mono_ms,
+            recovered_wall_ms: wall_ms(),
+            recovered_mono_ms: mono_ms(epoch, Instant::now()),
+        });
+    }
     match kind {
         FaultKind::Kill9 => {
             n.kill9();
@@ -519,6 +583,7 @@ async fn execute(
             tokio::time::sleep(Duration::from_millis(freeze_ms)).await;
             signal(pid, "CONT")?;
         }
+        FaultKind::Cut => {}
     }
     let http = n.http;
     drop(n);
@@ -571,6 +636,7 @@ async fn drive(
                 f.kind,
                 f.freeze_ms,
                 epoch,
+                live.clone(),
             )));
         }
         for t in tasks {
@@ -592,8 +658,9 @@ async fn drive(
                 let _ = tokio::time::timeout(Duration::from_secs(10), live.wait_for(|l| l[other]))
                     .await;
             }
-            executed
-                .push(execute(nodes[f.node].clone(), f.node, f.kind, f.freeze_ms, epoch).await?);
+            let node = nodes[f.node].clone();
+            let done = execute(node, f.node, f.kind, f.freeze_ms, epoch, live.clone()).await?;
+            executed.push(done);
         }
     }
     let last = executed
@@ -720,7 +787,10 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
             "--token".into(),
             token.clone(),
         ];
+        let target: SocketAddr = format!("127.0.0.1:{stream}").parse().expect("addr");
+        let (proxy, relay) = Proxy::start(target).await.map_err(|e| e.to_string())?;
         let mut n = NodeProc {
+            proxy,
             bin: bins.join("node"),
             args,
             mutant: node_mutant,
@@ -729,7 +799,8 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
             child: None,
         };
         n.start()?;
-        urls.push(format!("ws://127.0.0.1:{stream}"));
+        // The client reaches each node through its relay.
+        urls.push(format!("ws://127.0.0.1:{relay}"));
         nodes.push(Arc::new(tokio::sync::Mutex::new(n)));
     }
 
