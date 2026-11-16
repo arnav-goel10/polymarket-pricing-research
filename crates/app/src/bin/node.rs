@@ -5,7 +5,8 @@
 //!     [--listen 127.0.0.1:9100] [--http 127.0.0.1:9101] [--keep-slots 60]
 //!     [--ring-frames 200000] [--ring-bytes 67108864]
 //!     [--rtds-url URL] [--binance-url URL] [--clob-url URL] [--token ID]
-//!     [--store DIR] [--slot-ms 60000] [--lease-timing TTL,RENEW,POLL,HOLD,TAKE]
+//!     [--store DIR | --azure-store URL] [--slot-ms 60000]
+//!     [--lease-timing TTL,RENEW,POLL,HOLD,TAKE] [--azure-selftest ID]
 //!
 //! Every frame, in order: append to the open segment, compute its keys,
 //! push it to the ring (see `ha::ring`), which numbers venue frames. Clients
@@ -30,6 +31,12 @@
 //! leads, and reports the epoch and leadership in `hb`, `/ha` and
 //! `/metrics`. `--lease-timing` sets ttl, renew, poll, holder margin and
 //! takeover margin in milliseconds (default 30000,10000,5000,2000,1000).
+//! `--azure-store https://<account>.blob.core.windows.net` puts the lease
+//! and the archive on Blob Storage instead (`ha::azure`), signed with the
+//! VM's managed identity; `POLY_AZURE_CLIENT_ID` names the identity when
+//! the VM has several. With `--azure-selftest ID` the node only runs the
+//! store contract suite under `selftest/ID/` in the archive container and
+//! exits 0 or 1.
 //!
 //! On start the node prints one line, `node <id> boot <hex> stream <addr>
 //! http <addr>`, with the bound addresses. On SIGINT or SIGTERM it sends
@@ -51,10 +58,11 @@ use axum::Router;
 use feeds::recorder::queue;
 use feeds::recording::Source;
 use futures_util::{SinkExt, Stream, StreamExt};
+use ha::azure::{AzureConfig, AzureStore};
 use ha::caslease::{self, CasLease, LeaseMutant, Timing};
 use ha::key::{frame_keys, EventKey};
 use ha::ring::{Plan, Ring, RingConfig};
-use ha::store::FsStore;
+use ha::store::{FsStore, HeadStore, ObjectStore};
 use ha::wire::{self, Boot, ByeReason, Mode, NodeMsg};
 use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
@@ -121,6 +129,8 @@ struct Args {
     ring: RingConfig,
     urls: FeedUrls,
     store: Option<PathBuf>,
+    azure: Option<AzureConfig>,
+    azure_selftest: Option<String>,
     slot_ms: i64,
     timing: Timing,
 }
@@ -154,6 +164,8 @@ fn parse_args() -> Result<Args, String> {
         ring: RingConfig::default(),
         urls: FeedUrls::default(),
         store: None,
+        azure: None,
+        azure_selftest: None,
         slot_ms: 60_000,
         timing: Timing::default(),
     };
@@ -175,6 +187,16 @@ fn parse_args() -> Result<Args, String> {
             "--clob-url" => a.urls.clob = val()?,
             "--token" => a.urls.token = Some(val()?),
             "--store" => a.store = Some(PathBuf::from(val()?)),
+            "--azure-store" => {
+                // The identity to ask a token for, when the VM has several.
+                let id = std::env::var("POLY_AZURE_CLIENT_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty());
+                let cfg = AzureConfig::new(&val()?, id);
+                cfg.validate()?;
+                a.azure = Some(cfg);
+            }
+            "--azure-selftest" => a.azure_selftest = Some(val()?),
             "--slot-ms" => a.slot_ms = val()?.parse().map_err(|_| bad("--slot-ms"))?,
             "--lease-timing" => {
                 a.timing = parse_timing(&val()?).ok_or_else(|| bad("--lease-timing"))?
@@ -187,6 +209,12 @@ fn parse_args() -> Result<Args, String> {
             "--listen {} is not loopback; the stream is served on loopback only",
             a.listen
         ));
+    }
+    if a.store.is_some() && a.azure.is_some() {
+        return Err("--store and --azure-store cannot both be given".into());
+    }
+    if a.azure_selftest.is_some() && a.azure.is_none() {
+        return Err("--azure-selftest needs --azure-store".into());
     }
     if a.keep_slots < 1 || a.ring.max_frames < 1 || a.slot_ms < 1_000 {
         return Err(
@@ -573,6 +601,70 @@ fn ensure_dir(p: &Path) -> io::Result<()> {
     std::fs::create_dir_all(p)
 }
 
+/// Everything an archiver needs but its store.
+struct ArchiveParts {
+    lease: CasLease,
+    data: PathBuf,
+    node: u32,
+    slot_micros: i64,
+    view: Arc<LeaseView>,
+    stop: Arc<AtomicBool>,
+}
+
+fn build_archiver<S: HeadStore + ObjectStore>(store: S, p: ArchiveParts) -> Archiver<S> {
+    Archiver {
+        lease: p.lease,
+        store,
+        seg_dir: p.data.join("seg"),
+        tmp_dir: p.data.join("archive-tmp"),
+        log: p.data.join("lease.jsonl"),
+        node: p.node,
+        slot_micros: p.slot_micros,
+        lookback: 60,
+        view: p.view,
+        stop: p.stop,
+    }
+}
+
+/// Run the store contract suite against the deployed account, with its
+/// HEAD and its objects under `selftest/<id>/` in the archive container, so
+/// the real HEAD is never touched. Returns the process exit code.
+fn azure_selftest(mut cfg: AzureConfig, id: &str, data: &Path) -> i32 {
+    let ok = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !ok {
+        eprintln!("node: --azure-selftest takes letters, digits, - and _");
+        return 2;
+    }
+    let prefix = format!("selftest/{id}/");
+    cfg.head_container = cfg.object_container.clone();
+    cfg.head_blob = format!("{prefix}HEAD.json");
+    let scratch = data.join("selftest-tmp");
+    // The store makes blocking calls, so it lives on a plain thread.
+    let run = std::thread::spawn(move || {
+        let store = AzureStore::new(cfg)?;
+        let out = ha::store::contract_suite(&store, &scratch, &prefix);
+        let _ = std::fs::remove_dir_all(&scratch);
+        out
+    });
+    match run.join() {
+        Ok(Ok(())) => {
+            println!("azure selftest ok: conditional writes hold under selftest/{id}/");
+            0
+        }
+        Ok(Err(e)) => {
+            eprintln!("azure selftest FAILED: {e}");
+            1
+        }
+        Err(_) => {
+            eprintln!("azure selftest FAILED: the store thread panicked");
+            1
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     tracing_subscriber::fmt()
@@ -596,6 +688,9 @@ async fn main() -> Result<(), BoxError> {
             std::process::exit(2);
         }
     };
+    if let (Some(cfg), Some(id)) = (&args.azure, &args.azure_selftest) {
+        std::process::exit(azure_selftest(cfg.clone(), id, &args.data));
+    }
     if mutant != Mutant::None {
         warn!(?mutant, "running with a seeded fault");
     }
@@ -649,36 +744,45 @@ async fn main() -> Result<(), BoxError> {
     });
 
     let stop_archiver = Arc::new(AtomicBool::new(false));
-    let archiver = match &args.store {
-        None => None,
-        Some(dir) => {
-            let store = FsStore::open(dir)?;
-            let mut lcfg =
-                caslease::Config::new(args.node, random_boot().0 ^ boot.0).with_timing(args.timing);
-            // Tenures older than three days are dropped.
-            lcfg.keep_slots = (3 * 24 * 3_600_000 / args.slot_ms).max(1);
-            let lease_mutant = match mutant {
-                Mutant::Lease(m) => m,
-                _ => LeaseMutant::None,
-            };
-            #[cfg(feature = "mutants")]
-            let lcfg = lcfg.with_mutant(lease_mutant);
-            #[cfg(not(feature = "mutants"))]
-            let _ = lease_mutant;
-            let a = Archiver {
-                lease: CasLease::new(lcfg),
-                store,
-                seg_dir: args.data.join("seg"),
-                tmp_dir: args.data.join("archive-tmp"),
-                log: args.data.join("lease.jsonl"),
-                node: args.node,
-                slot_micros,
-                lookback: 60,
-                view: view.clone(),
-                stop: stop_archiver.clone(),
-            };
-            Some(std::thread::spawn(move || a.run()))
+    let archiver = if args.store.is_some() || args.azure.is_some() {
+        let mut lcfg =
+            caslease::Config::new(args.node, random_boot().0 ^ boot.0).with_timing(args.timing);
+        // Tenures older than three days are dropped.
+        lcfg.keep_slots = (3 * 24 * 3_600_000 / args.slot_ms).max(1);
+        let lease_mutant = match mutant {
+            Mutant::Lease(m) => m,
+            _ => LeaseMutant::None,
+        };
+        #[cfg(feature = "mutants")]
+        let lcfg = lcfg.with_mutant(lease_mutant);
+        #[cfg(not(feature = "mutants"))]
+        let _ = lease_mutant;
+        let parts = ArchiveParts {
+            lease: CasLease::new(lcfg),
+            data: args.data.clone(),
+            node: args.node,
+            slot_micros,
+            view: view.clone(),
+            stop: stop_archiver.clone(),
+        };
+        match (&args.store, args.azure.clone()) {
+            (Some(dir), _) => {
+                let a = build_archiver(FsStore::open(dir)?, parts);
+                Some(std::thread::spawn(move || a.run()))
+            }
+            // The Blob store makes blocking calls, so it is built on the
+            // archiver's own thread, never on the runtime.
+            (None, Some(cfg)) => Some(std::thread::spawn(move || match AzureStore::new(cfg) {
+                Ok(store) => build_archiver(store, parts).run(),
+                Err(e) => {
+                    eprintln!("node: {e}");
+                    std::process::exit(2);
+                }
+            })),
+            (None, None) => None,
         }
+    } else {
+        None
     };
 
     let stream = TcpListener::bind(args.listen).await?;

@@ -36,7 +36,7 @@ use feeds::recording::{RecordReader, RecordWriter};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use ha::caslease::{self, CasLease, LeaseEvent};
-use ha::store::{FsStore, ObjectStore, PutOutcome};
+use ha::store::{HeadStore, ObjectStore, PutOutcome};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::File;
@@ -101,9 +101,11 @@ impl Default for LeaseView {
     }
 }
 
-pub struct Archiver {
+/// The archiver over any store: the directory store in CI, Blob Storage on
+/// a VM.
+pub struct Archiver<S> {
     pub lease: CasLease,
-    pub store: FsStore,
+    pub store: S,
     pub seg_dir: PathBuf,
     pub tmp_dir: PathBuf,
     pub log: PathBuf,
@@ -219,7 +221,7 @@ pub fn gzip_slot(files: &[PathBuf], out: &Path) -> io::Result<u64> {
     Ok(n)
 }
 
-impl Archiver {
+impl<S: HeadStore + ObjectStore> Archiver<S> {
     fn now(start: Instant) -> u64 {
         start.elapsed().as_millis() as u64
     }
@@ -409,7 +411,7 @@ mod tests {
     use super::*;
     use feeds::recording::Source;
     use ha::caslease::{Config, Head};
-    use ha::store::HeadStore;
+    use ha::store::FsStore;
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("archiver-{}-{name}", std::process::id()));
@@ -455,7 +457,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(d);
     }
 
-    fn archiver(d: &Path, node: u32, slot_micros: i64, view: Arc<LeaseView>) -> Archiver {
+    fn archiver(d: &Path, node: u32, slot_micros: i64, view: Arc<LeaseView>) -> Archiver<FsStore> {
         Archiver {
             lease: CasLease::new(Config::new(node, node as u64)),
             store: FsStore::open(d.join("store")).unwrap(),
