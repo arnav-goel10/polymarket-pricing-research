@@ -66,6 +66,62 @@ impl FeedHealth {
     }
 }
 
+/// Whether the recorder queue is keeping up, for `/readyz`.
+///
+/// A frame the queue drops never reaches the ring, so it gets no `seq` and
+/// a client cannot see the loss on the wire. A writer stalled on the disk
+/// stops the stream while `hb` keeps coming. Neither shows in the stream,
+/// so the node reports itself not ready instead: for [`DROP_HOLD`] after
+/// any rise in the drop count, and while the queue holds more than a
+/// sixteenth of its capacity (4,096 of 65,536 frames, about 2 s at the
+/// measured rate; it is near zero when the writer keeps up).
+#[derive(Debug, Default)]
+pub struct Backlog {
+    dropped: u64,
+    rose_at: Option<std::time::Instant>,
+}
+
+pub const DROP_HOLD: Duration = Duration::from_secs(5);
+
+impl Backlog {
+    pub fn healthy(
+        &mut self,
+        now: std::time::Instant,
+        dropped: u64,
+        depth: u64,
+        capacity: u64,
+    ) -> bool {
+        if dropped > self.dropped {
+            self.dropped = dropped;
+            self.rose_at = Some(now);
+        }
+        let recent = self
+            .rose_at
+            .is_some_and(|t| now.saturating_duration_since(t) < DROP_HOLD);
+        !recent && depth.saturating_mul(16) <= capacity
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn a_drop_or_a_deep_queue_makes_the_node_not_ready() {
+        let mut b = Backlog::default();
+        let t = Instant::now();
+        let s = |ms| t + Duration::from_millis(ms);
+        assert!(b.healthy(t, 0, 0, 65_536));
+        assert!(b.healthy(s(10), 0, 4_096, 65_536));
+        assert!(!b.healthy(s(20), 0, 4_097, 65_536), "a stalled writer");
+        assert!(!b.healthy(s(30), 3, 0, 65_536), "a drop");
+        assert!(!b.healthy(s(5_029), 3, 0, 65_536));
+        assert!(b.healthy(s(5_030), 3, 0, 65_536), "held 5 s, then clear");
+        assert!(!b.healthy(s(6_000), 4, 0, 65_536), "a later drop again");
+    }
+}
+
 fn opts(metrics: Option<&Arc<FeedMetrics>>) -> ConnOpts {
     match metrics {
         Some(m) => ConnOpts::with_metrics(m.clone()),

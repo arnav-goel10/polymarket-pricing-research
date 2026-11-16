@@ -41,7 +41,7 @@
 //! start when it is set.
 
 use app::archiver::{Archiver, LeaseView};
-use app::ingest::{shutdown_signal, spawn_feeds, FeedHealth, FeedUrls};
+use app::ingest::{shutdown_signal, spawn_feeds, Backlog, FeedHealth, FeedUrls};
 use app::segments::{self, SegStats, Segments};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -265,7 +265,24 @@ struct Ctx {
     seg: Arc<SegStats>,
     health: FeedHealth,
     recorder: Arc<feeds::recorder::RecorderStats>,
+    backlog: Mutex<Backlog>,
     view: Arc<LeaseView>,
+}
+
+impl Ctx {
+    /// Whether the recorder queue keeps up (see [`Backlog`]).
+    fn recorder_healthy(&self) -> bool {
+        let r = &self.recorder;
+        self.backlog
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .healthy(
+                Instant::now(),
+                r.dropped.load(Relaxed),
+                r.queue_depth(),
+                r.capacity.load(Relaxed),
+            )
+    }
 }
 
 async fn accept_loop(listener: TcpListener, ctx: Arc<Ctx>) {
@@ -470,7 +487,7 @@ async fn healthz() -> &'static str {
 }
 
 async fn readyz(State(ctx): State<Arc<Ctx>>) -> impl IntoResponse {
-    if ctx.health.all_connected() && !*ctx.shutdown.borrow() {
+    if ctx.health.all_connected() && ctx.recorder_healthy() && !*ctx.shutdown.borrow() {
         (StatusCode::OK, "ready\n")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready\n")
@@ -625,6 +642,7 @@ async fn main() -> Result<(), BoxError> {
         seg: seg_stats,
         health: health.clone(),
         recorder: rec.stats.clone(),
+        backlog: Mutex::new(Backlog::default()),
         view: view.clone(),
     });
 
