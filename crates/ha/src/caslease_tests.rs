@@ -469,6 +469,28 @@ fn the_reader_rule_counts_holes_and_orphans() {
     // A fenced epoch-1 writer kept uploading 13 and 15: never a winner.
     assert_eq!(v.orphans, 2);
     assert_eq!(v.foreign, 1);
+    assert_eq!(v.overlaps, 0);
+
+    // Epoch 2's copy of slot 12, the slot before its tenure, is an overlap;
+    // its copy of 11 is an orphan.
+    let names: Vec<String> = [
+        (1, 10),
+        (1, 11),
+        (1, 12),
+        (2, 12),
+        (2, 11),
+        (2, 13),
+        (2, 14),
+    ]
+    .iter()
+    .map(|&(e, s)| object_name(e, s))
+    .collect();
+    let v = read_archive(&h, &names);
+    assert_eq!((v.archived, v.holes, v.overlaps, v.orphans), (5, 0, 1, 1));
+    assert_eq!(object_role(&h, 2, 12), ObjectRole::Overlap);
+    assert_eq!(object_role(&h, 1, 12), ObjectRole::Archived);
+    assert_eq!(object_role(&h, 2, 11), ObjectRole::Orphan);
+    assert_eq!(object_role(&h, 3, 14), ObjectRole::Orphan);
 }
 
 // ---------------------------------------------------------------------

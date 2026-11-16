@@ -981,6 +981,10 @@ pub struct ArchiveView {
     pub archived: u64,
     /// Covered slots with no object.
     pub holes: u64,
+    /// Overlap objects: an epoch's copy of the slot just before its tenure,
+    /// shipped from the new leader's own files when it took over. A reader
+    /// merges one with that slot's archived object by key.
+    pub overlaps: u64,
     /// Objects outside their epoch's tenure range: writes from a fenced
     /// epoch that HEAD never referenced.
     pub orphans: u64,
@@ -990,8 +994,47 @@ pub struct ArchiveView {
     pub foreign: u64,
 }
 
+/// What the object for `(epoch, slot)` is to a reader of `head`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectRole {
+    /// The slot's archived object: exactly one tenure covers the slot and
+    /// it is this epoch's.
+    Archived,
+    /// This epoch's overlap copy of the slot before its tenure.
+    Overlap,
+    /// Neither: never trusted.
+    Orphan,
+}
+
+/// The tenures covering `slot`.
+fn covering(head: &Head, slot: i64) -> impl Iterator<Item = &Tenure> {
+    head.tenures
+        .iter()
+        .filter(move |t| t.from <= slot && slot <= t.to)
+}
+
+pub fn object_role(head: &Head, epoch: u64, slot: i64) -> ObjectRole {
+    let mut c = covering(head, slot);
+    if let (Some(t), None) = (c.next(), c.next()) {
+        if t.e == epoch {
+            return ObjectRole::Archived;
+        }
+    }
+    if head
+        .tenures
+        .iter()
+        .any(|t| t.e == epoch && t.from - 1 == slot)
+    {
+        ObjectRole::Overlap
+    } else {
+        ObjectRole::Orphan
+    }
+}
+
 /// The reader rule: slot n is archived iff exactly one tenure covers n and
-/// `seg/e<that epoch>/s<n>` exists.
+/// `seg/e<that epoch>/s<n>` exists. An epoch's object for the slot just
+/// before its tenure is an overlap, merged with that slot by key; any other
+/// object outside its epoch's tenure is an orphan.
 pub fn read_archive(head: &Head, names: &[String]) -> ArchiveView {
     let mut v = ArchiveView::default();
     let mut objects: HashSet<(u64, i64)> = HashSet::new();
@@ -1021,14 +1064,13 @@ pub fn read_archive(head: &Head, names: &[String]) -> ArchiveView {
             v.holes += 1;
         }
     }
-    v.orphans = objects
-        .iter()
-        .filter(|(e, s)| {
-            cover
-                .get(s)
-                .is_none_or(|es| !(es.len() == 1 && es[0] == *e))
-        })
-        .count() as u64;
+    for &(e, s) in &objects {
+        match object_role(head, e, s) {
+            ObjectRole::Archived => {}
+            ObjectRole::Overlap => v.overlaps += 1,
+            ObjectRole::Orphan => v.orphans += 1,
+        }
+    }
     v
 }
 
