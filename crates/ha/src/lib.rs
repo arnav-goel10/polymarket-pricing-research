@@ -19,13 +19,19 @@
 //! venue frame and keeps the recent ones for resume and resync, and
 //! [`wire`] is the JSON protocol a client speaks to a node. [`client`] is
 //! the hedged client that subscribes to several nodes and merges them.
+//!
+//! The archive leader is picked by [`caslease`], a lease on one HEAD
+//! document changed only by conditional writes to a [`store`], so the
+//! grant, the epoch and each archive commit are one atomic write.
 
+pub mod caslease;
 pub mod client;
 pub mod key;
 pub mod keycheck;
 pub mod lease;
 pub mod merge;
 pub mod ring;
+pub mod store;
 pub mod wire;
 
 pub use key::{EventKey, Feed, FrameKind, KeyKind};
