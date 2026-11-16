@@ -258,16 +258,22 @@ fn verify_and_print(run: &Path, truth: &Path) -> i32 {
         serde_json::to_string_pretty(&r).expect("report serializes")
     );
     println!(
-        "chaos: {} reason={} missing={} duplicates={} extra={} late_lost={} faults={}/{} observed={} self_repeats={} merger_duplicates={}",
+        "chaos: {} reason={} missing={} duplicates={} extra={} late={} late_already_delivered={} late_pre_window={} late_lost={} in_window={} faults={}/{} observed={} rehedge_max_ms={} added_delay_p99_ms={} self_repeats={} merger_duplicates={}",
         r.verdict.result,
         r.verdict.reason.as_deref().unwrap_or("-"),
         r.missing,
         r.duplicates,
         r.extra,
+        r.merger.late,
+        r.late.already_delivered,
+        r.late.pre_window,
         r.late.lost,
+        r.truth_keys_in_window,
         r.faults.executed,
         r.faults.planned,
         r.faults.observed,
+        r.rehedge_ms.max.map_or("-".into(), |v| format!("{v:.0}")),
+        r.added_delay_ms.p99.map_or("-".into(), |v| format!("{v:.1}")),
         r.counters.self_repeats,
         r.merger.duplicates,
     );
