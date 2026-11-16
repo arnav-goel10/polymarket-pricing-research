@@ -343,7 +343,7 @@ fn archive_and_print(run: &Path, store: &Path) -> i32 {
         return 2;
     }
     println!(
-        "chaos archive: {} reason={} writes={} grants={} epoch={} committed_to={} archived={} holes={} orphans={} stale_epoch_commits={} epoch_two_holders={} fence_rejected={} leader_freezes={} takeovers={} takeover_max_ms={}",
+        "chaos archive: {} reason={} writes={} grants={} epoch={} committed_to={} archived={} holes={} partial={} overlaps={} orphans={} content_required={} content_missing={} journal_matches_head={} stale_epoch_commits={} epoch_two_holders={} fence_rejected={} leader_freezes={} takeovers={} takeover_max_ms={}",
         r.verdict.result,
         r.verdict.reason.as_deref().unwrap_or("-"),
         r.audit.writes,
@@ -352,7 +352,12 @@ fn archive_and_print(run: &Path, store: &Path) -> i32 {
         r.committed_to.map_or("-".into(), |v| v.to_string()),
         r.view.archived,
         r.view.holes,
+        r.partial_slots,
+        r.view.overlaps,
         r.view.orphans,
+        r.content_required,
+        r.content_missing,
+        r.journal_matches_head,
         r.audit.stale_epoch_commits,
         r.audit.epoch_two_holders,
         r.fence_rejected,

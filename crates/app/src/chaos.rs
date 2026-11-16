@@ -70,13 +70,20 @@
 //! | `stale_epoch_commit` | no write accepted under an epoch below one already granted |
 //! | `epoch_two_holders` | each epoch has one holder |
 //! | `tenure` | the tenure list only grows at its end, apart from trimming |
+//! | `journal` | the journal's last line is the final HEAD, so no applied write is missing |
+//! | `archive_content` | every key that all nodes filed in a slot strictly inside the committed range is in an archived or overlap object |
 //! | `no_takeover` | the peer took over during every leader freeze |
 //! | `fence_not_observed` | fenced writes counted by the nodes >= leader freezes |
 //! | `vacuous_archive` | slots were archived, and a freeze run saw two grants |
 //!
-//! Holes and orphans are reported, not gated.
+//! Holes, orphans, overlaps and the slots the nodes logged as partial are
+//! reported, not gated. The content check leaves out the committed range's
+//! two end slots, where a node can file a key one slot off the other, and
+//! keys only one node has: a slot shipped from a leader that missed frames
+//! the other node holds is a known limit, counted as partial, not a
+//! failure.
 
-use ha::caslease::{self, ArchiveView, Audit, Head};
+use ha::caslease::{self, ArchiveView, Audit, Head, ObjectRole};
 use ha::client::{ClientCounters, Event};
 use ha::key::{frame_keys, EventKey, Feed, KeyKind};
 use ha::merge::{FeedCounters, Verdict};
@@ -884,6 +891,14 @@ pub struct ArchiveReport {
     pub leader_freezes: usize,
     pub takeovers_seen: usize,
     pub takeover_ms: Spread,
+    /// The journal's last line is the final HEAD.
+    pub journal_matches_head: bool,
+    /// `partial` lines in the nodes' `lease.jsonl`.
+    pub partial_slots: u64,
+    /// Keys every node filed strictly inside the committed range.
+    pub content_required: u64,
+    /// Of those, keys in no archived or overlap object.
+    pub content_missing: u64,
 }
 
 impl ArchiveReport {
@@ -903,6 +918,26 @@ pub struct ArchiveInputs {
     pub objects: Vec<String>,
     pub lease_log: Vec<String>,
     pub executed: Vec<Executed>,
+    /// The event keys in each archive object, by name.
+    pub object_keys: HashMap<String, HashSet<String>>,
+    /// Each node's local segment keys, by slot.
+    pub node_keys: Vec<HashMap<i64, HashSet<String>>>,
+}
+
+/// Add the event keys of every record `r` holds; a torn tail ends it.
+fn record_keys<R: io::Read>(r: R, out: &mut HashSet<String>) {
+    let Ok(rr) = feeds::recording::RecordReader::new(r) else {
+        return;
+    };
+    let mut ks = Vec::new();
+    for rec in rr {
+        let Ok(rec) = rec else {
+            break;
+        };
+        ks.clear();
+        frame_keys(rec.source, &rec.frame, &mut ks);
+        out.extend(ks.iter().map(key_text));
+    }
 }
 
 /// Read the store's journal, HEAD and objects, and every `lease.jsonl`
@@ -915,12 +950,44 @@ pub fn load_archive(run: &Path, store: &Path) -> io::Result<ArchiveInputs> {
         .map_err(io::Error::other)?
         .and_then(|(b, _)| Head::decode(&b));
     let objects = fs.list("seg/").map_err(io::Error::other)?;
+    let mut object_keys = HashMap::new();
+    for n in &objects {
+        if caslease::parse_object_name(n).is_none() {
+            continue;
+        }
+        let mut keys = HashSet::new();
+        if let Ok(f) = std::fs::File::open(store.join(n)) {
+            let gz = flate2::read::GzDecoder::new(f);
+            record_keys(io::BufReader::new(gz), &mut keys);
+        }
+        object_keys.insert(n.clone(), keys);
+    }
     let mut lease_log = Vec::new();
+    let mut node_keys = Vec::new();
     for e in std::fs::read_dir(run)?.flatten() {
         let p = e.path().join("lease.jsonl");
         if let Ok(text) = std::fs::read_to_string(&p) {
             lease_log.extend(text.lines().map(str::to_string));
         }
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("node-") && name.ends_with("-data")) {
+            continue;
+        }
+        let mut by_slot: HashMap<i64, HashSet<String>> = HashMap::new();
+        for f in std::fs::read_dir(e.path().join("seg"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let fname = f.file_name().to_string_lossy().into_owned();
+            let Some(slot) = crate::archiver::file_slot(&fname) else {
+                continue;
+            };
+            if let Ok(file) = std::fs::File::open(f.path()) {
+                record_keys(io::BufReader::new(file), by_slot.entry(slot).or_default());
+            }
+        }
+        node_keys.push(by_slot);
     }
     Ok(ArchiveInputs {
         journal: FsStore::read_journal(store)?,
@@ -932,7 +999,47 @@ pub fn load_archive(run: &Path, store: &Path) -> io::Result<ArchiveInputs> {
         } else {
             Vec::new()
         },
+        object_keys,
+        node_keys,
     })
+}
+
+/// One node's keys filed in slots `lo..=hi`.
+fn keys_between(n: &HashMap<i64, HashSet<String>>, lo: i64, hi: i64) -> HashSet<&str> {
+    n.iter()
+        .filter(|(s, _)| (lo..=hi).contains(*s))
+        .flat_map(|(_, k)| k.iter().map(String::as_str))
+        .collect()
+}
+
+/// Keys every node filed strictly inside the committed range, and how
+/// many of them no archived or overlap object holds. Needs two nodes.
+fn content_check(h: &Head, inp: &ArchiveInputs) -> (u64, u64) {
+    let (Some(first), Some(last)) = (h.tenures.first(), h.tenures.last()) else {
+        return (0, 0);
+    };
+    if inp.node_keys.len() < 2 {
+        return (0, 0);
+    }
+    let (lo, hi) = (first.from + 1, last.to - 1);
+    let mut archived: HashSet<&str> = HashSet::new();
+    for (name, keys) in &inp.object_keys {
+        let Some((e, s)) = caslease::parse_object_name(name) else {
+            continue;
+        };
+        if caslease::object_role(h, e, s) != ObjectRole::Orphan {
+            archived.extend(keys.iter().map(String::as_str));
+        }
+    }
+    let mut sets = inp.node_keys.iter().map(|n| keys_between(n, lo, hi));
+    let Some(mut required) = sets.next() else {
+        return (0, 0);
+    };
+    for other in sets {
+        required.retain(|k| other.contains(k));
+    }
+    let missing = required.iter().filter(|k| !archived.contains(*k)).count();
+    (required.len() as u64, missing as u64)
 }
 
 pub fn verify_archive(inp: &ArchiveInputs) -> ArchiveReport {
@@ -944,7 +1051,14 @@ pub fn verify_archive(inp: &ArchiveInputs) -> ArchiveReport {
         r.view = caslease::read_archive(h, &inp.objects);
         r.committed_to = h.committed_to();
         r.final_epoch = h.epoch;
+        (r.content_required, r.content_missing) = content_check(h, inp);
     }
+    r.journal_matches_head = inp.journal.last().and_then(|l| Head::decode(l)) == inp.head;
+    r.partial_slots = inp
+        .lease_log
+        .iter()
+        .filter(|l| l.contains("\"ev\":\"partial\""))
+        .count() as u64;
     r.fence_rejected = inp
         .lease_log
         .iter()
@@ -970,6 +1084,8 @@ pub fn verify_archive(inp: &ArchiveInputs) -> ArchiveReport {
             "tenure",
             r.audit.tenure_violations == 0 && r.audit.unreadable == 0,
         ),
+        ("journal", r.journal_matches_head),
+        ("archive_content", r.content_missing == 0),
         ("no_takeover", r.takeovers_seen == r.leader_freezes),
         (
             "fence_not_observed",
@@ -1411,7 +1527,74 @@ mod tests {
                 .map(|_| r#"{"wall_ms":1,"node":1,"ev":"fenced","epoch":1}"#.to_string())
                 .collect(),
             executed: vec![freeze(takeover)],
+            object_keys: HashMap::new(),
+            node_keys: Vec::new(),
         }
+    }
+
+    fn set(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|k| k.to_string()).collect()
+    }
+
+    #[test]
+    fn the_content_check_needs_the_overlap_at_a_takeover() {
+        // Node 1 led slots 10 to 12, node 2 from 13. Key x reached node 1
+        // just after the 12/13 boundary and node 2 just before it.
+        let journal = vec![
+            head(1, Some(1), &[]),
+            head(1, Some(1), &[(1, 1, 10, 12)]),
+            head(2, Some(2), &[(1, 1, 10, 12)]),
+            head(2, Some(2), &[(1, 1, 10, 12), (2, 2, 13, 15)]),
+        ];
+        let mut inp = archive_inputs(journal, 1, Some(5_000));
+        inp.node_keys = vec![
+            HashMap::from([
+                (11, set(&["a"])),
+                (12, set(&["b"])),
+                (13, set(&["x", "c"])),
+                (14, set(&["d", "only1"])),
+            ]),
+            HashMap::from([
+                (11, set(&["a"])),
+                (12, set(&["b", "x"])),
+                (13, set(&["c"])),
+                (14, set(&["d"])),
+            ]),
+        ];
+        let mut objects = vec![
+            (1, 10, vec![]),
+            (1, 11, vec!["a"]),
+            (1, 12, vec!["b"]),
+            (2, 13, vec!["c"]),
+            (2, 14, vec!["d"]),
+            (2, 15, vec![]),
+        ];
+        let set_objects = |inp: &mut ArchiveInputs, objects: &[(u64, i64, Vec<&str>)]| {
+            inp.objects = objects
+                .iter()
+                .map(|(e, s, _)| caslease::object_name(*e, *s))
+                .collect();
+            inp.object_keys = objects
+                .iter()
+                .map(|(e, s, k)| (caslease::object_name(*e, *s), set(k)))
+                .collect();
+        };
+        set_objects(&mut inp, &objects);
+        let r = verify_archive(&inp);
+        assert_eq!(r.verdict.reason.as_deref(), Some("archive_content"));
+        assert_eq!((r.content_required, r.content_missing), (5, 1));
+        // Node 2's copy of slot 12 under epoch 2 holds x.
+        objects.push((2, 12, vec!["b", "x"]));
+        set_objects(&mut inp, &objects);
+        let r = verify_archive(&inp);
+        assert_eq!(r.verdict.result, "pass", "{:?}", r.verdict);
+        assert_eq!(r.view.overlaps, 1);
+        // An orphan's keys do not count.
+        objects.pop();
+        objects.push((1, 13, vec!["x"]));
+        set_objects(&mut inp, &objects);
+        let r = verify_archive(&inp);
+        assert_eq!(r.verdict.reason.as_deref(), Some("archive_content"));
     }
 
     #[test]
@@ -1443,6 +1626,12 @@ mod tests {
         assert_eq!(r.verdict.reason.as_deref(), Some("fence_not_observed"));
         let r = verify_archive(&archive_inputs(clean[..2].to_vec(), 1, Some(5_000)));
         assert_eq!(r.verdict.reason.as_deref(), Some("vacuous_archive"));
+
+        // The last applied write is not in the journal.
+        let mut short = archive_inputs(clean.clone(), 1, Some(5_000));
+        short.journal.pop();
+        let r = verify_archive(&short);
+        assert_eq!(r.verdict.reason.as_deref(), Some("journal"));
     }
 
     #[test]
