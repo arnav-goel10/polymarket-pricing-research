@@ -14,11 +14,17 @@
 //!
 //! [`keycheck`] measures how well the key assumption holds on a real
 //! recording.
+//!
+//! The stream a node serves is built from two more: [`ring`] numbers every
+//! venue frame and keeps the recent ones for resume and resync, and
+//! [`wire`] is the JSON protocol a client speaks to a node.
 
 pub mod key;
 pub mod keycheck;
 pub mod lease;
 pub mod merge;
+pub mod ring;
+pub mod wire;
 
 pub use key::{EventKey, Feed, FrameKind, KeyKind};
 pub use lease::{
