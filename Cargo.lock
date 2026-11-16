@@ -1474,9 +1474,12 @@ name = "ha"
 version = "0.1.0"
 dependencies = [
  "feeds",
+ "futures-util",
  "proptest",
  "serde",
  "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
 ]
 
 [[package]]

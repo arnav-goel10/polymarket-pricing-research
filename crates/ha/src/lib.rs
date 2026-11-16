@@ -17,8 +17,10 @@
 //!
 //! The stream a node serves is built from two more: [`ring`] numbers every
 //! venue frame and keeps the recent ones for resume and resync, and
-//! [`wire`] is the JSON protocol a client speaks to a node.
+//! [`wire`] is the JSON protocol a client speaks to a node. [`client`] is
+//! the hedged client that subscribes to several nodes and merges them.
 
+pub mod client;
 pub mod key;
 pub mod keycheck;
 pub mod lease;

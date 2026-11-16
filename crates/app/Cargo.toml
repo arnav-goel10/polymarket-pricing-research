@@ -26,7 +26,7 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 [features]
 # Seeded faults for the HA harness, chosen at run time with POLY_MUTANT.
 # Never enabled in a deploy build; the node refuses POLY_MUTANT without it.
-mutants = []
+mutants = ["ha/mutants"]
 
 [dev-dependencies]
 criterion = { workspace = true }
