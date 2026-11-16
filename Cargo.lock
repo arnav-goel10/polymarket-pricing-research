@@ -171,6 +171,8 @@ dependencies = [
  "criterion",
  "execution",
  "feeds",
+ "futures-util",
+ "ha",
  "market",
  "poly_core",
  "pricing",
@@ -178,6 +180,7 @@ dependencies = [
  "serde_json",
  "stats",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tower",
  "tower-http",
  "tracing",
@@ -1472,6 +1475,7 @@ version = "0.1.0"
 dependencies = [
  "feeds",
  "proptest",
+ "serde",
  "serde_json",
 ]
 
