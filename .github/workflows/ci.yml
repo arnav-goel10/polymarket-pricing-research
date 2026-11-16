@@ -32,6 +32,8 @@ jobs:
         run: cargo run --locked --release -p app --bin latency_report -- --recording fixtures/live-sample.prec
       - name: Check event keys on the committed live recording
         run: cargo run --locked --release -p ha --bin keycheck -- fixtures/live-sample.prec --fail-on-collision
+      - name: Snapshot size on the committed live recording
+        run: cargo test --locked -p ha --test fixture_snapshot -- --nocapture
 
   # Milestone B gate: two nodes under kills and freezes behind the hedged
   # client, checked against the simulator's total truth. The baselines must

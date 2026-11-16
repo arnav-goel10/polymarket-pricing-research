@@ -17,9 +17,14 @@
 //!   clears the CLOB slots, because books for the old token no longer apply.
 //! - [`Ring::plan`] resumes a client whose last sequence number is from this
 //!   boot and still followed by retained frames. Anyone else gets a
-//!   snapshot: the slot frames plus every retained CLOB frame after the
-//!   oldest current book, in sequence order. The snapshot is `complete`
-//!   only when no CLOB frame after that book has left the ring.
+//!   snapshot: the slot frames plus the retained CLOB frames after the
+//!   oldest current book, in sequence order. That CLOB tail is capped at a
+//!   quarter of the ring (frames and bytes), newest kept, so a snapshot
+//!   can be sent well before the ring turns over and the live stream after
+//!   it starts inside the ring. The snapshot is `complete` only when no
+//!   CLOB frame after that book has left the ring or been cut by the cap.
+//!   `complete` speaks for the CLOB book only: a snapshot never carries the
+//!   RTDS and Binance frames between a client's last seq and the head.
 
 use crate::key::{EventKey, FrameKind, KeyKind};
 use crate::wire::{Boot, ResumeFrom};
@@ -85,6 +90,8 @@ pub(crate) enum RingMutant {
     KeepBooks,
     /// Snapshot the slots only, without the CLOB changes after the book.
     NoClobTail,
+    /// Send the whole CLOB tail, however much of the ring it is.
+    UncappedTail,
     /// Count Noise frames as venue frames.
     NumberNoise,
 }
@@ -171,6 +178,15 @@ impl Ring {
     /// Bytes of frame text held in the ring (slots not counted).
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// The most CLOB tail a snapshot carries: a quarter of each cap, at
+    /// least one frame and one byte.
+    pub fn tail_cap(&self) -> (usize, usize) {
+        (
+            (self.cfg.max_frames / 4).max(1),
+            (self.cfg.max_bytes / 4).max(1),
+        )
     }
 
     /// Take one received frame. `kind` and `keys` are what
@@ -272,12 +288,28 @@ impl Ring {
             frames.insert(e.seq, e.clone());
         }
         let first_book = self.books.values().map(|e| e.seq).min();
-        let complete = first_book.is_none_or(|b| b + 1 >= oldest);
+        let mut complete = first_book.is_none_or(|b| b + 1 >= oldest);
         if let (Some(b), false) = (first_book, self.mutant == RingMutant::NoClobTail) {
             let from = (b + 1).max(oldest);
-            let tail = self.read_from(from, usize::MAX).unwrap_or_default();
-            for e in tail.into_iter().filter(|e| e.src == Source::ClobBook) {
-                frames.insert(e.seq, e);
+            let start = ((from - oldest) as usize).min(self.entries.len());
+            let (cap_frames, cap_bytes) = match self.mutant {
+                RingMutant::UncappedTail => (usize::MAX, usize::MAX),
+                _ => self.tail_cap(),
+            };
+            let (mut n, mut bytes) = (0usize, 0usize);
+            let clob = self
+                .entries
+                .range(start..)
+                .rev()
+                .filter(|e| e.src == Source::ClobBook);
+            for e in clob {
+                if n + 1 > cap_frames || bytes + e.frame.len() > cap_bytes {
+                    complete = false;
+                    break;
+                }
+                n += 1;
+                bytes += e.frame.len();
+                frames.insert(e.seq, e.clone());
             }
         }
         Plan::Snapshot {
@@ -402,6 +434,7 @@ mod tests {
     /// hold, computed from the whole history rather than from the ring.
     #[derive(Default)]
     struct Model {
+        cfg: RingConfig,
         all: Vec<Entry>,
         rtds: Option<u64>,
         binance: [Option<u64>; 2],
@@ -412,7 +445,10 @@ mod tests {
 
     fn check(c: &Case, mutant: RingMutant) -> Result<(), TestCaseError> {
         let mut ring = Ring::new(BOOT, c.cfg).with_mutant(mutant);
-        let mut m = Model::default();
+        let mut m = Model {
+            cfg: c.cfg,
+            ..Model::default()
+        };
         let mut keys = Vec::new();
         for (i, op) in c.ops.iter().enumerate() {
             if let Some((src, text)) = frame(op, i) {
@@ -531,11 +567,24 @@ mod tests {
                     .copied()
                     .collect();
                 let first_book = m.books.values().min().copied();
+                // The CLOB tail after the oldest book, newest first, cut at
+                // a quarter of each cap.
+                let (cap_frames, cap_bytes) =
+                    ((m.cfg.max_frames / 4).max(1), (m.cfg.max_bytes / 4).max(1));
+                let mut cut = false;
                 if let Some(b) = first_book {
-                    for e in &m.all[b as usize..] {
-                        if e.src == Source::ClobBook && e.seq >= oldest {
-                            want.push(e.seq);
+                    let (mut n, mut bytes) = (0, 0);
+                    for e in m.all[b as usize..].iter().rev() {
+                        if e.src != Source::ClobBook || e.seq < oldest {
+                            continue;
                         }
+                        if n + 1 > cap_frames || bytes + e.frame.len() > cap_bytes {
+                            cut = true;
+                            break;
+                        }
+                        n += 1;
+                        bytes += e.frame.len();
+                        want.push(e.seq);
                     }
                 }
                 want.sort_unstable();
@@ -547,7 +596,7 @@ mod tests {
                         .any(|e| e.src == Source::ClobBook && e.seq < oldest)
                 });
                 let gap = first_book.is_some_and(|b| b + 1 < oldest);
-                prop_assert_eq!(*complete, !gap, "complete flag");
+                prop_assert_eq!(*complete, !gap && !cut, "complete flag");
                 prop_assert!(!lost || !*complete, "CLOB frames lost but complete");
             }
             (p, r) => {
@@ -592,6 +641,9 @@ mod tests {
         assert!(caught(RingMutant::KeepBooks));
         // Books without the changes since leave the client's book stale.
         assert!(caught(RingMutant::NoClobTail));
+        // A tail as big as the ring can take longer to send than the ring
+        // lasts, and the client lags out of every snapshot it gets.
+        assert!(caught(RingMutant::UncappedTail));
         // A numbered keepalive is a frame the client cannot key.
         assert!(caught(RingMutant::NumberNoise));
     }
