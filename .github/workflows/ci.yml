@@ -96,6 +96,34 @@ jobs:
           a epoch-reuse epoch_two_holders
           exit "$fail"
 
+  # The Blob store against the Azurite emulator: the same contract suite the
+  # directory store passes, racing writers, and a zombie leader fenced by
+  # the conditional write. Nothing here touches Azure. The account key
+  # below is made up for this job's emulator and opens nothing else.
+  azurite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite:3.34.0
+        ports:
+          - 10000:10000
+        env:
+          AZURITE_ACCOUNTS: "polyci:cG9seS1jaS1lbXVsYXRvci1vbmx5LW5vdC1hLXNlY3JldA=="
+    env:
+      POLY_AZURITE_URL: http://127.0.0.1:10000/polyci
+      POLY_AZURITE_ACCOUNT: polyci
+      POLY_AZURITE_KEY: "cG9seS1jaS1lbXVsYXRvci1vbmx5LW5vdC1hLXNlY3JldA=="
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Blob store tests against Azurite, all eight must run
+        run: |
+          set -o pipefail
+          cargo test --locked -p ha --lib azure::tests::emulator -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/azurite.out"
+          grep -q "test result: ok. 8 passed; 0 failed; 0 ignored" "$RUNNER_TEMP/azurite.out"
+
   benches:
     runs-on: ubuntu-latest
     timeout-minutes: 25
