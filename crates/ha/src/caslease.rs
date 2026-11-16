@@ -466,10 +466,8 @@ impl CasLease {
                     Some(n) if now < h.deadline => Op::Commit(n),
                     _ => Op::Renew,
                 }
-            } else if let Some(n) = self.want_commit {
-                Op::Commit(n)
             } else {
-                return None;
+                Op::Commit(self.want_commit?)
             };
             let cond = if op == Op::Release {
                 Cond::IfMatch(h.etag.clone())
@@ -871,11 +869,8 @@ pub fn audit<'a>(docs: impl IntoIterator<Item = &'a Head>) -> Audit {
                     holders.insert(d.epoch, h);
                     a.grants += 1;
                 }
-                Some(&x) if x != h => {
-                    if two.insert(d.epoch) {
-                        a.epoch_two_holders += 1;
-                    }
-                }
+                // Counted once per epoch.
+                Some(&x) if x != h && two.insert(d.epoch) => a.epoch_two_holders += 1,
                 _ => {}
             }
         }
