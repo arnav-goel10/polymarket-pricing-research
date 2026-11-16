@@ -117,9 +117,29 @@ impl QueueOnly {
     /// Start the writer thread appending to `writer`.
     pub fn start<W: std::io::Write + Send + 'static>(
         self,
-        mut writer: RecordWriter<W>,
+        writer: RecordWriter<W>,
         on_done: impl FnOnce(RecordWriter<W>) -> std::io::Result<(u64, u64)> + Send + 'static,
     ) -> RecorderTask {
+        self.start_with(
+            writer,
+            |w, recv_micros, source, text| w.append(recv_micros, source, &text),
+            on_done,
+        )
+    }
+
+    /// Start the consumer thread with a custom per-frame step. `on_frame`
+    /// gets every queued frame in order, owning its text, together with
+    /// `state`; an error from it stops the thread and is returned by
+    /// [`RecorderTask::finish`]. Once every handle is dropped and the queue
+    /// is empty, `on_done` gets `state` back. The drop policy is the same as
+    /// [`start`](Self::start), which is this with a [`RecordWriter`] as the
+    /// state.
+    pub fn start_with<S, F, D>(self, mut state: S, mut on_frame: F, on_done: D) -> RecorderTask
+    where
+        S: Send + 'static,
+        F: FnMut(&mut S, i64, Source, String) -> std::io::Result<()> + Send + 'static,
+        D: FnOnce(S) -> std::io::Result<(u64, u64)> + Send + 'static,
+    {
         let stats = self.stats.clone();
         let rx = self.rx;
         let join = std::thread::Builder::new()
@@ -127,10 +147,10 @@ impl QueueOnly {
             .spawn(move || {
                 // Runs until every sender is dropped and the queue is empty.
                 while let Ok(f) = rx.recv() {
-                    writer.append(f.recv_micros, f.source, &f.text)?;
+                    on_frame(&mut state, f.recv_micros, f.source, f.text)?;
                     stats.written.fetch_add(1, Relaxed);
                 }
-                on_done(writer)
+                on_done(state)
             })
             .expect("spawn recorder thread");
         RecorderTask {
@@ -175,6 +195,63 @@ mod tests {
         assert_eq!(n, 5_000);
         assert_eq!(stats.dropped.load(Relaxed), 0);
         assert_eq!(stats.written.load(Relaxed), 5_000);
+    }
+
+    fn source_for(i: usize) -> Source {
+        if i.is_multiple_of(2) {
+            Source::Rtds
+        } else {
+            Source::ClobBook
+        }
+    }
+
+    #[test]
+    fn start_with_sees_every_frame_in_order_and_returns_the_state() {
+        let (h, q) = queue(1_000);
+        let task = q.start_with(
+            Vec::<(i64, Source, String)>::new(),
+            |seen, t, s, text| {
+                seen.push((t, s, text));
+                Ok(())
+            },
+            |seen| {
+                assert_eq!(seen.len(), 300);
+                for (i, (t, s, text)) in seen.iter().enumerate() {
+                    assert_eq!(*t, i as i64);
+                    assert_eq!(*s, source_for(i));
+                    assert_eq!(text, &format!("f{i}"));
+                }
+                Ok((seen.len() as u64, 0))
+            },
+        );
+        for i in 0..300usize {
+            assert!(h.record_at(i as i64, source_for(i), &format!("f{i}")));
+        }
+        drop(h);
+        assert_eq!(task.finish().unwrap().0, 300);
+    }
+
+    #[test]
+    fn an_error_from_on_frame_stops_the_thread_and_is_reported() {
+        let (h, q) = queue(100);
+        let task = q.start_with(
+            0u32,
+            |n, _, _, _| {
+                *n += 1;
+                if *n == 3 {
+                    Err(std::io::Error::other("disk gone"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Ok((0, 0)),
+        );
+        for i in 0..10 {
+            h.record_at(i, Source::Binance, "x");
+        }
+        drop(h);
+        let err = task.finish().unwrap_err();
+        assert_eq!(err.to_string(), "disk gone");
     }
 
     #[test]

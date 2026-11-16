@@ -2,6 +2,7 @@ pub mod adaptive;
 pub mod backtest;
 pub mod convergence;
 pub mod engine;
+pub mod ingest;
 pub mod latency;
 pub mod lifecycle;
 pub mod metrics;
