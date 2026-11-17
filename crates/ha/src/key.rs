@@ -32,6 +32,8 @@
 //! | CLOB `price_change`, one key per entry | asset id, `hash`, frame `timestamp`, `side`, `price`, `size` | see below |
 //! | CLOB `best_bid_ask` | asset id, `timestamp`, `best_bid`, `best_ask` | there is no hash; the quoted top is the event |
 //! | CLOB `last_trade_price` | asset id, `transaction_hash`, `timestamp`, `side`, `price`, `size` | one transaction can fill at several prices |
+//! | CLOB `new_market` | `market` (condition id), market `id`, `timestamp` | the venue's own ids for the market it announces |
+//! | CLOB `tick_size_change` | asset id, `timestamp`, `old_tick_size`, `new_tick_size` | there is no hash; the change is the event |
 //!
 //! Binance time. `T` is set by the matching engine and is the same in every
 //! copy of a message. `E` is the time the message was pushed, and on the
@@ -52,6 +54,15 @@
 //! shows 0 collisions there, and `keycheck` prints that number), so nothing
 //! measured forces this; it costs nothing, because every copy of one entry
 //! carries the same size.
+//!
+//! Market announcements. With `custom_feature_enabled` the market channel
+//! also sends `new_market` for markets the venue opens, whatever assets the
+//! connection asked for, and `tick_size_change` when a book's tick changes. Both are
+//! venue events, not keepalives, so a subscriber must get each once. The
+//! first live drill had them unkeyed: the 10-minute live recording holds
+//! 611 `new_market` (in bursts of up to 289 a minute) and 2
+//! `tick_size_change`, and they were the only events of any feed without a
+//! key there.
 //!
 //! Anything else (another topic or event type, a frame missing an identity
 //! field, a frame that is not JSON) becomes [`KeyKind::Unkeyed`] with a
@@ -115,6 +126,8 @@ pub enum KeyKind {
     ClobPriceChange,
     ClobBestBidAsk,
     ClobLastTrade,
+    ClobNewMarket,
+    ClobTickSize,
     /// No venue identity. The id is a fingerprint of the event's content.
     Unkeyed(Feed),
 }
@@ -127,7 +140,9 @@ impl KeyKind {
             KeyKind::ClobBook
             | KeyKind::ClobPriceChange
             | KeyKind::ClobBestBidAsk
-            | KeyKind::ClobLastTrade => Feed::Clob,
+            | KeyKind::ClobLastTrade
+            | KeyKind::ClobNewMarket
+            | KeyKind::ClobTickSize => Feed::Clob,
             KeyKind::Unkeyed(f) => f,
         }
     }
@@ -147,6 +162,8 @@ impl KeyKind {
             KeyKind::ClobBestBidAsk => 6,
             KeyKind::ClobLastTrade => 7,
             KeyKind::Unkeyed(f) => 8 + f.index() as u64,
+            KeyKind::ClobNewMarket => 11,
+            KeyKind::ClobTickSize => 12,
         }
     }
 }
@@ -646,6 +663,30 @@ fn clob_event<F: FnMut(EventKey, u128), const C: bool>(e: &Value, s: &mut Sink<'
                 _ => s.unkeyed(Feed::Clob, e, ts),
             }
         }
+        Some("new_market") => match (str_field(e, "market"), str_field(e, "id"), ts) {
+            (Some(m), Some(id), Some(t)) => {
+                let mut fp = Fingerprint::new();
+                fp.field(m.as_bytes()).field(id.as_bytes()).int(t);
+                s.keyed(KeyKind::ClobNewMarket, fp.finish(), Some(t), whole);
+            }
+            _ => s.unkeyed(Feed::Clob, e, ts),
+        },
+        Some("tick_size_change") => match (
+            asset,
+            ts,
+            str_field(e, "old_tick_size"),
+            str_field(e, "new_tick_size"),
+        ) {
+            (Some(a), Some(t), Some(old), Some(new)) => {
+                let mut fp = Fingerprint::new();
+                fp.field(a.as_bytes())
+                    .int(t)
+                    .field(old.as_bytes())
+                    .field(new.as_bytes());
+                s.keyed(KeyKind::ClobTickSize, fp.finish(), Some(t), whole);
+            }
+            _ => s.unkeyed(Feed::Clob, e, ts),
+        },
         _ => s.unkeyed(Feed::Clob, e, ts),
     }
 }
@@ -814,6 +855,33 @@ mod tests {
         assert_eq!(one(Source::ClobBook, ltp).kind, KeyKind::ClobLastTrade);
     }
 
+    // Shapes from the 10-minute live recording, description shortened.
+    const NEW_MARKET: &str = r#"{"id":"6894295", "question":"Dogecoin Up or Down - November 10, 1:20AM-1:25AM ET", "market":"0xe709", "slug":"doge-updown-5m-1794291600", "description":"This market will resolve to Up.", "assets_ids":["101","102"], "outcomes":["Up","Down"], "active":true, "timestamp":"1794205786533", "event_type":"new_market"}"#;
+    const TICK: &str = r#"{"market":"0x0629", "asset_id":"5609", "old_tick_size":"0.01", "new_tick_size":"0.001", "timestamp":"1794205786533", "event_type":"tick_size_change"}"#;
+
+    #[test]
+    fn market_announcements_and_tick_changes_are_keyed() {
+        let n = one(Source::ClobBook, NEW_MARKET);
+        assert_eq!(n.kind, KeyKind::ClobNewMarket);
+        assert_eq!(n.ts_millis, Some(1794205786533));
+        // Another market announced at the same millisecond is another event.
+        let other = NEW_MARKET.replacen(r#""id":"6894295""#, r#""id":"6894296""#, 1);
+        assert_ne!(n, one(Source::ClobBook, &other));
+        // Text outside the identity does not move the key.
+        let reworded = NEW_MARKET.replacen("resolve to Up", "resolve Up", 1);
+        assert_eq!(n, one(Source::ClobBook, &reworded));
+
+        let t = one(Source::ClobBook, TICK);
+        assert_eq!(t.kind, KeyKind::ClobTickSize);
+        assert_eq!(t.ts_millis, Some(1794205786533));
+        let back = TICK
+            .replacen(r#""old_tick_size":"0.01""#, r#""old_tick_size":"0.001""#, 1)
+            .replacen(r#""new_tick_size":"0.001""#, r#""new_tick_size":"0.01""#, 1);
+        assert_ne!(t, one(Source::ClobBook, &back));
+        // Same ids and time, other kind: different keys.
+        assert_ne!(t.kind.code(), n.kind.code());
+    }
+
     #[test]
     fn frames_without_identity_are_unkeyed_not_dropped() {
         let no_hash =
@@ -821,6 +889,7 @@ mod tests {
         let k = one(Source::ClobBook, no_hash);
         assert_eq!(k.kind, KeyKind::Unkeyed(Feed::Clob));
         assert_eq!(k.ts_millis, Some(1));
+        // A tick size change without its sizes has no identity.
         let other = r#"{"asset_id":"559","timestamp":"1","event_type":"tick_size_change"}"#;
         assert_eq!(
             one(Source::ClobBook, other).kind,

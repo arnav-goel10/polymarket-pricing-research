@@ -106,10 +106,12 @@ The plan is two or three identical nodes, each reading the same public feeds on 
 | CLOB `price_change` entry | asset id, hash, timestamp, side, price, size |
 | CLOB `best_bid_ask` | asset id, timestamp, best bid, best ask |
 | CLOB `last_trade_price` | asset id, transaction hash, timestamp, side, price, size |
+| CLOB `new_market` | market (condition id), market id, timestamp |
+| CLOB `tick_size_change` | asset id, timestamp, old tick size, new tick size |
 
 Binance uses `T` only. `E` is the push time, it differs from `T` in 1,435 of the 5,697 recorded frames, and nothing promises it matches across connections, so it is never a fallback. A Binance message without `T` keeps its sequence key and is untimed. Size is in the price change key by decision: an entry gives the new total size at one level, so two entries that differ only in size are two states of that level and neither may be dropped. The recording does not force this (the key without size also has 0 collisions there).
 
-Anything else becomes `Unkeyed` with a fingerprint of its content, and is counted. Keepalives are not events.
+Anything else becomes `Unkeyed` with a fingerprint of its content, and is counted. Keepalives are not events. The last two rows came from the first live drill: with `custom_feature_enabled` the market channel announces new markets whatever the connection subscribed to, and these were the only events of any feed without a key in the 10-minute live recording (611 `new_market`, 2 `tick_size_change`). They are venue events a subscriber should get once, so they get keys rather than being called noise.
 
 **Merge** (`ha::merge`). Each feed has a window of recently delivered keys, bounded by a venue-time span and a hard capacity, both preallocated. A key in the window is a duplicate. A timed key not in the window is late if its timestamp is below the horizon (newest timestamp minus span) or if it is at or below the floor, the largest (timestamp, key) the capacity cap has pushed out. Late keys are dropped and counted per feed, never passed on as new, because a late copy cannot be told from a duplicate whose key has left the window.
 

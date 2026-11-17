@@ -36,6 +36,11 @@ pub const RTDS_TICK_MS: i64 = 250;
 pub const ASSETS: [&str; 2] = ["tokA", "tokB"];
 /// A fresh `book` for an asset every this many CLOB frames for it.
 const BOOK_EVERY: u64 = 25;
+/// One CLOB frame in this many announces a new market, as the live market
+/// channel does with `custom_feature_enabled` (611 in ten minutes live).
+const NEW_MARKET_EVERY: u64 = 400;
+/// One in this many is a tick size change (2 in ten minutes live).
+const TICK_SIZE_EVERY: u64 = 4_000;
 
 /// splitmix64.
 #[derive(Debug, Clone)]
@@ -69,6 +74,7 @@ pub struct Synth {
     /// Integer price in cents.
     btc_cents: i64,
     clob_frames: [u64; 2],
+    clob_calls: u64,
     rtds_points: u64,
     /// Last point timestamp per RTDS series, fast then Chainlink.
     rtds_last: [i64; 2],
@@ -82,6 +88,7 @@ impl Synth {
             book_u: 5_000_000,
             btc_cents: 10_000_000,
             clob_frames: [0; 2],
+            clob_calls: 0,
             rtds_points: 0,
             rtds_last: [i64::MIN; 2],
         }
@@ -117,6 +124,20 @@ impl Synth {
     /// it is a `book`, the rest a one or two entry `price_change`. Bids stay
     /// at 0.40 to 0.45 and asks at 0.55 to 0.60, so the book never crosses.
     pub fn clob(&mut self, now_ms: i64) -> String {
+        self.clob_calls += 1;
+        let c = self.clob_calls;
+        if c.is_multiple_of(TICK_SIZE_EVERY) {
+            let asset = ASSETS[(c / TICK_SIZE_EVERY % 2) as usize];
+            return format!(
+                r#"{{"market":"0xsim","asset_id":"{asset}","old_tick_size":"0.01","new_tick_size":"0.001","timestamp":"{now_ms}","event_type":"tick_size_change"}}"#
+            );
+        }
+        if c.is_multiple_of(NEW_MARKET_EVERY) {
+            let id = c / NEW_MARKET_EVERY;
+            return format!(
+                r#"{{"id":"{id}","question":"Sim market {id}","market":"0xnew{id:08x}","slug":"sim-{id}","assets_ids":["new{id}a","new{id}b"],"outcomes":["Up","Down"],"active":true,"timestamp":"{now_ms}","event_type":"new_market"}}"#
+            );
+        }
         let i = (self.rng.below(10) >= 7) as usize;
         let asset = ASSETS[i];
         let n = self.clob_frames[i];
@@ -309,7 +330,8 @@ mod tests {
         let run = |seed| {
             let mut s = Synth::new(seed);
             let mut frames = Vec::new();
-            for i in 0..3_000i64 {
+            // Enough CLOB frames for market announcements and a tick change.
+            for i in 0..4_000i64 {
                 frames.push((Source::Binance, s.binance(1_000 + i)));
                 frames.push((Source::ClobBook, s.clob(1_000 + i)));
                 if i % 10 == 0 {
@@ -336,6 +358,8 @@ mod tests {
             KeyKind::BinanceBook,
             KeyKind::ClobBook,
             KeyKind::ClobPriceChange,
+            KeyKind::ClobNewMarket,
+            KeyKind::ClobTickSize,
             KeyKind::RtdsPrice,
         ] {
             assert!(kinds.contains(&k), "{k:?} never generated");
