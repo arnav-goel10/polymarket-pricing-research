@@ -13,17 +13,18 @@
 //! - [`MemStore`]: in process, with injected faults (slow, unreachable,
 //!   applied with the reply lost, lost on the way). The lease tests and the
 //!   contract suite run against it.
-//! - [`FsStore`]: a directory shared by several processes on one host. A
-//!   lock file taken with `File::lock` makes each conditional write atomic,
-//!   and every applied HEAD write is appended to a journal, so a run can be
-//!   audited afterwards. `chaos local` points both nodes at one.
+//! - [`FsStore`]: a directory shared by several processes on one host.
+//!   Each applied HEAD write is one numbered file made by a hard link, so
+//!   a conditional write is atomic without a lock and the files are the
+//!   journal a run is audited from. `chaos local` points both nodes at
+//!   one.
 //!
 //! [`contract_suite`] checks the semantics the lease relies on and runs
 //! against every store.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -308,159 +309,146 @@ impl ObjectStore for MemStore {
 ///
 /// | Path | What |
 /// | --- | --- |
-/// | `lease/HEAD` | the ETag on the first line, the body on the second |
-/// | `lease/journal.jsonl` | every applied HEAD body, one per line, append only |
-/// | `lease/.lock` | taken with `File::lock` around every HEAD write |
+/// | `lease/v/<version>` | one file per applied HEAD write, the body, numbered from 1 |
+/// | `lease/.w.<pid>.<n>` | a writer's own temp file, removed after its write |
 /// | `<name>` | each object, created by a hard link so it appears whole or not at all |
+///
+/// HEAD is the highest version and its number is the ETag. A write prepares
+/// its body in a temp file and hard links it to the next number, which
+/// fails if that number exists. So a conditional write is one atomic step
+/// with no lock: a writer frozen or killed at any point holds nothing the
+/// others wait for, as with a blob store, where the compare and the write
+/// happen on the server. The versions are also the journal: an applied
+/// write is there whole and in order, or it was not applied.
 #[derive(Debug, Clone)]
 pub struct FsStore {
     root: PathBuf,
+    /// A version this handle knows exists. Versions are never removed, so
+    /// the newest is found by counting up from here.
+    known: Arc<AtomicU64>,
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// How much of the journal's end is read to mend it. A HEAD body is a few
-/// kilobytes at most, so the last line always fits.
-const MEND_TAIL: u64 = 1 << 20;
+fn version_etag(n: u64) -> Etag {
+    Etag(format!("\"{n}\""))
+}
 
 impl FsStore {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
-        std::fs::create_dir_all(root.join("lease"))?;
-        Ok(FsStore { root })
+        std::fs::create_dir_all(Self::versions(&root))?;
+        Ok(FsStore {
+            root,
+            known: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    fn head_path(&self) -> PathBuf {
-        self.root.join("lease").join("HEAD")
+    fn versions(root: &Path) -> PathBuf {
+        root.join("lease").join("v")
     }
 
-    pub fn journal_path(root: &Path) -> PathBuf {
-        root.join("lease").join("journal.jsonl")
+    fn version_path(root: &Path, n: u64) -> PathBuf {
+        Self::versions(root).join(format!("{n:020}"))
     }
 
-    /// Every applied HEAD body under `root`, in order.
-    pub fn read_journal(root: &Path) -> io::Result<Vec<Vec<u8>>> {
-        let f = match File::open(Self::journal_path(root)) {
-            Ok(f) => f,
+    /// The version numbers under `root`, in no order.
+    fn list_versions(root: &Path) -> io::Result<Vec<u64>> {
+        let dir = match std::fs::read_dir(Self::versions(root)) {
+            Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
         let mut out = Vec::new();
-        for line in BufReader::new(f).split(b'\n') {
-            let line = line?;
-            if !line.is_empty() {
-                out.push(line);
+        for e in dir {
+            if let Some(n) = e?.file_name().to_str().and_then(|s| s.parse().ok()) {
+                out.push(n);
             }
         }
         Ok(out)
     }
 
-    fn lock(&self) -> io::Result<File> {
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.root.join("lease").join(".lock"))?;
-        f.lock()?;
-        Ok(f)
+    /// Every applied HEAD body under `root`, in order.
+    pub fn read_journal(root: &Path) -> io::Result<Vec<Vec<u8>>> {
+        let mut versions = Self::list_versions(root)?;
+        versions.sort_unstable();
+        versions
+            .into_iter()
+            .map(|n| std::fs::read(Self::version_path(root, n)))
+            .collect()
+    }
+
+    /// The newest version, if HEAD exists. Every write links the number
+    /// after the newest it saw, so the numbers have no gap and counting up
+    /// from any existing one ends at the newest.
+    fn newest(&self) -> io::Result<Option<u64>> {
+        let mut n = self.known.load(Ordering::Relaxed);
+        if n == 0 {
+            n = Self::list_versions(&self.root)?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+        }
+        while Self::version_path(&self.root, n + 1).try_exists()? {
+            n += 1;
+        }
+        self.known.fetch_max(n, Ordering::Relaxed);
+        Ok((n > 0).then_some(n))
     }
 
     fn read_raw(&self) -> io::Result<Option<(Vec<u8>, Etag)>> {
-        let mut buf = Vec::new();
-        match File::open(self.head_path()) {
-            Ok(mut f) => f.read_to_end(&mut buf)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
+        let Some(n) = self.newest()? else {
+            return Ok(None);
         };
-        let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
-            return Err(io::Error::other("HEAD has no ETag line"));
-        };
-        let etag = String::from_utf8_lossy(&buf[..nl]).into_owned();
-        Ok(Some((buf[nl + 1..].to_vec(), Etag(etag))))
+        let body = std::fs::read(Self::version_path(&self.root, n))?;
+        Ok(Some((body, version_etag(n))))
     }
 
-    /// Under the lock, make the journal end with the current HEAD body. A
-    /// writer killed between its rename and its append left that applied
-    /// write out of the journal, and one killed mid-append left a torn line
-    /// that the next line would run into. Both are mended before a line is
-    /// added, so the journal misses no applied write but the very last.
-    fn mend_journal(&self, current: Option<&[u8]>) -> io::Result<()> {
-        let mut j = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(Self::journal_path(&self.root))?;
-        let len = j.metadata()?.len();
-        let from = len.saturating_sub(MEND_TAIL);
-        j.seek(SeekFrom::Start(from))?;
-        let mut tail = Vec::new();
-        j.read_to_end(&mut tail)?;
-        let keep = match tail.iter().rposition(|&b| b == b'\n') {
-            Some(i) => i + 1,
-            None if from == 0 => 0,
-            // One line longer than the tail: not a HEAD body, leave it.
-            None => return Ok(()),
-        };
-        let mut changed = false;
-        if keep < tail.len() {
-            j.set_len(from + keep as u64)?;
-            tail.truncate(keep);
-            changed = true;
-        }
-        let last = tail[..keep.saturating_sub(1)]
-            .rsplit(|&b| b == b'\n')
-            .next()
-            .filter(|l| !l.is_empty());
-        if let Some(cur) = current {
-            if last != Some(cur) {
-                j.seek(SeekFrom::End(0))?;
-                let mut line = cur.to_vec();
-                line.push(b'\n');
-                j.write_all(&line)?;
-                changed = true;
+    /// Link `tmp` as the version after the newest, if `cond` holds for the
+    /// newest. The link is the whole write: it fails if another writer
+    /// took that number first.
+    fn link_next(&self, tmp: &Path, cond: &Cond) -> io::Result<WriteOutcome> {
+        loop {
+            let newest = self.newest()?;
+            if !cond_holds(cond, newest.map(version_etag).as_ref()) {
+                return Ok(WriteOutcome::PreconditionFailed);
+            }
+            let next = newest.unwrap_or(0) + 1;
+            match std::fs::hard_link(tmp, Self::version_path(&self.root, next)) {
+                Ok(()) => {
+                    self.known.fetch_max(next, Ordering::Relaxed);
+                    return Ok(WriteOutcome::Done(version_etag(next)));
+                }
+                // Another writer landed first. A conditional write lost;
+                // an unconditional one goes after it.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if *cond != Cond::Unconditional {
+                        return Ok(WriteOutcome::PreconditionFailed);
+                    }
+                }
+                Err(e) => return Err(e),
             }
         }
-        if changed {
-            j.sync_data()?;
-        }
-        Ok(())
     }
 
-    fn write_locked(&self, body: &[u8], cond: &Cond) -> io::Result<WriteOutcome> {
-        let _lock = self.lock()?;
-        let current = self.read_raw()?;
-        if !cond_holds(cond, current.as_ref().map(|(_, e)| e)) {
-            return Ok(WriteOutcome::PreconditionFailed);
-        }
-        self.mend_journal(current.as_ref().map(|(b, _)| b.as_slice()))?;
-        let version = match &current {
-            Some((_, Etag(e))) => e.trim_matches('"').parse::<u64>().unwrap_or(0) + 1,
-            None => 1,
-        };
-        let etag = Etag(format!("\"{version}\""));
-        let tmp = self.root.join("lease").join("HEAD.tmp");
-        {
-            let mut f = File::create(&tmp)?;
-            f.write_all(etag.0.as_bytes())?;
-            f.write_all(b"\n")?;
-            f.write_all(body)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, self.head_path())?;
-        let mut j = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(Self::journal_path(&self.root))?;
-        let mut line = body.to_vec();
-        line.push(b'\n');
-        j.write_all(&line)?;
-        j.sync_data()?;
-        Ok(WriteOutcome::Done(etag))
+    fn write_version(&self, body: &[u8], cond: &Cond) -> io::Result<WriteOutcome> {
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = self
+            .root
+            .join("lease")
+            .join(format!(".w.{}.{n}", std::process::id()));
+        let out = File::create(&tmp)
+            .and_then(|mut f| {
+                f.write_all(body)?;
+                f.sync_all()
+            })
+            .and_then(|()| self.link_next(&tmp, cond));
+        let _ = std::fs::remove_file(&tmp);
+        out
     }
 
     fn object_path(&self, name: &str) -> Option<PathBuf> {
@@ -505,9 +493,10 @@ impl HeadStore for FsStore {
         if body.contains(&b'\n') {
             return WriteOutcome::Unreachable;
         }
-        // A failure before the rename leaves HEAD as it was; after it, the
-        // write landed. Either way the caller cannot tell which.
-        self.write_locked(body, cond)
+        // A failure before the link leaves HEAD as it was. A link that
+        // reports a failure may still have been made, so the caller cannot
+        // tell which.
+        self.write_version(body, cond)
             .unwrap_or(WriteOutcome::Unknown)
     }
 }
@@ -655,25 +644,38 @@ mod tests {
         assert!(matches!(s.write_head(body, &cond), WriteOutcome::Done(_)));
     }
 
+    /// A writer frozen or killed part way through a write has only its
+    /// own temp file. The others carry on, and when it wakes its link is
+    /// refused because the number it wants is taken.
     #[test]
-    fn the_journal_is_mended_before_the_next_write() {
-        let d = scratch("mend");
+    fn a_writer_stopped_mid_write_blocks_nobody() {
+        let d = scratch("stopped");
         let s = FsStore::open(d.join("store")).unwrap();
-        let jp = FsStore::journal_path(s.root());
         write(&s, b"aaaa");
-        write(&s, b"bbbb");
-        // A writer killed after its rename, before its append.
-        std::fs::write(&jp, b"aaaa\n").unwrap();
+        let (_, seen) = s.read_head().unwrap().unwrap();
+        // The stopped writer got as far as its temp file.
+        let tmp = s.root().join("lease").join(".w.0.stopped");
+        std::fs::write(&tmp, b"zzzz").unwrap();
+        let other = FsStore::open(s.root()).unwrap();
+        write(&other, b"bbbb");
         write(&s, b"cccc");
-        write(&s, b"dddd");
-        // A writer killed mid-append.
-        std::fs::write(&jp, b"aaaa\nbbbb\ncccc\ndd").unwrap();
-        write(&s, b"eeee");
-        let want: Vec<Vec<u8>> = ["aaaa", "bbbb", "cccc", "dddd", "eeee"]
+        // It wakes and finishes the write it had started.
+        assert_eq!(
+            s.link_next(&tmp, &Cond::IfMatch(seen)).unwrap(),
+            WriteOutcome::PreconditionFailed
+        );
+        let (body, etag) = other.read_head().unwrap().unwrap();
+        assert_eq!((body.as_slice(), etag), (&b"cccc"[..], version_etag(3)));
+        let want: Vec<Vec<u8>> = ["aaaa", "bbbb", "cccc"]
             .iter()
             .map(|l| l.as_bytes().to_vec())
             .collect();
         assert_eq!(FsStore::read_journal(s.root()).unwrap(), want);
+        // A write with no condition goes after whatever is there.
+        assert_eq!(
+            other.write_head(b"dddd", &Cond::Unconditional),
+            WriteOutcome::Done(version_etag(4))
+        );
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -750,8 +752,8 @@ mod tests {
     }
 
     /// Several writers, each with its own handle on one directory, race
-    /// read-then-write cycles. With the lock every applied write is based
-    /// on the one before it, so no update is lost.
+    /// read-then-write cycles. Every applied write is based on the one
+    /// before it, so no update is lost.
     #[test]
     fn racing_writers_on_one_directory_lose_no_update() {
         let d = scratch("race");
