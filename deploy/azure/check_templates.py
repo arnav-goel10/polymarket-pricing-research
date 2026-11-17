@@ -229,8 +229,12 @@ def main():
     check(
         "the deploy identity trusts only the named environment of the named repository",
         cred["properties"]["issuer"] == "https://token.actions.githubusercontent.com"
+        # The repository part is githubRepo, or the id form GitHub may send
+        # (OWNER@ID/REPO@ID) when githubSubjectRepo is given; nothing else.
         and cred["properties"]["subject"]
-        == "[format('repo:{0}:environment:{1}', parameters('githubRepo'), parameters('githubEnvironment'))]"
+        == "[format('repo:{0}:environment:{1}', if(empty(parameters('githubSubjectRepo')), "
+        "parameters('githubRepo'), parameters('githubSubjectRepo')), parameters('githubEnvironment'))]"
+        and default(bootstrap, "githubSubjectRepo") == ""
         and default(bootstrap, "githubEnvironment") == "azure",
     )
 
