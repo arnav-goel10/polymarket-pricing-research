@@ -662,6 +662,8 @@ start "vm_tools install ships the bundle and checks the digest the VM reports" "
 check test "$code" = 0
 check test "$(changed)" = 1
 check grep -q "^vm run-command invoke -g poly-ha -n node-a .*--scripts @" "$AZ_LOG"
+# The agent runs scripts with dash: the install script must hand itself to bash first.
+check grep -q 'exec bash' "$here/vm_tools.sh"
 start "vm_tools install fails when the VM reports another digest" env FAKE_TOOLS_DIGEST=0000 "$here/vm_tools.sh" install node-b
 check test "$code" != 0
 start "vm_tools install refuses another subscription" env FAKE_SUBSCRIPTION=Klimacap "$here/vm_tools.sh" install node-a

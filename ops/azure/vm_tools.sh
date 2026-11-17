@@ -40,6 +40,8 @@ case "$cmd" in
     trap 'rm -rf "$tmp"' EXIT
     bundle=$(cd "$src" && export LC_ALL=C && tar -czf - -- * | base64 | tr -d '\n')
     cat >"$tmp/install.sh" <<SCRIPT
+# The VM agent runs this with sh, which on Ubuntu is dash and has no pipefail.
+if [ -z "\${BASH_VERSION:-}" ]; then exec bash "\$0" "\$@"; fi
 set -euo pipefail
 d=/opt/poly/drill
 new=\$(mktemp -d /opt/poly/drill.new.XXXXXX)
