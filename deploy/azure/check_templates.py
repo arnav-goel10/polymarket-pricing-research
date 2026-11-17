@@ -111,6 +111,11 @@ def main():
         and allow[0]["priority"] < deny[0]["priority"] <= 4096,
     )
     check("sshSourceCidr has no default", "defaultValue" not in nodes["parameters"]["sshSourceCidr"])
+    # 0.0.0.0/0 is 9 characters, * is 1 and Internet is 8.
+    check(
+        "sshSourceCidr cannot be as short as 0.0.0.0/0, * or Internet",
+        nodes["parameters"]["sshSourceCidr"].get("minLength", 0) >= 10,
+    )
     vnet = of(every, "Microsoft.Network/virtualNetworks")[0]
     check(
         "the one subnet is behind that security group",

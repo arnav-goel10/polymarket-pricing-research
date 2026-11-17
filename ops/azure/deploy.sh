@@ -34,8 +34,8 @@ done
 [[ $repo =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "--github-repo OWNER/REPO is required"
 [[ $email =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "--budget-email is required"
 if [ "$bootstrap_only" -eq 0 ]; then
-  [[ $cidr =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "--ssh-cidr A.B.C.D/N is required"
-  [ "${cidr##*/}" -ge 24 ] || die "--ssh-cidr must be /24 or narrower; 0.0.0.0/0 would open SSH to everyone"
+  # The same check the ha-infra job of the workflow runs.
+  "$(dirname "$0")/check_cidr.sh" "$cidr" || die "--ssh-cidr A.B.C.D/N is required, /24 or narrower"
   [ -r "$key_file" ] || die "--ssh-key-file must name a readable public key"
   case "$(cut -d' ' -f1 "$key_file")" in
     ssh-ed25519 | ssh-rsa) ;;

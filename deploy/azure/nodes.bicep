@@ -11,7 +11,12 @@
 
 param location string = resourceGroup().location
 
+// The length bounds turn away 0.0.0.0/0, * and a service tag here too. The
+// full rule, one IPv4 range of /24 or narrower, is ops/azure/check_cidr.sh,
+// which both ways of deploying run first.
 @description('The only address range that may open SSH, for example 203.0.113.7/32.')
+@minLength(10)
+@maxLength(18)
 param sshSourceCidr string
 
 @description('The admin SSH public key. Password login is off.')
