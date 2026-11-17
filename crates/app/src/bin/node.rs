@@ -31,6 +31,8 @@
 //! leads, and reports the epoch and leadership in `hb`, `/ha` and
 //! `/metrics`. `--lease-timing` sets ttl, renew, poll, holder margin and
 //! takeover margin in milliseconds (default 30000,10000,5000,2000,1000).
+//! With a store the node exits 2 unless a slot lasts at least as long as a
+//! takeover (ttl, takeover margin and two polls).
 //! `--azure-store https://<account>.blob.core.windows.net` puts the lease
 //! and the archive on Blob Storage instead (`ha::azure`), signed with the
 //! VM's managed identity; `POLY_AZURE_CLIENT_ID` names the identity when
@@ -203,6 +205,17 @@ fn parse_args() -> Result<Args, String> {
             }
             s => return Err(format!("unknown argument {s}")),
         }
+    }
+    // A leader that stalls and keeps the lease has stalled for less than a
+    // takeover takes, and it files what arrived meanwhile in the slot it
+    // wakes in. The overlap object covers a shift of one slot, so a slot
+    // must last at least as long as a takeover.
+    let takeover_ms = a.timing.ttl_ms + a.timing.takeover_margin_ms + 2 * a.timing.poll_ms;
+    if (a.store.is_some() || a.azure.is_some()) && (a.slot_ms as u64) < takeover_ms {
+        return Err(format!(
+            "--slot-ms {} is shorter than a takeover ({takeover_ms} ms: ttl, takeover margin and two polls)",
+            a.slot_ms
+        ));
     }
     if !a.listen.ip().is_loopback() {
         return Err(format!(

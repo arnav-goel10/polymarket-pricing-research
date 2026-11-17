@@ -668,6 +668,34 @@ fn the_stream_refuses_a_non_loopback_address() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("loopback"));
 }
 
+/// A leader that stalls for under a takeover keeps the lease and files what
+/// arrived meanwhile in the slot it wakes in. The overlap object covers a
+/// shift of one slot, so a slot shorter than a takeover is refused.
+#[test]
+fn a_slot_shorter_than_a_takeover_is_refused_with_a_store() {
+    let run = |slot_ms: &str, store: bool| {
+        let dir = temp_dir("slot");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_node"));
+        cmd.args(["--data", dir.join("data").to_str().unwrap()])
+            // Not loopback, so a run that gets past the slot check stops at
+            // the next one instead of starting.
+            .args(["--listen", "0.0.0.0:0"])
+            .args(["--slot-ms", slot_ms])
+            .args(["--lease-timing", "4000,1000,500,1000,500"])
+            .env_remove("POLY_MUTANT");
+        if store {
+            cmd.args(["--store", dir.join("store").to_str().unwrap()]);
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // ttl 4 s, takeover margin 0.5 s and two 0.5 s polls: 5.5 s.
+    assert!(run("5499", true).contains("shorter than a takeover"));
+    assert!(run("5500", true).contains("loopback"));
+    assert!(run("2000", false).contains("loopback"));
+}
+
 #[cfg(feature = "mutants")]
 mod mutants {
     use super::*;

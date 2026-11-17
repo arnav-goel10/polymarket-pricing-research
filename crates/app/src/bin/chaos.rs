@@ -35,8 +35,9 @@
 //! victim first, so the greeting has somewhere to go.
 //!
 //! `--archive 1` points both nodes at one directory store in the run
-//! directory, with 2 s slots and a scaled lease (ttl 4 s, renew 1 s, poll
-//! 0.5 s, margins 1 s and 0.5 s), and adds the archive verdict
+//! directory, with 6 s slots and a scaled lease (ttl 4 s, renew 1 s, poll
+//! 0.5 s, margins 1 s and 0.5 s, so a takeover within 5.5 s and a slot no
+//! shorter than that), and adds the archive verdict
 //! (`verify-archive`) after the stream verdict. `--leader-freezes N` turns
 //! the last N faults into `freeze_leader`: SIGSTOP on whichever node `/ha`
 //! says leads, for `--leader-freeze-ms`, while the harness times the
@@ -989,8 +990,10 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
             args.extend([
                 "--store".into(),
                 store.to_string_lossy().into_owned(),
+                // A slot is no shorter than a takeover (5.5 s here), as the
+                // node requires and as on Azure (60 s against 41 s).
                 "--slot-ms".into(),
-                "2000".into(),
+                "6000".into(),
                 "--lease-timing".into(),
                 "4000,1000,500,1000,500".into(),
             ]);
