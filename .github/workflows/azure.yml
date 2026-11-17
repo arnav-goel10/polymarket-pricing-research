@@ -16,13 +16,16 @@ name: Azure
 # Azure accepts only for that environment of this repository. The ids it
 # needs are environment variables, not secrets.
 #
-# Until the owner has created that environment and limited which tags may
-# use it, the workflow does nothing: the `gate` job, which has no
-# environment and no Azure access, finds no protected environment and every
-# other job is skipped. A skipped job does not create the environment.
+# Until the owner has created that environment and limited it to ha-* tags,
+# the workflow does nothing: the `gate` job, which has no environment and
+# no Azure access, reads the environment and its deployment rules, and
+# every other job is skipped unless each rule is an ha-* tag. A skipped job
+# does not create the environment.
 #
 # The repository is public, so are these logs. No step prints venue data,
-# and the SSH source range and key are masked.
+# and the SSH source range and key and the subscription, tenant and client
+# ids are masked. Every action is pinned to a commit, since these jobs can
+# sign in to Azure and build the binary the VMs run.
 
 on:
   push:
@@ -54,7 +57,7 @@ jobs:
       ready: ${{ steps.check.outputs.ready }}
       action: ${{ steps.check.outputs.action }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Is the azure environment there, and limited to chosen tags?
         id: check
         env:
@@ -69,6 +72,7 @@ jobs:
             reason=ok) ;;
             reason=missing) echo "::notice::There is no GitHub environment named azure. Nothing was done. See docs/AZURE_RUNBOOK.md." ;;
             reason=open) echo "::notice::The azure environment lets any branch or tag deploy. Limit it to the ha-* tags first. Nothing was done." ;;
+            reason=policy) echo "::notice::The azure environment must allow ha-* tags and nothing else. Its list of rules is empty or names another branch or tag. Nothing was done." ;;
             *) echo "::notice::The azure environment could not be read. Nothing was done." ;;
           esac
 
@@ -82,12 +86,32 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/login@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Keep the account ids out of the public log
+        env:
+          IDS: ${{ vars.AZURE_SUBSCRIPTION_ID }} ${{ vars.AZURE_TENANT_ID }} ${{ vars.AZURE_CLIENT_ID }}
+        run: |
+          for id in $IDS; do
+            echo "::add-mask::$id"
+          done
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # The same check ops/azure/deploy.sh makes, before Azure is asked
+      # anything: one IPv4 range, /24 or narrower. The template takes any
+      # string, so without this 0.0.0.0/0 would deploy.
+      - name: The SSH source range is /24 or narrower
+        env:
+          SSH_SOURCE_CIDR: ${{ vars.SSH_SOURCE_CIDR }}
+          SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
+        run: |
+          test -n "$SSH_SOURCE_CIDR" && test -n "$SSH_PUBLIC_KEY"
+          echo "::add-mask::$SSH_SOURCE_CIDR"
+          echo "::add-mask::${SSH_SOURCE_CIDR%/*}"
+          echo "::add-mask::$SSH_PUBLIC_KEY"
+          ops/azure/check_cidr.sh "$SSH_SOURCE_CIDR"
       - name: What would change
         env:
           SSH_SOURCE_CIDR: ${{ vars.SSH_SOURCE_CIDR }}
@@ -96,7 +120,6 @@ jobs:
           echo "::add-mask::$SSH_SOURCE_CIDR"
           echo "::add-mask::${SSH_SOURCE_CIDR%/*}"
           echo "::add-mask::$SSH_PUBLIC_KEY"
-          test -n "$SSH_SOURCE_CIDR" && test -n "$SSH_PUBLIC_KEY"
           az deployment group what-if --name poly-ha-nodes --resource-group "$RG" \
             --template-file deploy/azure/nodes.bicep \
             --parameters "sshSourceCidr=$SSH_SOURCE_CIDR" "sshPublicKey=$SSH_PUBLIC_KEY" \
@@ -109,6 +132,7 @@ jobs:
           echo "::add-mask::$SSH_SOURCE_CIDR"
           echo "::add-mask::${SSH_SOURCE_CIDR%/*}"
           echo "::add-mask::$SSH_PUBLIC_KEY"
+          ops/azure/check_cidr.sh "$SSH_SOURCE_CIDR"
           az deployment group create --name poly-ha-nodes --resource-group "$RG" \
             --template-file deploy/azure/nodes.bicep \
             --parameters "sshSourceCidr=$SSH_SOURCE_CIDR" "sshPublicKey=$SSH_PUBLIC_KEY" \
@@ -131,9 +155,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo build --locked --release -p app --bin node
       - name: Name the build and record its digest
         run: |
@@ -141,7 +167,7 @@ jobs:
           cp target/release/node "out/node-${{ matrix.arch }}"
           (cd out && sha256sum "node-${{ matrix.arch }}" | cut -d' ' -f1 >"node-${{ matrix.arch }}.sha256")
           cat "out/node-${{ matrix.arch }}.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: node-${{ matrix.arch }}
           path: out/
@@ -157,12 +183,19 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: out
           merge-multiple: true
-      - uses: azure/login@v2
+      - name: Keep the account ids out of the public log
+        env:
+          IDS: ${{ vars.AZURE_SUBSCRIPTION_ID }} ${{ vars.AZURE_TENANT_ID }} ${{ vars.AZURE_CLIENT_ID }}
+        run: |
+          for id in $IDS; do
+            echo "::add-mask::$id"
+          done
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
@@ -222,7 +255,14 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: azure/login@v2
+      - name: Keep the account ids out of the public log
+        env:
+          IDS: ${{ vars.AZURE_SUBSCRIPTION_ID }} ${{ vars.AZURE_TENANT_ID }} ${{ vars.AZURE_CLIENT_ID }}
+        run: |
+          for id in $IDS; do
+            echo "::add-mask::$id"
+          done
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
@@ -243,7 +283,14 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: azure/login@v2
+      - name: Keep the account ids out of the public log
+        env:
+          IDS: ${{ vars.AZURE_SUBSCRIPTION_ID }} ${{ vars.AZURE_TENANT_ID }} ${{ vars.AZURE_CLIENT_ID }}
+        run: |
+          for id in $IDS; do
+            echo "::add-mask::$id"
+          done
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
@@ -264,7 +311,14 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: azure/login@v2
+      - name: Keep the account ids out of the public log
+        env:
+          IDS: ${{ vars.AZURE_SUBSCRIPTION_ID }} ${{ vars.AZURE_TENANT_ID }} ${{ vars.AZURE_CLIENT_ID }}
+        run: |
+          for id in $IDS; do
+            echo "::add-mask::$id"
+          done
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
         with:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
