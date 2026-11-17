@@ -133,7 +133,7 @@ git tag ha-infra-1 && git push origin ha-infra-1
 git tag ha-deploy-1 && git push origin ha-deploy-1
 
 # 9. Look
-gh run list --workflow azure.yml --limit 5
+gh run list --event push --limit 5      # the runs named Azure
 ops/azure/status.sh
 ```
 
