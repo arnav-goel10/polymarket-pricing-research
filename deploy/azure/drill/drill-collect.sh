@@ -76,7 +76,7 @@ for f in "$data"/seg/*.prec "$data"/seg/*.prec.open; do
   files=$((files + 1))
   bytes=$((bytes + $(stat -c %s "$tmpd/seg.gz")))
 done
-stage=done
+stage=finished
 
 echo "drill-collect: node $POLY_NODE_ID segments=$files gz_bytes=$bytes slots=$lo..$hi"
 echo "POLY_OK drill-collect"
