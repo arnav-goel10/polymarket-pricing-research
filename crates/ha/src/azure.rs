@@ -1216,6 +1216,224 @@ x-ms-version:2023-11-03\n/acct/acct/lease/HEAD.json"
         assert_eq!(s.read_head(), Ok(None));
     }
 
+    /// What a relay between a store and the emulator does to each request.
+    #[derive(Clone, Copy)]
+    enum Lose {
+        /// Pass the request on, wait for the emulator's answer, then hang
+        /// up without it: the write was applied and the reply is lost.
+        Reply,
+        /// Take the request and hang up: it left and never arrived.
+        Request,
+    }
+
+    /// The emulator's host and port.
+    fn emulator_addr() -> String {
+        let u = reqwest::Url::parse(&env("POLY_AZURITE_URL")).expect("emulator url");
+        format!(
+            "{}:{}",
+            u.host_str().expect("emulator host"),
+            u.port_or_known_default().expect("emulator port")
+        )
+    }
+
+    /// Start a relay on a loopback port and return the port.
+    fn relay(lose: Lose) -> u16 {
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        let upstream = emulator_addr();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("relay port");
+        let port = listener.local_addr().expect("relay address").port();
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let mut first = [0u8; 1];
+                match lose {
+                    Lose::Request => {
+                        let mut c = client;
+                        let _ = std::io::Read::read(&mut c, &mut first);
+                        let _ = c.shutdown(Shutdown::Both);
+                    }
+                    Lose::Reply => {
+                        let Ok(mut up) = TcpStream::connect(&upstream) else {
+                            continue;
+                        };
+                        let (Ok(mut from), Ok(mut to)) = (client.try_clone(), up.try_clone())
+                        else {
+                            continue;
+                        };
+                        std::thread::spawn(move || {
+                            let _ = std::io::copy(&mut from, &mut to);
+                        });
+                        std::thread::spawn(move || {
+                            // The first byte of the answer: the emulator
+                            // has applied the write.
+                            let _ = std::io::Read::read(&mut up, &mut first);
+                            let _ = client.shutdown(Shutdown::Both);
+                            let _ = up.shutdown(Shutdown::Both);
+                        });
+                    }
+                }
+            }
+        });
+        port
+    }
+
+    /// The same account and containers as `s`, reached through `port`.
+    fn through(s: &AzureStore, port: u16) -> AzureStore {
+        let mut cfg = s.config().clone();
+        cfg.endpoint = format!("http://127.0.0.1:{port}{}", s.0.base_path);
+        AzureStore::new(cfg).expect("a store through the relay")
+    }
+
+    /// Reads go straight to the emulator. The first `left` writes go
+    /// through a relay, the rest straight.
+    struct Lossy<'a> {
+        direct: &'a AzureStore,
+        relayed: &'a AzureStore,
+        left: AtomicU64,
+    }
+
+    impl HeadStore for Lossy<'_> {
+        fn read_head(&self) -> HeadRead {
+            self.direct.read_head()
+        }
+        fn write_head(&self, body: &[u8], cond: &Cond) -> WriteOutcome {
+            if self.left.load(Ordering::Relaxed) > 0 {
+                self.left.fetch_sub(1, Ordering::Relaxed);
+                self.relayed.write_head(body, cond)
+            } else {
+                self.direct.write_head(body, cond)
+            }
+        }
+    }
+
+    /// The case the lease cannot do without: a write that was sent and got
+    /// no answer. Over real HTTP it must come back as unknown, whether it
+    /// was applied or not, and the lease must settle it by reading HEAD.
+    #[test]
+    #[ignore = "needs the Azurite emulator"]
+    fn emulator_a_write_with_no_answer_is_unknown_and_the_lease_settles_it() {
+        // Applied, reply lost.
+        let s = fresh("lostreply");
+        let lost_reply = through(&s, relay(Lose::Reply));
+        assert_eq!(
+            lost_reply.write_head(b"one", &Cond::IfNoneMatch),
+            WriteOutcome::Unknown
+        );
+        let (body, e1) = s.read_head().unwrap().expect("the write was applied");
+        assert_eq!(body, b"one".to_vec());
+        assert_eq!(
+            lost_reply.write_head(b"two", &Cond::IfMatch(e1)),
+            WriteOutcome::Unknown
+        );
+        assert_eq!(s.read_head().unwrap().unwrap().0, b"two".to_vec());
+        // An object upload with the reply lost is unknown too, and the
+        // retry finds the object there.
+        let d = scratch("lostreply");
+        let src = d.join("src");
+        std::fs::write(&src, b"slot").unwrap();
+        assert_eq!(lost_reply.put_new("seg/a", &src), PutOutcome::Unknown);
+        assert_eq!(s.put_new("seg/a", &src), PutOutcome::PreconditionFailed);
+
+        // Sent, never arrived.
+        let lost_request = through(&s, relay(Lose::Request));
+        let (_, e2) = s.read_head().unwrap().unwrap();
+        assert_eq!(
+            lost_request.write_head(b"three", &Cond::IfMatch(e2.clone())),
+            WriteOutcome::Unknown
+        );
+        assert_eq!(
+            s.read_head().unwrap(),
+            Some((b"two".to_vec(), e2)),
+            "a lost request was applied"
+        );
+        assert_eq!(lost_request.put_new("seg/b", &src), PutOutcome::Unknown);
+        assert_eq!(s.list("seg/").unwrap(), vec!["seg/a".to_string()]);
+        let _ = std::fs::remove_dir_all(d);
+
+        // The lease over a store that loses the reply to its grant and to
+        // its first commit: both landed, and it finds each by reading HEAD.
+        let s = fresh("lostreply-lease");
+        let relayed = through(&s, relay(Lose::Reply));
+        let store = Lossy {
+            direct: &s,
+            relayed: &relayed,
+            left: AtomicU64::new(2),
+        };
+        let mut a = CasLease::new(Config::new(1, 8));
+        step(&mut a, &store, 0);
+        assert!(a.leads(0), "the grant landed and was not found");
+        a.commit(5);
+        step(&mut a, &store, 1);
+        assert_eq!(a.committed_to(), Some(5));
+        let st = a.stats();
+        assert_eq!(
+            (
+                st.unknown_outcomes,
+                st.grants,
+                st.commits,
+                st.fence_rejected
+            ),
+            (2, 1, 1, 0)
+        );
+        let h = head(&s);
+        assert_eq!((h.epoch, h.holder, h.committed_to()), (1, Some(1), Some(5)));
+
+        // The lease over a store that loses the grant on its way: nothing
+        // landed, so it sends the same write again and leads once.
+        let s = fresh("lostrequest-lease");
+        let relayed = through(&s, relay(Lose::Request));
+        let store = Lossy {
+            direct: &s,
+            relayed: &relayed,
+            left: AtomicU64::new(1),
+        };
+        let mut b = CasLease::new(Config::new(2, 9));
+        step(&mut b, &store, 0);
+        assert!(!b.leads(0), "leads on a write that never arrived");
+        assert_eq!(s.read_head(), Ok(None));
+        step(&mut b, &store, 1_000);
+        assert!(b.leads(1_000));
+        let st = b.stats();
+        assert_eq!((st.unknown_outcomes, st.retries, st.grants), (1, 1, 1));
+        let h = head(&s);
+        assert_eq!((h.epoch, h.holder), (1, Some(2)));
+    }
+
+    /// A store that cannot be reached at all: the request never left, so
+    /// the answer is "not written", not "unknown".
+    #[test]
+    #[ignore = "needs the Azurite emulator"]
+    fn emulator_a_closed_port_is_unreachable_and_writes_nothing() {
+        let s = fresh("closedport");
+        // A loopback port with nothing listening: bound once, then freed.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free port")
+            .port();
+        let dead = through(&s, port);
+        assert_eq!(
+            dead.write_head(b"x", &Cond::IfNoneMatch),
+            WriteOutcome::Unreachable
+        );
+        assert_eq!(
+            dead.write_head(b"x", &etag("\"0x1\"")),
+            WriteOutcome::Unreachable
+        );
+        assert!(dead.read_head().is_err(), "read as a missing HEAD");
+        assert!(dead.list("").is_err());
+        let d = scratch("closedport");
+        let src = d.join("src");
+        std::fs::write(&src, b"slot").unwrap();
+        assert_eq!(dead.put_new("seg/a", &src), PutOutcome::Unreachable);
+        let _ = std::fs::remove_dir_all(d);
+        assert_eq!(s.read_head(), Ok(None));
+        assert!(s.list("").unwrap().is_empty());
+        // The lease does not lead, and counts nothing as unknown.
+        let mut a = CasLease::new(Config::new(1, 8));
+        step(&mut a, &dead, 0);
+        assert!(!a.leads(0));
+        assert_eq!((a.stats().grants, a.stats().unknown_outcomes), (0, 0));
+    }
+
     /// a leads and commits, freezes past its deadline, b takes over, a
     /// wakes. The lease runs on its own clock, so the test passes the times
     /// in and nothing waits.
