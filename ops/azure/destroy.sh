@@ -21,6 +21,13 @@ if ! group_exists; then
   exit 0
 fi
 
+# Only a group this project made. POLY_RG can name any group, and the
+# bootstrap template tags the one it creates.
+project=$(az group show -n "$RG" --query tags.project -o tsv 2>/dev/null || true)
+if [ "$project" != poly-ha ]; then
+  die "resource group $RG is not tagged project=poly-ha. Not deleting it."
+fi
+
 say ""
 say "This deletes resource group $RG and everything in it, for good:"
 az resource list -g "$RG" --query "[].{name:name, type:type}" -o table

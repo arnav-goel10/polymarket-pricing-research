@@ -22,6 +22,8 @@ case "$*" in
     if [ -e "$AZ_STATE/group-deleted" ]; then echo false; else echo "${FAKE_GROUP_EXISTS:-true}"; fi
     ;;
   "group delete"*) touch "$AZ_STATE/group-deleted" ;;
+  "group show"*"tags.project"*) echo "${FAKE_GROUP_TAG-poly-ha}" ;;
+  "vm run-command invoke"*) echo "${FAKE_RUN_OUTPUT:-POLY_OK status}" ;;
   "provider show"*) echo "${FAKE_PROVIDER_STATE:-Registered}" ;;
   "consumption budget show"*) [ "${FAKE_BUDGET:-0}" = 1 ] || exit 3 ;;
   "resource list --tag"*"length(@)"*) echo 0 ;;
@@ -36,7 +38,7 @@ deploy_args=(--github-repo owner/repo --budget-email owner@example.com
   --ssh-cidr 203.0.113.7/32 --ssh-key-file "$key")
 
 # Calls that change something in Azure.
-mutating='^(deployment (sub|group|mg|tenant) (create|delete)|group (create|delete)|vm (deallocate|start|stop|delete|create|restart)|provider register|role assignment|storage|identity|ad |account set|login)'
+mutating='^(deployment (sub|group|mg|tenant) (create|delete)|group (create|delete)|vm (deallocate|start|stop|delete|create|restart|run-command)|provider register|role assignment|storage|identity|ad |account set|login)'
 
 fails=0
 check() {
@@ -155,6 +157,110 @@ check grep -q "^deployment sub delete --name poly-ha-bootstrap" "$AZ_LOG"
 start "destroy with no group deletes nothing" env FAKE_GROUP_EXISTS=false "$here/destroy.sh" --yes
 check test "$code" = 0
 check no_change
+
+start "destroy refuses a group this project did not tag" env FAKE_GROUP_TAG=other "$here/destroy.sh" --yes
+check test "$code" != 0
+check no_change
+check grep -q "not tagged project=poly-ha" <<<"$out"
+
+start "destroy refuses a group with no tag" env FAKE_GROUP_TAG= "$here/destroy.sh" --yes
+check test "$code" != 0
+check no_change
+
+# The SSH range: one check, shared by deploy.sh and the workflow.
+not_printed() {
+  [ -z "$range" ] || ! grep -qF -- "$range" <<<"$out"
+}
+for range in 203.0.113.7/32 198.51.100.0/24; do
+  start "an SSH range of $range is accepted" "$here/check_cidr.sh" "$range"
+  check test "$code" = 0
+done
+for range in 0.0.0.0/0 10.0.0.0/8 203.0.113.0/23 "*" Internet 203.0.113.7 300.0.113.7/32 203.0.113.7/33 "::/0" ""; do
+  start "an SSH range of '$range' is refused" "$here/check_cidr.sh" "$range"
+  check test "$code" = 1
+  # The log of the workflow is public: the range is never printed back.
+  check not_printed
+done
+
+# vm_run.sh changes a VM, so it holds to the subscription rule too.
+start "vm_run refuses another subscription" env FAKE_SUBSCRIPTION=Klimacap "$here/vm_run.sh" node-a status
+check test "$code" != 0
+check no_change
+check grep -q "Not touching it" <<<"$out"
+
+start "vm_run runs one command on the right subscription" "$here/vm_run.sh" node-a status
+check test "$code" = 0
+check test "$(changed)" = 1
+check grep -q "^vm run-command invoke -g poly-ha -n node-a .*polyctl.sh status" "$AZ_LOG"
+
+start "vm_run fails when the command did not finish" env FAKE_RUN_OUTPUT=nothing "$here/vm_run.sh" node-a status
+check test "$code" = 1
+
+start "vm_run refuses an argument that is not a plain word" "$here/vm_run.sh" node-a status 'x;reboot'
+check test "$code" = 2
+check no_change
+
+# The gate of the workflow, against a fake `gh`. It must say ready only for
+# an environment whose every deployment rule is an ha-* tag.
+cat >"$tmp/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+case "$2" in
+  */deployment-branch-policies*)
+    [ -n "${FAKE_POLICIES:-}" ] || exit 1
+    printf '%s\n' "$FAKE_POLICIES"
+    ;;
+  */environments/*)
+    case "${FAKE_ENV:-missing}" in
+      missing) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+      broken) echo "gh: Server Error (HTTP 502)" >&2; exit 1 ;;
+      *) printf '%s\n' "$FAKE_ENV" ;;
+    esac
+    ;;
+esac
+STUB
+chmod +x "$tmp/bin/gh"
+export GITHUB_REPOSITORY=owner/repo GH_TOKEN=none
+limited='{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}'
+policies() {
+  local n=$# list
+  list=$(printf '%s,' "$@")
+  printf '{"total_count":%s,"branch_policies":[%s]}' "${TOTAL:-$n}" "${list%,}"
+}
+tag='{"name":"ha-*","type":"tag"}'
+gate() {
+  local want=$1
+  shift
+  start "gate: $name_for_gate" env "$@" "$here/gate.sh" azure
+  check test "$code" = 0
+  check grep -qx "reason=$want" <<<"$out"
+  if [ "$want" = ok ]; then
+    check grep -qx "ready=true" <<<"$out"
+  else
+    check grep -qx "ready=false" <<<"$out"
+  fi
+}
+name_for_gate="no environment is not ready"
+gate missing FAKE_ENV=missing
+name_for_gate="an unreadable environment is not ready"
+gate unreadable FAKE_ENV=broken
+name_for_gate="an environment open to every ref is not ready"
+gate open FAKE_ENV='{"deployment_branch_policy":null}'
+name_for_gate="protected branches only is not ready"
+gate open FAKE_ENV='{"deployment_branch_policy":{"protected_branches":true,"custom_branch_policies":false}}'
+name_for_gate="an unreadable rule list is not ready"
+gate unreadable FAKE_ENV="$limited"
+name_for_gate="an empty rule list is not ready"
+gate policy FAKE_ENV="$limited" FAKE_POLICIES="$(policies)"
+name_for_gate="a branch rule is not ready"
+gate policy FAKE_ENV="$limited" FAKE_POLICIES="$(policies "$tag" '{"name":"main","type":"branch"}')"
+name_for_gate="a branch named like the tags is not ready"
+gate policy FAKE_ENV="$limited" FAKE_POLICIES="$(policies '{"name":"ha-*","type":"branch"}')"
+name_for_gate="a tag rule for every tag is not ready"
+gate policy FAKE_ENV="$limited" FAKE_POLICIES="$(policies "$tag" '{"name":"*","type":"tag"}')"
+name_for_gate="a rule list cut short is not ready"
+gate unreadable FAKE_ENV="$limited" FAKE_POLICIES="$(TOTAL=140 policies "$tag")"
+name_for_gate="only ha-* tag rules is ready"
+gate ok FAKE_ENV="$limited" FAKE_POLICIES="$(policies "$tag" '{"name":"ha-drill-*","type":"tag"}')"
 
 if [ "$fails" -gt 0 ]; then
   echo "$fails checks failed"

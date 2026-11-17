@@ -8,10 +8,12 @@
 #
 # run-command reports success even when the script exits non-zero, so the
 # check is the line `POLY_OK <command>` that polyctl.sh prints last.
-# This changes the VM (install restarts the node), so it is not for a
-# dry run; the workflow is its caller.
+# This changes the VM (install restarts the node) and has no dry run; the
+# workflow is its caller. Like the other scripts it refuses any
+# subscription but the project's.
 set -euo pipefail
-rg=${RG:-poly-ha}
+# shellcheck source=ops/azure/lib.sh
+. "$(dirname "$0")/lib.sh"
 vm=${1:?usage: vm_run.sh VM COMMAND [ARG...]}
 cmd=${2:?usage: vm_run.sh VM COMMAND [ARG...]}
 shift 2
@@ -29,7 +31,10 @@ for word in "$cmd" "$@"; do
   }
 done
 
-out=$(az vm run-command invoke -g "$rg" -n "$vm" --command-id RunShellScript \
+# Its output is the command's output, so the subscription line goes to stderr.
+require_subscription >&2
+
+out=$(az vm run-command invoke -g "$RG" -n "$vm" --command-id RunShellScript \
   --scripts "/opt/poly/polyctl.sh $cmd $*" --query "value[0].message" -o tsv)
 printf '%s\n' "$out"
 grep -qx "POLY_OK $cmd" <<<"$out" || {
