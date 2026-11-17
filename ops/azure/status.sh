@@ -25,8 +25,10 @@ az resource list -g "$RG" --query "[].{name:name, type:type, project:tags.projec
 
 say ""
 say "Resources tagged project=poly-ha outside $RG (expected: none):"
+# Azure reports a disk's group in capitals, so compare without case.
 az resource list --tag project=poly-ha \
-  --query "[?resourceGroup!='$RG'].{name:name, type:type, group:resourceGroup}" -o table
+  --query "[].[name, type, resourceGroup]" -o tsv |
+  awk -F'\t' -v rg="$RG" 'tolower($3) != tolower(rg) { print $1 "  " $2 "  " $3; n++ } END { if (!n) print "none" }'
 
 say ""
 say "Budget:"
