@@ -330,7 +330,7 @@ step_close() {
 # Wait until both nodes run and are ready with exactly one leader, through
 # the VM agent. Prints the state of each, without addresses.
 wait_healthy() {
-  local when=$1 tries=${DRILL_HEALTH_TRIES:-20} a= b= ok=0 n f
+  local when=$1 tries=${DRILL_HEALTH_TRIES:-20} a='' b='' ok=0 n f
   for _ in $(seq 1 "$tries"); do
     a=$("$here/vm_run.sh" node-a status 2>/dev/null || true)
     b=$("$here/vm_run.sh" node-b status 2>/dev/null || true)

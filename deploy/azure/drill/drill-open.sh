@@ -36,7 +36,9 @@ blob_len=$(printf '%s' "$b64" | base64 -d 2>/dev/null | wc -c)
 [ "$blob_len" -eq 51 ] || fail "the key is not an ed25519 public key"
 printf '%s' "$b64" | base64 -d | head -c 15 | grep -qa 'ssh-ed25519' || fail "the key is not an ed25519 public key"
 
-expiry=$(date -u -d '+4 hours' +%Y%m%d%H%MZ)
+# Local time with no zone suffix: sshd reads it in the system's own zone,
+# and the Z suffix is not understood by every OpenSSH release.
+expiry=$(date -d '+4 hours' +%Y%m%d%H%M)
 opts="restrict,port-forwarding,permitopen=\"127.0.0.1:9100\",permitopen=\"127.0.0.1:9101\",permitopen=\"127.0.0.1:9102\""
 # -R would need a listener; port 1 is privileged, so the drill user can
 # open none.
