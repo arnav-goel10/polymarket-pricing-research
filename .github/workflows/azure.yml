@@ -1,0 +1,275 @@
+name: Azure
+
+# Deploys and operates the two-node setup on Azure. See docs/AZURE_RUNBOOK.md.
+#
+# It runs only when one of these tags is pushed. A branch push, a pull
+# request, a schedule or a manual run never starts it:
+#
+#   ha-infra-*    create or update the network and the two VMs
+#   ha-deploy-*   build the node for both architectures, install it, check it
+#   ha-start-*    start both VMs
+#   ha-stop-*     deallocate both VMs
+#   ha-destroy-*  delete the resource group and everything in it
+#
+# There is no stored cloud secret. Every job that touches Azure runs in the
+# GitHub environment `azure` and signs in with GitHub's OIDC token, which
+# Azure accepts only for that environment of this repository. The ids it
+# needs are environment variables, not secrets.
+#
+# Until the owner has created that environment and limited which tags may
+# use it, the workflow does nothing: the `gate` job, which has no
+# environment and no Azure access, finds no protected environment and every
+# other job is skipped. A skipped job does not create the environment.
+#
+# The repository is public, so are these logs. No step prints venue data,
+# and the SSH source range and key are masked.
+
+on:
+  push:
+    tags:
+      - "ha-infra-*"
+      - "ha-deploy-*"
+      - "ha-start-*"
+      - "ha-stop-*"
+      - "ha-destroy-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: azure
+  cancel-in-progress: false
+
+env:
+  RG: poly-ha
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+      action: ${{ steps.check.outputs.action }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Is the azure environment there, and limited to chosen tags?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          action=${GITHUB_REF_NAME#ha-}
+          action=${action%%-*}
+          ops/azure/gate.sh azure | tee "$RUNNER_TEMP/gate"
+          cat "$RUNNER_TEMP/gate" >>"$GITHUB_OUTPUT"
+          echo "action=$action" >>"$GITHUB_OUTPUT"
+          case "$(grep '^reason=' "$RUNNER_TEMP/gate")" in
+            reason=ok) ;;
+            reason=missing) echo "::notice::There is no GitHub environment named azure. Nothing was done. See docs/AZURE_RUNBOOK.md." ;;
+            reason=open) echo "::notice::The azure environment lets any branch or tag deploy. Limit it to the ha-* tags first. Nothing was done." ;;
+            *) echo "::notice::The azure environment could not be read. Nothing was done." ;;
+          esac
+
+  infra:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true' && needs.gate.outputs.action == 'infra'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: azure
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: What would change
+        env:
+          SSH_SOURCE_CIDR: ${{ vars.SSH_SOURCE_CIDR }}
+          SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
+        run: |
+          echo "::add-mask::$SSH_SOURCE_CIDR"
+          echo "::add-mask::${SSH_SOURCE_CIDR%/*}"
+          echo "::add-mask::$SSH_PUBLIC_KEY"
+          test -n "$SSH_SOURCE_CIDR" && test -n "$SSH_PUBLIC_KEY"
+          az deployment group what-if --name poly-ha-nodes --resource-group "$RG" \
+            --template-file deploy/azure/nodes.bicep \
+            --parameters "sshSourceCidr=$SSH_SOURCE_CIDR" "sshPublicKey=$SSH_PUBLIC_KEY" \
+            --result-format ResourceIdOnly
+      - name: Create or update the network and the two VMs
+        env:
+          SSH_SOURCE_CIDR: ${{ vars.SSH_SOURCE_CIDR }}
+          SSH_PUBLIC_KEY: ${{ vars.SSH_PUBLIC_KEY }}
+        run: |
+          echo "::add-mask::$SSH_SOURCE_CIDR"
+          echo "::add-mask::${SSH_SOURCE_CIDR%/*}"
+          echo "::add-mask::$SSH_PUBLIC_KEY"
+          az deployment group create --name poly-ha-nodes --resource-group "$RG" \
+            --template-file deploy/azure/nodes.bicep \
+            --parameters "sshSourceCidr=$SSH_SOURCE_CIDR" "sshPublicKey=$SSH_PUBLIC_KEY" \
+            --output none
+          az vm list -g "$RG" -d \
+            --query "[].{name:name, power:powerState, size:hardwareProfile.vmSize, zone:zones[0]}" -o table
+
+  # The node as it runs on the VMs: no seeded faults compiled in, built on
+  # the same Ubuntu release as the VMs so it links the same system TLS.
+  build:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true' && needs.gate.outputs.action == 'deploy'
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release -p app --bin node
+      - name: Name the build and record its digest
+        run: |
+          mkdir out
+          cp target/release/node "out/node-${{ matrix.arch }}"
+          (cd out && sha256sum "node-${{ matrix.arch }}" | cut -d' ' -f1 >"node-${{ matrix.arch }}.sha256")
+          cat "out/node-${{ matrix.arch }}.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.arch }}
+          path: out/
+          retention-days: 3
+
+  deploy:
+    needs: [gate, build]
+    if: needs.gate.outputs.ready == 'true' && needs.gate.outputs.action == 'deploy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: azure
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Upload both builds to releases/<sha>/
+        run: |
+          account=$(az storage account list -g "$RG" --query "[0].name" -o tsv)
+          test -n "$account"
+          for arch in x64 arm64; do
+            az storage blob upload --auth-mode login --account-name "$account" \
+              --container-name archive --name "releases/$GITHUB_SHA/node-$arch" \
+              --file "out/node-$arch" --overwrite true --output none
+          done
+      - name: Start the VMs if they are deallocated
+        run: |
+          for n in node-a node-b; do
+            az vm start -g "$RG" -n "$n" --output none
+          done
+      - name: Install on node-a, wait for its feeds, then node-b
+        run: |
+          # x64 on node-a, Arm64 on node-b. Each install returns only once
+          # /readyz is 200, that is with all three venue feeds connected,
+          # so node-b is not touched until node-a is serving again.
+          ops/azure/vm_run.sh node-a install "$GITHUB_SHA" "$(cat out/node-x64.sha256)"
+          ops/azure/vm_run.sh node-b install "$GITHUB_SHA" "$(cat out/node-arm64.sha256)"
+      - name: Store contract suite against the real account, from each VM
+        run: |
+          ops/azure/vm_run.sh node-a selftest "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-a"
+          ops/azure/vm_run.sh node-b selftest "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-b"
+      - name: One leader, and slots being committed
+        run: |
+          # A takeover needs up to 41 s and the first slot closes when it
+          # is two minutes old, so give it eight minutes.
+          for i in $(seq 1 16); do
+            a=$(ops/azure/vm_run.sh node-a status || true)
+            b=$(ops/azure/vm_run.sh node-b status || true)
+            leaders=$(printf '%s\n%s\n' "$a" "$b" | grep -c '^poly_lease_leader 1$' || true)
+            commits=$(printf '%s\n%s\n' "$a" "$b" | awk '/^poly_archive_commits_total /{s+=$2} END{print s+0}')
+            echo "check $i: leaders=$leaders commits=$commits"
+            if [ "$leaders" = 1 ] && [ "$commits" -gt 0 ]; then
+              printf '%s\n\n%s\n' "$a" "$b" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 30
+          done
+          printf '%s\n\n%s\n' "$a" "$b"
+          echo "::error::expected exactly one leader and at least one committed slot"
+          exit 1
+
+  start:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true' && needs.gate.outputs.action == 'start'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: azure
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: |
+          for n in node-a node-b; do
+            az vm start -g "$RG" -n "$n" --output none
+          done
+          az vm list -g "$RG" -d --query "[].{name:name, power:powerState}" -o table
+
+  stop:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true' && needs.gate.outputs.action == 'stop'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: azure
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: |
+          for n in node-a node-b; do
+            az vm deallocate -g "$RG" -n "$n" --output none
+          done
+          az vm list -g "$RG" -d --query "[].{name:name, power:powerState}" -o table
+
+  destroy:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true' && needs.gate.outputs.action == 'destroy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: azure
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # The identity this job signed in as lives in the group, so the
+      # delete is handed to Azure and not waited for. Check afterwards
+      # with ops/azure/status.sh.
+      - run: az group delete -n "$RG" --yes --no-wait
