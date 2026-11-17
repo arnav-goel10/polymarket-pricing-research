@@ -50,6 +50,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: chaos
       - name: Build node, venue_sim and chaos with the seeded faults compiled in
         run: cargo build --locked --release -p app --features mutants --bin node --bin venue_sim --bin chaos
       # The two venue cuts at the end replay each venue's greeting to a node
@@ -96,10 +98,41 @@ jobs:
           a epoch-reuse epoch_two_holders
           exit "$fail"
 
+  # The archive case again on 30 other seeds, five to a runner. One green
+  # run of a case with timed faults says little; this is the repeat that
+  # shows a failure is not waiting on timing. Every run must pass.
+  chaos-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
+    env:
+      CHAOS_BIN: target/release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: chaos
+          save-if: false
+      - name: Build node, venue_sim and chaos
+        run: cargo build --locked --release -p app --features mutants --bin node --bin venue_sim --bin chaos
+      - name: Archive case, five seeds, a kill, a freeze and two leader freezes each
+        run: |
+          fail=0
+          for i in 1 2 3 4 5; do
+            seed=$((100 + ${{ matrix.shard }} * 5 + i))
+            scripts/chaos_case.sh "archive-$seed" pass --seed "$seed" --rate 200 --faults 4 --gap-ms 4000 --archive 1 --leader-freezes 2 || fail=1
+          done
+          exit "$fail"
+
   # The Blob store against the Azurite emulator: the same contract suite the
-  # directory store passes, racing writers, and a zombie leader fenced by
-  # the conditional write. Nothing here touches Azure. The account key
-  # below is made up for this job's emulator and opens nothing else.
+  # directory store passes, racing writers, a zombie leader fenced by the
+  # conditional write, and writes whose reply or request is lost on the
+  # way. Nothing here touches Azure. The account key below is made up for
+  # this job's emulator and opens nothing else.
   azurite:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -118,11 +151,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Blob store tests against Azurite, all eight must run
+      - name: Blob store tests against Azurite, all ten must run
         run: |
           set -o pipefail
           cargo test --locked -p ha --lib azure::tests::emulator -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/azurite.out"
-          grep -q "test result: ok. 8 passed; 0 failed; 0 ignored" "$RUNNER_TEMP/azurite.out"
+          grep -q "test result: ok. 10 passed; 0 failed; 0 ignored" "$RUNNER_TEMP/azurite.out"
 
   # The Azure deploy code, checked without an Azure account: both templates
   # compile, the scripts lint, and a fake `az` shows that no script changes
