@@ -124,6 +124,37 @@ jobs:
           cargo test --locked -p ha --lib azure::tests::emulator -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/azurite.out"
           grep -q "test result: ok. 8 passed; 0 failed; 0 ignored" "$RUNNER_TEMP/azurite.out"
 
+  # The Azure deploy code, checked without an Azure account: both templates
+  # compile, the scripts lint, and a fake `az` shows that no script changes
+  # anything without --yes or on another subscription. Nothing is deployed
+  # from this workflow; .github/workflows/azure.yml does that, on ha-* tags.
+  azure-deploy-code:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Both Bicep templates compile, with no warning
+        run: |
+          for t in bootstrap nodes; do
+            az bicep build --file "deploy/azure/$t.bicep" --outdir "$RUNNER_TEMP" 2>"$RUNNER_TEMP/$t.log" || {
+              cat "$RUNNER_TEMP/$t.log"
+              exit 1
+            }
+            cat "$RUNNER_TEMP/$t.log"
+            ! grep -E "Warning|Error" "$RUNNER_TEMP/$t.log"
+            test -s "$RUNNER_TEMP/$t.json"
+          done
+      - name: The compiled templates hold what the runbook lists
+        run: python3 deploy/azure/check_templates.py "$RUNNER_TEMP/bootstrap.json" "$RUNNER_TEMP/nodes.json"
+      - name: Shell scripts lint
+        run: shellcheck --severity=warning -x ops/azure/*.sh deploy/azure/vm/*.sh
+      - name: No script changes anything without --yes
+        run: ops/azure/test_dry_run.sh
+      - name: The Azure workflow lints
+        run: |
+          docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.7 \
+            -color .github/workflows/azure.yml
+
   benches:
     runs-on: ubuntu-latest
     timeout-minutes: 25
