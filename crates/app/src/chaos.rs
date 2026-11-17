@@ -471,6 +471,25 @@ pub struct Spread {
     pub max: Option<f64>,
 }
 
+/// Median, p99 and max of a sample, as the reports give them.
+pub fn spread_of(v: Vec<f64>) -> Spread {
+    spread(v)
+}
+
+/// The outcome of named checks: the first failing one names the reason.
+pub fn outcome_of(checks: &[(&str, bool)]) -> Outcome {
+    let failures: Vec<String> = checks
+        .iter()
+        .filter(|(_, ok)| !ok)
+        .map(|(n, _)| n.to_string())
+        .collect();
+    Outcome {
+        result: if failures.is_empty() { "pass" } else { "fail" }.into(),
+        reason: failures.first().cloned(),
+        failures,
+    }
+}
+
 fn spread(mut v: Vec<f64>) -> Spread {
     v.sort_by(|a, b| a.total_cmp(b));
     let at = |q: f64| -> Option<f64> {

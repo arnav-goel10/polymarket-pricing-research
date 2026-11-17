@@ -5,6 +5,7 @@
 #   ops/azure/vm_run.sh VM COMMAND [ARG...]
 #   ops/azure/vm_run.sh node-a install <git sha> <sha256>
 #   ops/azure/vm_run.sh node-a status
+#   ops/azure/vm_run.sh node-a drill-close <run>
 #
 # run-command reports success even when the script exits non-zero, so the
 # check is the line `POLY_OK <command>` that polyctl.sh prints last.
@@ -34,8 +35,15 @@ done
 # Its output is the command's output, so the subscription line goes to stderr.
 require_subscription >&2
 
+# The drill commands are scripts of their own, installed by vm_tools.sh;
+# everything else is a polyctl.sh command.
+case "$cmd" in
+  drill-open | drill-collect | drill-close) script="/opt/poly/drill/$cmd.sh" ;;
+  *) script="/opt/poly/polyctl.sh $cmd" ;;
+esac
+
 out=$(az vm run-command invoke -g "$RG" -n "$vm" --command-id RunShellScript \
-  --scripts "/opt/poly/polyctl.sh $cmd $*" --query "value[0].message" -o tsv)
+  --scripts "$script $*" --query "value[0].message" -o tsv)
 printf '%s\n' "$out"
 grep -qx "POLY_OK $cmd" <<<"$out" || {
   echo "vm_run: $cmd on $vm did not finish" >&2

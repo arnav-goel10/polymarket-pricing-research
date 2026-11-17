@@ -128,6 +128,28 @@ jobs:
           done
           exit "$fail"
 
+  # The live drill's path on loopback, with no Azure: the real drill agent
+  # killing and freezing two nodes under restart loops, `chaos drill`
+  # through the agents, the collection, and `chaos verify-drill` with the
+  # union of the nodes' recordings as truth, cross-checked against the
+  # simulator's own manifest. The workflow side of the drill is checked
+  # by ops/azure/test_dry_run.sh in azure-deploy-code.
+  drill-local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CHAOS_BIN: target/release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: drill
+      - name: Build node, venue_sim and chaos as the drill uses them, without seeded faults
+        run: cargo build --locked --release -p app --bin node --bin venue_sim --bin chaos
+      - name: Rehearsal on loopback, three kills and a leader freeze through the agents
+        run: ops/azure/test_drill_local.sh
+
   # The Blob store against the Azurite emulator: the same contract suite the
   # directory store passes, racing writers, a zombie leader fenced by the
   # conditional write, and writes whose reply or request is lost on the
@@ -180,8 +202,8 @@ jobs:
       - name: The compiled templates hold what the runbook lists
         run: python3 deploy/azure/check_templates.py "$RUNNER_TEMP/bootstrap.json" "$RUNNER_TEMP/nodes.json"
       - name: Shell scripts lint
-        run: shellcheck --severity=warning -x ops/azure/*.sh deploy/azure/vm/*.sh
-      - name: No script changes anything without --yes
+        run: shellcheck --severity=warning -x ops/azure/*.sh deploy/azure/vm/*.sh deploy/azure/drill/*.sh
+      - name: No script changes anything without --yes, and the drill runner leaks no address or key
         run: ops/azure/test_dry_run.sh
       - name: The Azure workflow lints
         run: |

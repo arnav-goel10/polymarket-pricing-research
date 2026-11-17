@@ -12,6 +12,12 @@
 //! chaos client --nodes URL,URL --seconds N --run DIR [--mutant NAME]
 //! chaos verify --run DIR --truth FILE
 //! chaos verify-archive --run DIR [--store DIR]
+//! chaos drill  --run DIR --nodes URL,URL --http ADDR,ADDR --agents ADDR,ADDR
+//!              [--seed 1] [--faults 20] [--gap-ms 90000] [--leader-freezes 6]
+//!              [--leader-freeze-ms 60000] [--margin-s 15] [--ready-limit-s 120]
+//! chaos verify-drill --run DIR --collected DIR [--slot-ms 60000]
+//!              [--takeover-gate-ms 45000]
+//! chaos store-dump --store DIR --out DIR
 //! ```
 //!
 //! `local` does the whole run on this machine: it starts `venue_sim` with a
@@ -47,6 +53,17 @@
 //! 2 invalid: a node exited on its own, a peer never became ready, or the
 //! subscriptions never all went live.
 //!
+//! `drill` is the live drill (spec 4.7, `docs/HA_DRILL.md`): the same
+//! client and fault driver against two nodes that run elsewhere. Each node
+//! is reached at three addresses, normally SSH forwards: its stream, its
+//! health endpoints, and the drill agent on its VM (`drill-agent.py`), which
+//! does the kill or the freeze when asked. A second client subscribes to
+//! node-a only, as the control. It writes the run directory and
+//! `times.json`, and judges nothing: `verify-drill` does that once both
+//! nodes' recordings and lease logs are collected, with their union as
+//! truth. `store-dump` writes a directory store's HEAD and object list in
+//! the form `verify-drill` reads, so the drill path runs in CI on loopback.
+//!
 //! `--mutant` picks one seeded fault and works only in a build with the
 //! `mutants` feature: `no-dedup`, `single-node`, `no-reconnect`,
 //! `late-deliver` (client),
@@ -54,6 +71,7 @@
 //! (node, through `POLY_MUTANT`), `overlap-kill` (harness).
 
 use app::chaos::{self, ClientRecord, ConnObs, Executed, FaultKind, Harness, LogLine, Plan};
+use app::drill;
 use ha::client::{self, ClientConfig, ClientMutant, Output};
 use std::collections::HashMap;
 use std::fs::File;
@@ -227,7 +245,17 @@ async fn run_client(
     stop: oneshot::Receiver<()>,
     tx: watch::Sender<Vec<bool>>,
 ) -> (ClientRecord, Vec<LogLine>) {
-    let wanted = wanted(mutant);
+    run_client_with(urls, client_config(mutant), wanted(mutant), epoch, stop, tx).await
+}
+
+async fn run_client_with(
+    urls: Vec<String>,
+    cfg: ClientConfig,
+    wanted: Vec<bool>,
+    epoch: Instant,
+    stop: oneshot::Receiver<()>,
+    tx: watch::Sender<Vec<bool>>,
+) -> (ClientRecord, Vec<LogLine>) {
     let mut rec = Rec {
         epoch,
         live: vec![false; wanted.len()],
@@ -240,7 +268,7 @@ async fn run_client(
     };
     let core = client::run(
         urls,
-        client_config(mutant),
+        cfg,
         async {
             let _ = stop.await;
         },
@@ -516,9 +544,27 @@ struct NodeProc {
     http: SocketAddr,
     log: PathBuf,
     child: Option<Child>,
+    /// The drill agent of a node that runs elsewhere. Such a node has no
+    /// child here: faults go to the agent.
+    agent: Option<SocketAddr>,
 }
 
 impl NodeProc {
+    /// A node on another machine, reached at `http` and `agent`.
+    fn remote(http: SocketAddr, agent: SocketAddr) -> NodeProc {
+        NodeProc {
+            proxy: Arc::new(Proxy::default()),
+            venue: Vec::new(),
+            bin: PathBuf::new(),
+            args: Vec::new(),
+            mutant: None,
+            http,
+            log: PathBuf::new(),
+            child: None,
+            agent: Some(agent),
+        }
+    }
+
     fn start(&mut self) -> Result<(), String> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(&self.args)
@@ -540,6 +586,10 @@ impl NodeProc {
 
     /// True if the process is gone without the harness stopping it.
     fn exited(&mut self) -> bool {
+        if self.agent.is_some() {
+            // Its supervisor restarts it; readiness is the check.
+            return false;
+        }
         match &mut self.child {
             Some(c) => c.try_wait().ok().flatten().is_some(),
             None => true,
@@ -615,14 +665,59 @@ async fn find_leader(nodes: &[Shared]) -> Option<(usize, u64)> {
     }
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(15) {
+        // A woken zombie can still say it leads until its first write is
+        // refused, so the newest epoch wins.
+        let mut best: Option<(usize, u64)> = None;
         for (i, h) in https.iter().enumerate() {
             if let Some((e, true)) = ha_state(*h).await {
-                return Some((i, e));
+                if best.is_none_or(|(_, b)| e > b) {
+                    best = Some((i, e));
+                }
             }
+        }
+        if best.is_some() {
+            return best;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     None
+}
+
+/// Ask a drill agent to do one thing. Its answer is one line: `ok ...`,
+/// `skip <why>` or `error <why>`.
+async fn agent_cmd(addr: SocketAddr, cmd: &str) -> Result<String, String> {
+    let io = async {
+        let mut s = tokio::net::TcpStream::connect(addr).await?;
+        s.write_all(format!("{cmd}\n").as_bytes()).await?;
+        let mut buf = String::new();
+        s.read_to_string(&mut buf).await?;
+        Ok::<_, std::io::Error>(buf)
+    };
+    match tokio::time::timeout(Duration::from_secs(10), io).await {
+        Ok(Ok(a)) if !a.trim().is_empty() => Ok(a.trim().to_string()),
+        Ok(Ok(_)) => Err(format!("agent gave no answer to {cmd}")),
+        Ok(Err(e)) => Err(format!("agent: {e}")),
+        Err(_) => Err(format!("agent did not answer {cmd} within 10 s")),
+    }
+}
+
+/// How long the driver waits for things. Loopback runs use the defaults;
+/// the drill's nodes reach real venues over TLS and are given longer.
+#[derive(Clone, Copy)]
+struct Limits {
+    all_live: Duration,
+    peer_ready: Duration,
+    victim_ready: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            all_live: Duration::from_secs(30),
+            peer_ready: Duration::from_secs(20),
+            victim_ready: Duration::from_secs(20),
+        }
+    }
 }
 
 /// Wait until `/readyz` is 200, up to `limit`.
@@ -710,6 +805,7 @@ impl Proxy {
 
 /// Run one fault. `takeover_watch` is the peer's HTTP address and the victim's
 /// epoch, for timing a takeover during a leader freeze.
+#[allow(clippy::too_many_arguments)]
 async fn execute(
     node: Shared,
     idx: usize,
@@ -718,8 +814,24 @@ async fn execute(
     epoch: Instant,
     mut live: watch::Receiver<Vec<bool>>,
     takeover_watch: Option<(SocketAddr, u64)>,
-) -> Result<Executed, String> {
+    limits: Limits,
+) -> Result<Executed, Fault> {
     let mut n = node.lock().await;
+    if let Some(agent) = n.agent {
+        let http = n.http;
+        drop(n);
+        return execute_remote(
+            agent,
+            http,
+            idx,
+            kind,
+            freeze_ms,
+            epoch,
+            takeover_watch,
+            limits,
+        )
+        .await;
+    }
     let at_wall_ms = wall_ms();
     let at_mono_ms = mono_ms(epoch, Instant::now());
     if kind == FaultKind::Cut {
@@ -744,7 +856,7 @@ async fn execute(
         FaultKind::Kill9 => {
             n.kill9();
             tokio::time::sleep(Duration::from_secs(1)).await;
-            n.start()?;
+            n.start().map_err(Fault::Failed)?;
         }
         FaultKind::Freeze => {
             let pid = n.pid()?;
@@ -755,18 +867,7 @@ async fn execute(
         FaultKind::FreezeLeader => {
             let pid = n.pid()?;
             signal(pid, "STOP")?;
-            let t0 = Instant::now();
-            let until = t0 + Duration::from_millis(freeze_ms);
-            while Instant::now() < until {
-                if let (None, Some((peer, e0))) = (takeover_ms, takeover_watch) {
-                    if let Some((e, true)) = ha_state(peer).await {
-                        if e > e0 {
-                            takeover_ms = Some(t0.elapsed().as_millis() as i64);
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            takeover_ms = watch_takeover(Instant::now(), freeze_ms, takeover_watch).await;
             signal(pid, "CONT")?;
         }
         FaultKind::VenueCut => {
@@ -777,7 +878,9 @@ async fn execute(
             let started = Instant::now();
             while n.venue.iter().zip(&before).any(|(p, b)| p.accepted() <= *b) {
                 if started.elapsed() > Duration::from_secs(20) {
-                    return Err(format!("node {idx} did not redial its venues within 20 s"));
+                    return Err(Fault::Failed(format!(
+                        "node {idx} did not redial its venues within 20 s"
+                    )));
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -786,8 +889,11 @@ async fn execute(
     }
     let http = n.http;
     drop(n);
-    if !wait_ready(http, Duration::from_secs(20)).await {
-        return Err(format!("node {idx} not ready 20 s after its fault"));
+    if !wait_ready(http, limits.victim_ready).await {
+        return Err(Fault::Failed(format!(
+            "node {idx} not ready {} s after its fault",
+            limits.victim_ready.as_secs()
+        )));
     }
     Ok(Executed {
         node: idx,
@@ -798,6 +904,107 @@ async fn execute(
         recovered_mono_ms: mono_ms(epoch, Instant::now()),
         takeover_ms,
     })
+}
+
+/// Why a fault did not run.
+enum Fault {
+    /// The run cannot count.
+    Failed(String),
+    /// The agent declined (a leader freeze on a node that no longer
+    /// leads); the driver may pick the victim again.
+    Skipped(String),
+}
+
+impl From<String> for Fault {
+    fn from(s: String) -> Self {
+        Fault::Failed(s)
+    }
+}
+
+/// Poll the peer's `/ha` every 100 ms for `freeze_ms` from `t0`, and return
+/// how long after `t0` it first showed a higher epoch and leadership.
+async fn watch_takeover(
+    t0: Instant,
+    freeze_ms: u64,
+    takeover_watch: Option<(SocketAddr, u64)>,
+) -> Option<i64> {
+    let until = t0 + Duration::from_millis(freeze_ms);
+    let mut takeover_ms = None;
+    while Instant::now() < until {
+        if let (None, Some((peer, e0))) = (takeover_ms, takeover_watch) {
+            if let Some((e, true)) = ha_state(peer).await {
+                if e > e0 {
+                    takeover_ms = Some(t0.elapsed().as_millis() as i64);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    takeover_ms
+}
+
+/// One fault on a node that runs elsewhere, through its drill agent. A kill
+/// is SIGKILL and the node's supervisor (systemd on the VM) restarts it a
+/// second later. A freeze is SIGSTOP, and the agent itself sends SIGCONT
+/// after `freeze_ms`, so a lost runner never leaves a node stopped.
+#[allow(clippy::too_many_arguments)]
+async fn execute_remote(
+    agent: SocketAddr,
+    http: SocketAddr,
+    idx: usize,
+    kind: FaultKind,
+    freeze_ms: u64,
+    epoch: Instant,
+    takeover_watch: Option<(SocketAddr, u64)>,
+    limits: Limits,
+) -> Result<Executed, Fault> {
+    let cmd = match kind {
+        FaultKind::Kill9 => "kill9".to_string(),
+        FaultKind::Freeze => format!("freeze {freeze_ms}"),
+        FaultKind::FreezeLeader => format!("freeze_leader {freeze_ms}"),
+        FaultKind::Cut | FaultKind::VenueCut => {
+            return Err(Fault::Failed(format!("{kind:?} is not a drill fault")))
+        }
+    };
+    let at_wall_ms = wall_ms();
+    let t0 = Instant::now();
+    let at_mono_ms = mono_ms(epoch, t0);
+    let answer = agent_cmd(agent, &cmd).await?;
+    if let Some(why) = answer.strip_prefix("skip") {
+        return Err(Fault::Skipped(why.trim().to_string()));
+    }
+    if !answer.starts_with("ok") {
+        return Err(Fault::Failed(format!("agent of node {idx}: {answer}")));
+    }
+    let mut takeover_ms = None;
+    if matches!(kind, FaultKind::Freeze | FaultKind::FreezeLeader) {
+        takeover_ms = watch_takeover(t0, freeze_ms, takeover_watch).await;
+    } else {
+        // Let the kill land before readiness is asked.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if !wait_ready(http, limits.victim_ready).await {
+        return Err(Fault::Failed(format!(
+            "node {idx} not ready {} s after its fault",
+            limits.victim_ready.as_secs()
+        )));
+    }
+    Ok(Executed {
+        node: idx,
+        kind,
+        at_wall_ms,
+        at_mono_ms,
+        recovered_wall_ms: wall_ms(),
+        recovered_mono_ms: mono_ms(epoch, Instant::now()),
+        takeover_ms,
+    })
+}
+
+fn failed(f: Fault) -> String {
+    match f {
+        Fault::Failed(s) => s,
+        Fault::Skipped(s) => format!("the agent skipped a fault: {s}"),
+    }
 }
 
 async fn check_alive(nodes: &[Shared]) -> Result<(), String> {
@@ -817,9 +1024,10 @@ async fn drive(
     wanted: &[bool],
     epoch: Instant,
     executed: &mut Vec<Executed>,
+    limits: Limits,
 ) -> Result<(), String> {
     let all_live = |l: &Vec<bool>| l.iter().zip(wanted).all(|(l, w)| *l || !*w);
-    tokio::time::timeout(Duration::from_secs(30), live.wait_for(all_live))
+    tokio::time::timeout(limits.all_live, live.wait_for(all_live))
         .await
         .map_err(|_| "subscriptions never all live".to_string())?
         .map_err(|_| "client stopped".to_string())?;
@@ -838,42 +1046,69 @@ async fn drive(
                 epoch,
                 live.clone(),
                 None,
+                limits,
             )));
         }
         for t in tasks {
-            executed.push(t.await.map_err(|e| e.to_string())??);
+            executed.push(t.await.map_err(|e| e.to_string())?.map_err(failed)?);
         }
     } else {
         for f in &plan.faults {
             tokio::time::sleep_until(due(f.at_ms)).await;
             check_alive(nodes).await?;
-            // A leader freeze picks its victim when it runs.
-            let (victim, leader_epoch) = if f.kind == FaultKind::FreezeLeader {
-                let (i, e) = find_leader(nodes)
-                    .await
-                    .ok_or("no node leads before a leader freeze")?;
-                (i, Some(e))
-            } else {
-                (f.node, None)
+            // A leader freeze picks its victim when it runs; an agent that
+            // finds its node no longer leads declines, and the leader is
+            // looked up again, three tries in all.
+            let mut tries = 0;
+            let done = loop {
+                tries += 1;
+                let (victim, leader_epoch) = if f.kind == FaultKind::FreezeLeader {
+                    let (i, e) = find_leader(nodes)
+                        .await
+                        .ok_or("no node leads before a leader freeze")?;
+                    (i, Some(e))
+                } else {
+                    (f.node, None)
+                };
+                let other = 1 - victim;
+                let http = nodes[other].lock().await.http;
+                if !ready_for(http, Duration::from_millis(500), limits.peer_ready).await {
+                    return Err(format!(
+                        "node {other} not ready before a fault on node {victim}"
+                    ));
+                }
+                if wanted[other] {
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(10), live.wait_for(|l| l[other]))
+                            .await;
+                }
+                if f.kind == FaultKind::VenueCut && wanted[victim] {
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(10), live.wait_for(|l| l[victim]))
+                            .await;
+                }
+                let node = nodes[victim].clone();
+                let tw = leader_epoch.map(|e| (http, e));
+                let r = execute(
+                    node,
+                    victim,
+                    f.kind,
+                    f.freeze_ms,
+                    epoch,
+                    live.clone(),
+                    tw,
+                    limits,
+                )
+                .await;
+                match r {
+                    Ok(d) => break d,
+                    Err(Fault::Skipped(why)) if tries < 3 => {
+                        eprintln!("chaos: fault skipped ({why}), trying again");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(e) => return Err(failed(e)),
+                }
             };
-            let other = 1 - victim;
-            let http = nodes[other].lock().await.http;
-            if !ready_for(http, Duration::from_millis(500), Duration::from_secs(20)).await {
-                return Err(format!(
-                    "node {other} not ready before a fault on node {victim}"
-                ));
-            }
-            if wanted[other] {
-                let _ = tokio::time::timeout(Duration::from_secs(10), live.wait_for(|l| l[other]))
-                    .await;
-            }
-            if f.kind == FaultKind::VenueCut && wanted[victim] {
-                let _ = tokio::time::timeout(Duration::from_secs(10), live.wait_for(|l| l[victim]))
-                    .await;
-            }
-            let node = nodes[victim].clone();
-            let tw = leader_epoch.map(|e| (http, e));
-            let done = execute(node, victim, f.kind, f.freeze_ms, epoch, live.clone(), tw).await?;
             executed.push(done);
         }
     }
@@ -1035,6 +1270,7 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
             http: format!("127.0.0.1:{http}").parse().expect("addr"),
             log: run.join(format!("node-{name}.log")),
             child: None,
+            agent: None,
         };
         n.start()?;
         // The client reaches each node through its relay.
@@ -1048,7 +1284,16 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
     let client = tokio::spawn(run_client(urls, mutant, epoch, stop_rx, live_tx));
     let want = wanted(mutant);
     let mut executed = Vec::new();
-    let outcome = drive(&plan, &nodes, live_rx, &want, epoch, &mut executed).await;
+    let outcome = drive(
+        &plan,
+        &nodes,
+        live_rx,
+        &want,
+        epoch,
+        &mut executed,
+        Limits::default(),
+    )
+    .await;
     if let Err(e) = &outcome {
         eprintln!("chaos local: invalid run: {e}");
     }
@@ -1073,6 +1318,178 @@ async fn cmd_local(o: &Opts) -> Result<i32, String> {
     Ok(if stream != 0 { stream } else { arch })
 }
 
+fn pair<T: std::str::FromStr>(o: &Opts, k: &str) -> Result<Vec<T>, String> {
+    let v: Vec<T> = o
+        .need(k)?
+        .split(',')
+        .map(|x| x.parse().map_err(|_| format!("bad --{k}")))
+        .collect::<Result<_, _>>()?;
+    if v.len() != 2 {
+        return Err(format!("--{k} takes two values"));
+    }
+    Ok(v)
+}
+
+/// The live drill: the main client on both nodes, the control client on
+/// node-a only, the plan driven through each node's agent.
+async fn cmd_drill(o: &Opts) -> Result<i32, String> {
+    let run = PathBuf::from(o.need("run")?);
+    std::fs::create_dir_all(run.join(drill::CONTROL)).map_err(|e| e.to_string())?;
+    let urls: Vec<String> = pair(o, "nodes")?;
+    let https: Vec<SocketAddr> = pair(o, "http")?;
+    let agents: Vec<SocketAddr> = pair(o, "agents")?;
+    let gap_ms = o.num("gap-ms", 90_000i64)?;
+    let plan = drill::drill_plan(
+        o.num("seed", 1u64)?,
+        o.num("faults", 20usize)?,
+        gap_ms,
+        o.num("leader-freezes", 6usize)?,
+        o.num("leader-freeze-ms", 60_000u64)?,
+        o.num("margin-s", 15i64)? * 1_000,
+    );
+    chaos::write_json(&run.join(chaos::PLAN), &plan).map_err(|e| e.to_string())?;
+    let ready = Duration::from_secs(o.num("ready-limit-s", 120u64)?);
+    let limits = Limits {
+        all_live: ready,
+        peer_ready: ready,
+        victim_ready: ready,
+    };
+    for (i, a) in agents.iter().enumerate() {
+        let answer = agent_cmd(*a, "ping").await?;
+        if !answer.starts_with("ok") {
+            return Err(format!("agent of node {i}: {answer}"));
+        }
+    }
+    let nodes: Vec<Shared> = https
+        .iter()
+        .zip(&agents)
+        .map(|(h, a)| Arc::new(tokio::sync::Mutex::new(NodeProc::remote(*h, *a))))
+        .collect();
+
+    let start_ms = wall_ms();
+    let epoch = Instant::now();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let (live_tx, live_rx) = watch::channel(vec![false; 2]);
+    let main = tokio::spawn(run_client_with(
+        urls.clone(),
+        ClientConfig::new(2),
+        vec![true, true],
+        epoch,
+        stop_rx,
+        live_tx,
+    ));
+    let (cstop_tx, cstop_rx) = oneshot::channel();
+    let (ctl_tx, _ctl_rx) = watch::channel(vec![false; 1]);
+    let control = tokio::spawn(run_client_with(
+        vec![urls[0].clone()],
+        ClientConfig::new(1),
+        vec![true],
+        epoch,
+        cstop_rx,
+        ctl_tx,
+    ));
+    let mut executed = Vec::new();
+    let outcome = drive(
+        &plan,
+        &nodes,
+        live_rx,
+        &[true, true],
+        epoch,
+        &mut executed,
+        limits,
+    )
+    .await;
+    if let Err(e) = &outcome {
+        eprintln!("chaos drill: invalid run: {e}");
+    }
+    let _ = stop_tx.send(());
+    let _ = cstop_tx.send(());
+    let (rec, log) = main.await.map_err(|e| e.to_string())?;
+    let (crec, clog) = control.await.map_err(|e| e.to_string())?;
+    let times = drill::Times {
+        start_ms,
+        end_ms: wall_ms(),
+    };
+    chaos::write_jsonl(&run.join(chaos::FAULTS), &executed).map_err(|e| e.to_string())?;
+    let harness = Harness {
+        invalid: outcome.err(),
+    };
+    chaos::write_json(&run.join(chaos::HARNESS), &harness).map_err(|e| e.to_string())?;
+    chaos::write_json(&run.join(drill::TIMES), &times).map_err(|e| e.to_string())?;
+    write_client(&run, &rec, &log).map_err(|e| e.to_string())?;
+    write_client(&run.join(drill::CONTROL), &crec, &clog).map_err(|e| e.to_string())?;
+    println!(
+        "chaos drill: faults {}/{} invalid={} main_frames={} control_frames={} seconds={}",
+        executed.len(),
+        plan.faults.len(),
+        harness.invalid.is_some(),
+        rec.counters.frames,
+        crec.counters.frames,
+        (times.end_ms - times.start_ms) / 1_000,
+    );
+    Ok(0)
+}
+
+fn cmd_verify_drill(o: &Opts) -> Result<i32, String> {
+    let run = PathBuf::from(o.need("run")?);
+    let collected = PathBuf::from(o.need("collected")?);
+    let mut inp = drill::load(&run, &collected).map_err(|e| format!("verify-drill: {e}"))?;
+    let r = drill::verify(
+        &mut inp,
+        o.num("slot-ms", 60_000i64)?,
+        o.num("takeover-gate-ms", drill::TAKEOVER_GATE_MS)?,
+    );
+    chaos::write_json(&run.join(drill::STREAM), &r.stream).map_err(|e| e.to_string())?;
+    chaos::write_json(&run.join(chaos::REPORT), &r).map_err(|e| e.to_string())?;
+    let s = &r.stream;
+    let a = &r.archive;
+    let b = ha::key::Feed::Binance.index();
+    println!(
+        "chaos drill: {} reason={} faults={}/{} kill9={} freeze_leader={} observed={} missing={} duplicates={} extra={} late_lost={} in_window={} control_missing={} content_mismatch_binance={} rehedge_max_ms={} added_delay_p99_ms={} takeovers={}/{} takeover_max_ms={} fence_rejected={} stale_epoch_commits={} epoch_two_holders={} holes={} orphans={}",
+        r.verdict.result,
+        r.verdict.reason.as_deref().unwrap_or("-"),
+        s.faults.executed,
+        s.faults.planned,
+        s.faults.kill9,
+        s.faults.freeze_leader,
+        s.faults.observed,
+        s.missing,
+        s.duplicates,
+        s.extra,
+        s.late.lost,
+        s.truth_keys_in_window,
+        r.control_missing,
+        r.content.mismatch[b],
+        s.rehedge_ms.max.map_or("-".into(), |v| format!("{v:.0}")),
+        s.added_delay_ms.p99.map_or("-".into(), |v| format!("{v:.1}")),
+        a.takeovers_seen,
+        a.leader_freezes,
+        a.takeover_ms.max.map_or("-".into(), |v| format!("{v:.0}")),
+        a.fence_rejected,
+        a.stale_epoch_commits,
+        a.epoch_two_holders,
+        a.view.holes,
+        a.view.orphans,
+    );
+    Ok(r.exit_code())
+}
+
+/// A directory store's HEAD and object names, as `verify-drill` reads them.
+fn cmd_store_dump(o: &Opts) -> Result<i32, String> {
+    use ha::store::{FsStore, HeadStore, ObjectStore};
+    let store = FsStore::open(Path::new(o.need("store")?)).map_err(|e| e.to_string())?;
+    let out = PathBuf::from(o.need("out")?);
+    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+    if let Some((body, _)) = store.read_head().map_err(|e| format!("{e:?}"))? {
+        std::fs::write(out.join("head.json"), body).map_err(|e| e.to_string())?;
+    }
+    let names = store.list("seg/").map_err(|e| format!("{e:?}"))?;
+    let mut text = names.join("\n");
+    text.push('\n');
+    std::fs::write(out.join("objects.txt"), text).map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1093,7 +1510,13 @@ async fn main() {
         "verify" => cmd_verify(&opts),
         "verify-archive" => cmd_verify_archive(&opts),
         "local" => cmd_local(&opts).await,
-        _ => Err("usage: chaos local|plan|client|verify|verify-archive [options]".into()),
+        "drill" => cmd_drill(&opts).await,
+        "verify-drill" => cmd_verify_drill(&opts),
+        "store-dump" => cmd_store_dump(&opts),
+        _ => Err(
+            "usage: chaos local|plan|client|verify|verify-archive|drill|verify-drill|store-dump [options]"
+                .into(),
+        ),
     };
     match res {
         Ok(code) => std::process::exit(code),

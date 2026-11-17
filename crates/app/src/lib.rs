@@ -3,6 +3,7 @@ pub mod archiver;
 pub mod backtest;
 pub mod chaos;
 pub mod convergence;
+pub mod drill;
 pub mod engine;
 pub mod ingest;
 pub mod latency;

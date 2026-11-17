@@ -6,7 +6,10 @@ name: Azure
 # request, a schedule or a manual run never starts it:
 #
 #   ha-infra-*    create or update the network and the two VMs
-#   ha-deploy-*   build the node for both architectures, install it, check it
+#   ha-deploy-*   build the node for both architectures, install it and the
+#                 drill tools, check it
+#   ha-drill-*    the live drill: ha-drill-rehearsal runs 4 faults, any
+#                 other ha-drill-* tag 20 (docs/HA_DRILL.md)
 #   ha-start-*    start both VMs
 #   ha-stop-*     deallocate both VMs
 #   ha-destroy-*  delete the resource group and everything in it
@@ -32,6 +35,7 @@ on:
     tags:
       - "ha-infra-*"
       - "ha-deploy-*"
+      - "ha-drill-*"
       - "ha-start-*"
       - "ha-stop-*"
       - "ha-destroy-*"
@@ -221,6 +225,13 @@ jobs:
           # so node-b is not touched until node-a is serving again.
           ops/azure/vm_run.sh node-a install "$GITHUB_SHA" "$(cat out/node-x64.sha256)"
           ops/azure/vm_run.sh node-b install "$GITHUB_SHA" "$(cat out/node-arm64.sha256)"
+      - name: Install this commit's drill tools on both nodes
+        run: |
+          # The scripts the drill job runs on the VMs (deploy/azure/drill).
+          # Not in cloud-init, which Azure will not let change on a
+          # running VM. The drill job checks this digest before it opens.
+          ops/azure/vm_tools.sh install node-a
+          ops/azure/vm_tools.sh install node-b
       - name: Store contract suite against the real account, from each VM
         run: |
           ops/azure/vm_run.sh node-a selftest "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-a"
@@ -244,6 +255,85 @@ jobs:
           printf '%s\n\n%s\n' "$a" "$b"
           echo "::error::expected exactly one leader and at least one committed slot"
           exit 1
+
+  # The live drill (spec 4.7, docs/HA_DRILL.md). A per-run key for the
+  # restricted drill user, a security group rule for this runner's address
+  # only, SSH forwards to both nodes, a client on both and a control client
+  # on node-a, kills and leader freezes through the agent on each VM, then
+  # both nodes' recordings and lease logs collected under drill/<run>/ in
+  # the archive and judged with their union as truth. The cleanup step runs
+  # whatever happened before it, also on a cancel, and fails the job unless
+  # the rule and the key are gone and both nodes run with one leader.
+  # Only report.json (counts and timings) leaves the runner.
+  drill:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true' && needs.gate.outputs.action == 'drill'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    environment: azure
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      DRILL_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+      CHAOS: target/release/chaos
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Build chaos, without the seeded faults
+        run: cargo build --locked --release -p app --bin chaos
+      - name: The size of this drill
+        run: |
+          # The plan is seeded with the run id. A rehearsal is three kills
+          # and one leader freeze; a full drill fourteen and six.
+          if [ "$GITHUB_REF_NAME" = ha-drill-rehearsal ]; then
+            faults=4 freezes=1
+          else
+            faults=20 freezes=6
+          fi
+          {
+            echo "DRILL_FAULTS=$faults"
+            echo "DRILL_LEADER_FREEZES=$freezes"
+            echo "DRILL_SEED=$GITHUB_RUN_ID"
+          } >>"$GITHUB_ENV"
+          echo "$faults faults, $freezes of them leader freezes, seed $GITHUB_RUN_ID"
+      - name: Keep the account ids out of the public log
+        env:
+          IDS: ${{ vars.AZURE_SUBSCRIPTION_ID }} ${{ vars.AZURE_TENANT_ID }} ${{ vars.AZURE_CLIENT_ID }}
+        run: |
+          for id in $IDS; do
+            echo "::add-mask::$id"
+          done
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Start the VMs if they are deallocated, and wait for one leader
+        run: |
+          for n in node-a node-b; do
+            az vm start -g "$RG" -n "$n" --output none
+          done
+          ops/azure/drill.sh ready
+      - name: Open, a key for this run and an SSH rule for this runner only
+        run: ops/azure/drill.sh open
+      - name: Drive the faults
+        run: ops/azure/drill.sh run
+      - name: Collect both nodes' recordings and judge
+        run: ops/azure/drill.sh collect
+      - name: Close, rule and key removed, both nodes healthy
+        if: always()
+        run: ops/azure/drill.sh close
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: drill-report
+          path: ${{ runner.temp }}/drill-report/report.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   start:
     needs: gate
