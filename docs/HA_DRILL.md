@@ -10,14 +10,19 @@ Two VMs in different zones and CPU architectures each run the node: node-a (x64,
 
 A drill is a GitHub Actions job started by a tag. On the runner it:
 
-1. Waits until both nodes run and are ready with exactly one leader.
-2. Makes an ed25519 key for this run only. `drill-open.sh` puts it on both VMs for the user `drill`, limited to forwarding to the node's stream (9100), health endpoints (9101) and the drill agent (9102) on loopback, with no shell, no remote forward and an expiry four hours out. It starts the drill agent and returns the VM's host key, which the runner pins.
+1. Records each VM's power state, starts any that is not running, and waits until both nodes run and are ready with exactly one leader.
+2. Makes an ed25519 key for this run only. `drill-open.sh` first installs a `Match User drill` block for sshd (`deploy/azure/drill/sshd-drill.conf`) that allows that user local TCP forwards to the three loopback ports and nothing else: no Unix socket, agent or X11 forward, no listener, no terminal. It checks the config with `sshd -t` before any reload, takes the file out again if the check fails, and reads back what sshd would apply to the user. Then it puts the key on both VMs for the user `drill`, limited to forwarding to the node's stream (9100), health endpoints (9101) and the drill agent (9102) on loopback, with no shell, no remote forward and an expiry four hours out. It starts the drill agent and returns the VM's host key, which the runner pins.
 3. Adds a security group rule `drill-<run>` that lets TCP 22 in from the runner's address only.
 4. Opens SSH forwards to both nodes. A **main client** subscribes to both nodes at once through them, and a **control client** subscribes to node-a only.
 5. Runs the fault plan. Before each fault the other node's `/readyz` must have answered 200 for 500 ms and the main client must be live on it. Faults go to the agent on the victim's VM: `kill9` is SIGKILL on the node's main process, and systemd restarts it a second later; `freeze_leader` is SIGSTOP on whichever node says it leads, for 60 s, longer than the worst takeover, so the frozen leader wakes as a zombie. The agent sends SIGCONT itself, so a lost runner never leaves a node stopped.
 6. `drill-collect.sh` uploads, from each VM with its own identity, the agent's fault log, the node's `lease.jsonl`, its counters and its local minute files for the drill window, gzipped, to `drill/<run>/n<id>/` in the archive container. The runner downloads them, HEAD, and the list of archive objects.
 7. `chaos verify-drill` judges the run and writes `report.json`.
-8. Whatever happened before, also on a failure or a cancel: the forwards are closed, the rule is deleted, `drill-close.sh` empties the drill user's keys, stops the agent, wakes the node and ends every drill session, the runner's copy of the data is deleted, and the job fails unless no `drill-*` rule is left and both nodes run and are ready with exactly one leader.
+8. Whatever happened before, also on a failure or a cancel: the job signs in to Azure again, the forwards are closed, every `drill-*` rule is deleted (the delete and the check are tried up to five times, five seconds apart), `drill-close.sh` empties the drill user's keys, stops the agent, wakes the node and ends every drill session, the runner's copy of the data is deleted, and the job fails unless no `drill-*` rule is left and both nodes run and are ready with exactly one leader.
+9. Last, also on a failure or a cancel, each VM goes back to the state step 1 found it in. A VM that was deallocated is deallocated again. A VM that was running, or stopped but still allocated, or whose state could not be read, is left running, the last with a warning. A drill on deallocated VMs therefore costs only the hours it runs.
+
+The job signs in once more before collecting, as well as before the cleanup. The GitHub token behind a sign-in lasts minutes, and Azure's CLI asks for a token per service when it first needs one, so a storage token first wanted an hour after the sign-in would be refused. The fault step has a time limit of 15 minutes for a rehearsal and 45 for a full drill, and collect one of 20, so the cleanup always starts as an ordinary step with time left in the job.
+
+The agent on each VM stops promptly on SIGTERM. The signal only sets a flag; the agent finishes the command in hand, leaves its loop and sends SIGCONT to a node it froze on the way out, so stopping it can never wait on its own lock and never leaves a node stopped.
 
 | Tag | Faults | Of which | Runner time |
 |---|---|---|---|
@@ -95,14 +100,15 @@ The workflow log is public. Every address (the runner's and both VMs'), the run'
 |---|---|---|
 | `drill` module unit tests | `rust` job | the plan's shape for 4 and 20 faults, union truth from plain and gzipped files with a torn tail, the content comparison, every archive check failing by its own name, holes and orphans counted inside the window only |
 | `ops/azure/test_drill_local.sh` | `drill-local` job | the real agent, `chaos drill`, collection and `verify-drill` on loopback with two nodes under restart loops and a shared directory store: three kills and a leader freeze, a pass against the union of the recordings and against the simulator's own manifest, `control_missing` above 0 |
-| `ops/azure/test_dry_run.sh` | `azure-deploy-code` job | the workflow's steps against fakes of az, ssh and curl: the rule names only the runner's address and port 22, both VMs get the key and are closed, a cleanup after a failed open still removes everything, a stuck rule, an unclosed VM or two leaders fail the job loudly, another subscription is refused, the tools bundle digest is checked, and no address, key or account name reaches the log |
+| `ops/azure/test_dry_run.sh` | `azure-deploy-code` job | the workflow's steps against fakes of az, ssh and curl: the rule names only the runner's address and port 22, both VMs get the key and are closed, a cleanup after a failed open still removes everything, a rule delete or list that fails for a while is retried, a stuck rule, an unlistable group, an unclosed VM or two leaders fail the job loudly, VMs found deallocated are deallocated again and no others, another subscription is refused, the tools bundle digest is checked, and no address, key or account name reaches the log. Against the runner's real sshd: the drill user's Match block passes `sshd -t` beside the base config, gives exactly the TCP forwards to the three ports, and does not leak to other users |
+| `ops/azure/test_drill_agent.py` | `azure-deploy-code` job, from `test_dry_run.sh` | the real agent exits within seconds of SIGTERM when idle, mid-freeze, and while it holds its lock answering a leader freeze, and its stand-in node is never left stopped |
 | `shellcheck`, `actionlint` | `azure-deploy-code` job | the scripts and the workflow lint |
 
 What none of this shows: that SSH to the drill user works with these options on the VMs' sshd, that `systemctl kill` and `systemd-run` behave on the VMs as on a runner, that the venues send the same message text to two connections, and how long a node takes to be ready again after a kill against the real venues. The rehearsal is for those.
 
 ## 8. Running it
 
-The VMs must carry the drill tools of the commit the drill tag points at; the drill checks their digest and stops before opening anything if they differ. They are installed by the deploy job, so a drill tag needs a deploy tag on the same commit first. From the repository root on `ha-failover`:
+The VMs must carry the drill tools of the commit the drill tag points at; the drill checks their digest and stops before opening anything if they differ. They are installed by the deploy job, so a drill tag needs a deploy tag on the same commit first, and any change under `deploy/azure/drill/` needs a new deploy tag before the next drill tag. From the repository root on `ha-failover`:
 
 ```bash
 git tag ha-deploy-2 && git push origin ha-deploy-2           # about 30 minutes; wait for green

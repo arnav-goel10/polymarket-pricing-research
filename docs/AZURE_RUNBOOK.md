@@ -192,6 +192,8 @@ Or by tag: `ha-stop-N` and `ha-start-N`.
 
 The live drill is described in [HA_DRILL.md](HA_DRILL.md): what it does, what it measures and what a pass means. It runs from a tag, like everything else here.
 
+**Any change under `deploy/azure/drill/` needs a new `ha-deploy` tag on the same commit before the next drill tag.** The deploy job is what installs those files on the VMs, and the drill checks their digest against its own commit and stops before it opens anything if they differ. The same holds for a drill tag on a commit that has never had a deploy tag.
+
 ```bash
 # The VMs must carry this commit's drill tools, which the deploy job installs.
 git tag ha-deploy-2 && git push origin ha-deploy-2              # wait for it to pass
@@ -200,7 +202,11 @@ git tag ha-drill-rehearsal && git push origin ha-drill-rehearsal  # 4 faults, ab
 git tag ha-drill-1 && git push origin ha-drill-1                # 20 faults, about 50 minutes
 ```
 
-The drill job starts deallocated VMs, so it also works in drill-only mode. While it runs it adds one security group rule, `drill-<run id>`, that lets SSH in from the runner's address only, and a key for the user `drill` on both VMs that can only forward to the node's loopback ports. Its last step removes both, also after a failure or a cancel, and fails the run unless both are gone and both nodes run with exactly one leader. To check by hand afterwards:
+The drill job records each VM's power state, then starts the ones that are deallocated, so it also works in drill-only mode. Its very last step puts them back: a VM that was deallocated is deallocated again, and a VM that was running (or stopped without being deallocated, or whose state could not be read, with a warning) is left running. So a drill in drill-only mode costs only its own hours.
+
+While it runs it adds one security group rule, `drill-<run id>`, that lets SSH in from the runner's address only, and a key for the user `drill` on both VMs that can only forward to the node's loopback ports. `drill-open.sh` also installs `/etc/ssh/sshd_config.d/20-poly-drill.conf`, a `Match User drill` block that holds that user to local TCP forwards to the three loopback ports, with no Unix socket, agent or X11 forward and no listener, whatever a key says. It checks the whole sshd config with `sshd -t` before it reloads and takes the file out again if the check fails, so a bad file cannot lock SSH out. The file stays between drills. It is not in the base `sshd-poly.conf`, because that is cloud-init custom data, which Azure will not change on a running VM.
+
+The cleanup removes every `drill-*` rule and the key, also after a failure or a cancel, trying the rule delete and the check up to five times, and fails the run unless both are gone and both nodes run with exactly one leader. The job signs in to Azure again before it collects and before it cleans up, because a storage token first asked for long after the sign-in would be refused. The fault and collect steps have their own time limits (15 minutes for a rehearsal's faults, 45 for a full drill's, 20 for collect), so a hung step cannot eat the cleanup's time. To check by hand afterwards:
 
 ```bash
 az network nsg rule list -g poly-ha --nsg-name poly-ha-nsg --query "[].name" -o tsv   # no drill- name
