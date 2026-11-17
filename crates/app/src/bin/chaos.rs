@@ -416,10 +416,36 @@ fn cmd_verify(o: &Opts) -> Result<i32, String> {
     ))
 }
 
+/// A loopback port for a node to listen on, the same one after each
+/// restart. It comes from 20000 to 29999, below the range the system draws
+/// from for a bind to port 0 and for outgoing connections, so no relay or
+/// connection of this run can be given it between the check here and the
+/// node's own bind, or while a killed node is down. A port asked for with
+/// port 0 and then released was taken that way now and then, and the node
+/// exited with "address in use".
 fn free_port() -> std::io::Result<u16> {
-    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port())
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const LOW: u32 = 20_000;
+    const SPAN: u32 = 10_000;
+    static START: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static TRIED: AtomicU32 = AtomicU32::new(0);
+    // Two runs on one host start at different ports.
+    let start = *START.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        std::process::id().wrapping_mul(7_919) ^ nanos
+    });
+    for _ in 0..SPAN {
+        let n = TRIED.fetch_add(1, Ordering::Relaxed);
+        let port = (LOW + start.wrapping_add(n) % SPAN) as u16;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    Err(std::io::Error::other(
+        "no free loopback port between 20000 and 29999",
+    ))
 }
 
 /// Read the first stdout line, then keep draining so a later print never
