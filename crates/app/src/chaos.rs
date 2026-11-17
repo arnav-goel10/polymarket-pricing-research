@@ -618,7 +618,9 @@ fn ts_at(truth: &[TruthFrame], wall_ms: i64) -> [Option<i64>; 3] {
     out
 }
 
-fn in_window(lo: &[Option<i64>; 3], hi: &[Option<i64>; 3], feed: u8, ts: i64) -> bool {
+/// Whether a timed key of `feed` falls in the window bounded by `lo` and
+/// `hi` (see [`window_of`]).
+pub fn in_window(lo: &[Option<i64>; 3], hi: &[Option<i64>; 3], feed: u8, ts: i64) -> bool {
     let f = feed as usize;
     lo[f].is_none_or(|l| ts > l) && hi[f].is_some_and(|h| ts <= h)
 }
@@ -649,6 +651,36 @@ fn binance_trade_gaps<'a>(keys: impl Iterator<Item = &'a str>) -> u64 {
         gaps += ids.windows(2).filter(|w| w[1] != w[0] + 1).count() as u64;
     }
     gaps
+}
+
+/// The verdict window: from T0, `margin` after every subscription was live,
+/// to T1, `margin` after the last recovery, on the wall clock, and per feed
+/// the newest truth timestamps broadcast by each. A timed key is in the
+/// window when [`in_window`] says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub t0: i64,
+    pub t1: i64,
+    pub lo: [Option<i64>; 3],
+    pub hi: [Option<i64>; 3],
+}
+
+pub fn window_of(inp: &Inputs) -> Window {
+    let margin = inp.plan.margin_ms;
+    let t0 = inp.client.live_wall_ms.unwrap_or(0) + margin;
+    let last = inp
+        .executed
+        .iter()
+        .map(|e| e.recovered_wall_ms)
+        .max()
+        .unwrap_or(t0 - margin);
+    let t1 = last.max(t0) + margin;
+    Window {
+        t0,
+        t1,
+        lo: ts_at(&inp.truth, t0),
+        hi: ts_at(&inp.truth, t1),
+    }
 }
 
 pub fn verify(inp: &Inputs) -> Report {
@@ -691,18 +723,9 @@ pub fn verify(inp: &Inputs) -> Report {
         return r;
     }
 
-    let margin = inp.plan.margin_ms;
-    let t0 = inp.client.live_wall_ms.unwrap_or(0) + margin;
-    let last = inp
-        .executed
-        .iter()
-        .map(|e| e.recovered_wall_ms)
-        .max()
-        .unwrap_or(t0 - margin);
-    let t1 = last.max(t0) + margin;
-    r.window_ms = t1 - t0;
-    let lo = ts_at(&inp.truth, t0);
-    let hi = ts_at(&inp.truth, t1);
+    let w = window_of(inp);
+    r.window_ms = w.t1 - w.t0;
+    let (lo, hi) = (w.lo, w.hi);
 
     let mut all_truth: HashSet<&str> = HashSet::new();
     let mut window: HashSet<&str> = HashSet::new();

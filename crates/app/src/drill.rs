@@ -14,8 +14,15 @@
 //!   gated: a killed node can forward a frame and lose the last second of
 //!   its file.
 //! - **Content**: a key both nodes recorded in a frame of its own must carry
-//!   the same frame text on both. Counted per feed. Binance is gated at 0;
-//!   RTDS and CLOB are reported (see the deviation in the spec, section 9).
+//!   the same venue content on both: the content fingerprint of
+//!   [`ha::key::for_each_event_with_content`], which for an RTDS price is
+//!   the point without the envelope's per-connection id and send time.
+//!   Counted per feed. Binance is gated at 0; RTDS and CLOB are reported
+//!   (see the deviation in the spec, section 9).
+//! - **Diagnosis**: the delivered log never leaves the runner, so the report
+//!   itself says where the missing keys came from ([`MissingDetail`]) and
+//!   which venue events had no key ([`TruthSummary::unkeyed`]). Counts
+//!   only.
 //! - **Control**: a second client subscribed to node-a only. Its `missing`
 //!   over the same window must be above 0, or the faults did not bite and
 //!   the run is invalid.
@@ -35,10 +42,10 @@
 use crate::chaos::{self, ClientRecord, Executed, FaultKind, LogLine, Outcome, Plan, PlannedFault};
 use crate::chaos::{Report, Spread, TruthFrame};
 use ha::caslease::{self, Head, ObjectRole};
-use ha::key::frame_keys;
+use ha::key::{for_each_event_with_content, Feed};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -110,6 +117,15 @@ pub struct Content {
     pub mismatch: [u64; 3],
 }
 
+/// Which of the two nodes recorded a key, and when each first did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Origin {
+    /// Bit i: node i recorded the key.
+    pub nodes: u8,
+    /// First receive time per node, microseconds; `i64::MAX` if none.
+    pub first_rx_us: [i64; 2],
+}
+
 /// Truth built from the nodes' recordings.
 pub struct Union {
     pub frames: Vec<TruthFrame>,
@@ -118,6 +134,56 @@ pub struct Union {
     pub node_frames: Vec<u64>,
     /// Files whose last record was torn (a killed writer).
     pub torn_files: u64,
+    /// Per key (by the hash of its text), who recorded it and when.
+    pub origins: HashMap<u64, Origin>,
+    /// Unkeyed events per label (feed and venue event type), per node.
+    pub unkeyed: BTreeMap<String, [u64; 2]>,
+}
+
+/// A short label for an event with no key: its feed and the venue's own
+/// name for its type, cut to plain characters. Venue schema names only,
+/// never content.
+fn unkeyed_label(source: feeds::recording::Source, frame: &str) -> String {
+    use serde_json::Value;
+    let feed = Feed::from_source(source).map_or("control", Feed::name);
+    let clean = |t: &str| -> String {
+        t.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '/' | '.'))
+            .take(40)
+            .collect()
+    };
+    let kind = match serde_json::from_str::<Value>(frame) {
+        Err(_) => "not_json".to_string(),
+        Ok(v) => match Feed::from_source(source) {
+            Some(Feed::Clob) => {
+                let item = v.as_array().and_then(|a| a.first()).unwrap_or(&v);
+                let t = item
+                    .get("event_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("none");
+                if v.is_array() {
+                    format!("array/{}", clean(t))
+                } else {
+                    clean(t)
+                }
+            }
+            Some(Feed::Rtds) => {
+                let s = |k: &str| v.get(k).and_then(Value::as_str).map(clean);
+                format!(
+                    "{}/{}",
+                    s("topic").unwrap_or_else(|| "none".into()),
+                    s("type").unwrap_or_else(|| "none".into())
+                )
+            }
+            Some(Feed::Binance) => v
+                .get("stream")
+                .and_then(Value::as_str)
+                .and_then(|st| st.split('@').nth(1))
+                .map_or_else(|| "no_stream".to_string(), clean),
+            None => "control".into(),
+        },
+    };
+    format!("{feed}:{kind}")
 }
 
 fn hash_of<T: Hash + ?Sized>(t: &T) -> u64 {
@@ -180,30 +246,48 @@ pub fn load_union(nodes: &[PathBuf]) -> io::Result<Union> {
         content: Content::default(),
         node_frames: vec![0; nodes.len()],
         torn_files: 0,
+        origins: HashMap::new(),
+        unkeyed: BTreeMap::new(),
     };
-    // Key hash -> frame hash, for single-key frames of the first node.
-    let mut first: HashMap<u64, (u64, u8)> = HashMap::new();
+    // Key hash -> content fingerprint, for single-key frames of the first node.
+    let mut first: HashMap<u64, (u128, u8)> = HashMap::new();
     let mut seen_second: HashSet<u64> = HashSet::new();
-    let mut keys = Vec::new();
+    let mut keys: Vec<(ha::key::EventKey, u128)> = Vec::new();
     for (i, dir) in nodes.iter().enumerate() {
         let mut files = Vec::new();
         recording_files(dir, &mut files);
         for path in files {
             let torn = read_records(&path, |r| {
                 keys.clear();
-                frame_keys(r.source, &r.frame, &mut keys);
+                for_each_event_with_content(r.source, &r.frame, |k, c| keys.push((k, c)));
                 if keys.is_empty() {
                     return;
                 }
                 u.node_frames[i] += 1;
                 let texts: Vec<(String, u8, Option<i64>)> = keys
                     .iter()
-                    .map(|k| (chaos::key_text(k), k.kind.feed().index() as u8, k.ts_millis))
+                    .map(|(k, _)| (chaos::key_text(k), k.kind.feed().index() as u8, k.ts_millis))
                     .collect();
+                let unkeyed = keys.iter().filter(|(k, _)| !k.kind.is_keyed()).count() as u64;
+                if unkeyed > 0 && i < 2 {
+                    u.unkeyed
+                        .entry(unkeyed_label(r.source, &r.frame))
+                        .or_default()[i] += unkeyed;
+                }
+                for (k, _, _) in &texts {
+                    let o = u.origins.entry(hash_of(k.as_str())).or_insert(Origin {
+                        nodes: 0,
+                        first_rx_us: [i64::MAX; 2],
+                    });
+                    if i < 2 {
+                        o.nodes |= 1 << i;
+                        o.first_rx_us[i] = o.first_rx_us[i].min(r.recv_micros);
+                    }
+                }
                 if texts.len() == 1 {
                     let (k, feed, _) = &texts[0];
                     let kh = hash_of(k.as_str());
-                    let fh = hash_of(r.frame.as_str());
+                    let fh = keys[0].1;
                     match i {
                         0 => {
                             first.insert(kh, (fh, *feed));
@@ -461,6 +545,132 @@ fn window_view(h: &Head, objects: &[String], lo: i64, hi: i64) -> WindowView {
 pub struct TruthSummary {
     pub node_frames: Vec<u64>,
     pub torn_files: u64,
+    /// Events without a key in the recordings, per label (feed and venue
+    /// event type), as [node-a, node-b]. The client's `unkeyed` counter
+    /// counts the same events as offered over the stream.
+    #[serde(default)]
+    pub unkeyed: BTreeMap<String, [u64; 2]>,
+}
+
+/// Missing keys of one fault, by which nodes recorded them, as [node-a
+/// only, node-b only, both].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultMissing {
+    pub fault: usize,
+    pub kind: FaultKind,
+    pub node: usize,
+    /// First recorded between the fault and the victim's recovery.
+    pub during: [u64; 3],
+    /// First recorded within [`AFTER_MS`] after the recovery.
+    pub after: [u64; 3],
+}
+
+/// How long after a recovery a missing key still counts against the fault.
+pub const AFTER_MS: i64 = 30_000;
+
+/// Where the missing keys came from. Counts only.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MissingDetail {
+    /// Per feed (rtds, binance, clob): [node-a only, node-b only, both].
+    pub by_feed_and_recorder: [[u64; 3]; 3],
+    /// Missing keys some node offered late, by the node of the first late
+    /// offer.
+    pub late_from: Vec<u64>,
+    /// Missing keys no node ever offered to the client.
+    pub never_offered: u64,
+    /// First receive time on any node minus the venue timestamp.
+    pub recv_lag_ms: Spread,
+    /// Of those, received more than the merger's span after their venue
+    /// time: late on arrival whatever the client did.
+    pub recv_lag_over_span: u64,
+    /// Per fault, by the time the key was first recorded.
+    pub faults: Vec<FaultMissing>,
+    /// First recorded outside every fault and its [`AFTER_MS`].
+    pub outside_faults: [u64; 3],
+}
+
+/// Break `missing` down. `origins` is from [`load_union`].
+pub fn missing_detail(inp: &chaos::Inputs, origins: &HashMap<u64, Origin>) -> MissingDetail {
+    let w = chaos::window_of(inp);
+    let nodes = inp.client.wanted.len().max(2);
+    let mut d = MissingDetail {
+        late_from: vec![0; nodes],
+        ..MissingDetail::default()
+    };
+    let mut faults: Vec<(usize, &Executed)> = inp.executed.iter().enumerate().collect();
+    faults.sort_by_key(|(_, e)| e.at_wall_ms);
+    d.faults = inp
+        .executed
+        .iter()
+        .enumerate()
+        .map(|(i, e)| FaultMissing {
+            fault: i,
+            kind: e.kind,
+            node: e.node,
+            during: [0; 3],
+            after: [0; 3],
+        })
+        .collect();
+    let delivered: HashSet<&str> = inp
+        .log
+        .iter()
+        .filter(|l| l.d)
+        .map(|l| l.k.as_str())
+        .collect();
+    let mut late_by: HashMap<&str, usize> = HashMap::new();
+    for l in inp.log.iter().filter(|l| !l.d) {
+        late_by.entry(l.k.as_str()).or_insert(l.n);
+    }
+    let span = ha::merge::WindowConfig::default().span_millis;
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut lags = Vec::new();
+    for f in &inp.truth {
+        for (k, feed, ts) in &f.keys {
+            let Some(t) = ts else { continue };
+            if !chaos::in_window(&w.lo, &w.hi, *feed, *t)
+                || delivered.contains(k.as_str())
+                || !seen.insert(k.as_str())
+            {
+                continue;
+            }
+            let o = origins
+                .get(&hash_of(k.as_str()))
+                .copied()
+                .unwrap_or(Origin {
+                    nodes: 0,
+                    first_rx_us: [f.rx_us, i64::MAX],
+                });
+            let col = match o.nodes {
+                1 => 0,
+                2 => 1,
+                _ => 2,
+            };
+            d.by_feed_and_recorder[(*feed as usize).min(2)][col] += 1;
+            match late_by.get(k.as_str()) {
+                Some(&n) if n < d.late_from.len() => d.late_from[n] += 1,
+                Some(_) => {}
+                None => d.never_offered += 1,
+            }
+            let rx_ms = o.first_rx_us.iter().copied().min().unwrap_or(f.rx_us) / 1_000;
+            let lag = rx_ms - t;
+            lags.push(lag as f64);
+            if lag > span {
+                d.recv_lag_over_span += 1;
+            }
+            let at = faults
+                .iter()
+                .rev()
+                .find(|(_, e)| e.at_wall_ms <= rx_ms)
+                .filter(|(_, e)| rx_ms <= e.recovered_wall_ms + AFTER_MS);
+            match at {
+                Some((i, e)) if rx_ms <= e.recovered_wall_ms => d.faults[*i].during[col] += 1,
+                Some((i, _)) => d.faults[*i].after[col] += 1,
+                None => d.outside_faults[col] += 1,
+            }
+        }
+    }
+    d.recv_lag_ms = chaos::spread_of(lags);
+    d
 }
 
 /// The drill verdict. Counts and timings only: this is the public artifact.
@@ -472,6 +682,9 @@ pub struct DrillReport {
     pub control_missing: u64,
     pub content: Content,
     pub truth: TruthSummary,
+    /// Where the main client's missing keys came from.
+    #[serde(default)]
+    pub missing_detail: MissingDetail,
     pub archive: DrillArchive,
 }
 
@@ -491,6 +704,7 @@ pub struct DrillInputs {
     pub control: Option<(ClientRecord, Vec<LogLine>)>,
     pub content: Content,
     pub truth: TruthSummary,
+    pub origins: HashMap<u64, Origin>,
     pub head: Option<Head>,
     pub objects: Vec<String>,
     pub lease: Vec<LeaseLine>,
@@ -559,7 +773,9 @@ pub fn load(run: &Path, collected: &Path) -> io::Result<DrillInputs> {
         truth: TruthSummary {
             node_frames: union.node_frames,
             torn_files: union.torn_files,
+            unkeyed: union.unkeyed,
         },
+        origins: union.origins,
         head,
         objects,
         lease,
@@ -578,6 +794,7 @@ fn ungate(o: &mut Outcome, name: &str) {
 
 pub fn verify(inp: &mut DrillInputs, slot_ms: i64, takeover_gate_ms: i64) -> DrillReport {
     let mut stream = chaos::verify(&inp.stream);
+    let missing_detail = missing_detail(&inp.stream, &inp.origins);
     // A killed node can forward a frame and lose the last second of its
     // file, so a delivered key in neither recording is not a failure here.
     ungate(&mut stream.verdict, "extra");
@@ -652,6 +869,7 @@ pub fn verify(inp: &mut DrillInputs, slot_ms: i64, takeover_gate_ms: i64) -> Dri
         control_missing,
         content: inp.content,
         truth: inp.truth.clone(),
+        missing_detail,
         archive,
     }
 }
@@ -660,6 +878,7 @@ pub fn verify(inp: &mut DrillInputs, slot_ms: i64, takeover_gate_ms: i64) -> Dri
 mod tests {
     use super::*;
     use caslease::Tenure;
+    use chaos::LogLine;
 
     #[test]
     fn the_drill_plan_spreads_leader_freezes_and_alternates_kills() {
@@ -898,6 +1117,169 @@ mod tests {
             inner.write_all(&[7, 0, 0]).unwrap();
         }
         std::io::Write::flush(&mut inner).unwrap();
+    }
+
+    #[test]
+    fn rtds_content_is_compared_without_the_connection_envelope() {
+        use feeds::recording::Source;
+        // The rehearsal compared raw frames and found every RTDS key
+        // different: the envelope carries a per-connection id and send time.
+        let dir = std::env::temp_dir().join(format!("poly-drill-rtds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (n1, n2) = (dir.join("n1"), dir.join("n2"));
+        std::fs::create_dir_all(&n1).unwrap();
+        std::fs::create_dir_all(&n2).unwrap();
+        let point = |conn: &str, sent: i64, value: &str| {
+            format!(
+                r#"{{"connection_id":"{conn}","payload":{{"symbol":"btc/usd","timestamp":1794206104000,"value":{value}}},"timestamp":{sent},"topic":"crypto_prices_chainlink","type":"update"}}"#
+            )
+        };
+        let market =
+            r#"{"id":"7","market":"0xe7","timestamp":"1794206104100","event_type":"new_market"}"#;
+        let odd = r#"{"asset_id":"1","timestamp":"1794206104200","event_type":"something_new"}"#;
+        let (a, b) = (
+            point("AAA=", 1794206104917, "1.5"),
+            point("BBB=", 1794206104999, "1.5"),
+        );
+        write_prec(
+            &n1.join("1.prec"),
+            &[
+                (1, Source::Rtds, &a),
+                (2, Source::ClobBook, market),
+                (3, Source::ClobBook, odd),
+            ],
+            false,
+        );
+        write_prec(
+            &n2.join("1.prec"),
+            &[(4, Source::Rtds, &b), (5, Source::ClobBook, market)],
+            false,
+        );
+        let u = load_union(&[n1.clone(), n2.clone()]).unwrap();
+        let rtds = Feed::Rtds.index();
+        let clob = Feed::Clob.index();
+        assert_eq!((u.content.compared[rtds], u.content.mismatch[rtds]), (1, 0));
+        // A market announcement is keyed now and compared like any event.
+        assert_eq!((u.content.compared[clob], u.content.mismatch[clob]), (1, 0));
+        // The same point at another value is still a mismatch.
+        write_prec(
+            &n2.join("1.prec"),
+            &[(4, Source::Rtds, &point("BBB=", 1794206104999, "1.6"))],
+            false,
+        );
+        let v = load_union(&[n1, n2]).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!((v.content.compared[rtds], v.content.mismatch[rtds]), (1, 1));
+        // Events with no key are named by feed and venue type, per node.
+        let mut want = BTreeMap::new();
+        want.insert("clob:something_new".to_string(), [1, 0]);
+        assert_eq!(u.unkeyed, want);
+    }
+
+    /// Two nodes, one feed, keys one a millisecond for 60 s. Node-b is
+    /// frozen from 20 s to 30 s.
+    fn breakdown_inputs() -> (chaos::Inputs, HashMap<u64, Origin>) {
+        let base = 1_700_000_000_000i64;
+        let mut truth = Vec::new();
+        let mut log = Vec::new();
+        let mut origins = HashMap::new();
+        let key = |i: i64| {
+            format!(
+                "BinanceTrade/{:032x}/{}",
+                (7u128 << 64) | i as u128,
+                base + i
+            )
+        };
+        for i in 0..60_000i64 {
+            let ts = base + i;
+            let k = key(i);
+            let frozen = (20_000..30_000).contains(&i);
+            // Keys 25,000 to 25,099 reached node-b only, which released
+            // them 12 s late after its freeze; the client judged them late.
+            let b_only = (25_000..25_100).contains(&i);
+            let rx = if b_only { ts + 12_000 } else { ts };
+            truth.push(TruthFrame {
+                rx_us: rx * 1_000,
+                keys: vec![(k.clone(), 1, Some(ts))],
+            });
+            let nodes = if b_only {
+                2
+            } else if frozen {
+                1
+            } else {
+                3
+            };
+            origins.insert(
+                hash_of(k.as_str()),
+                Origin {
+                    nodes,
+                    first_rx_us: [
+                        if nodes & 1 == 1 { rx * 1_000 } else { i64::MAX },
+                        if nodes & 2 == 2 { rx * 1_000 } else { i64::MAX },
+                    ],
+                },
+            );
+            log.push(LogLine {
+                k,
+                f: 1,
+                ts: Some(ts),
+                d: !b_only,
+                n: if b_only { 1 } else { 0 },
+                w: rx * 1_000,
+                rx: rx * 1_000,
+                m: i,
+            });
+        }
+        // Two keys both nodes recorded before the fault and no node sent.
+        for i in [5_000i64, 5_001] {
+            log.retain(|l| l.k != key(i));
+        }
+        let inp = chaos::Inputs {
+            plan: chaos::plan(1, 1, 4_000, 2_000, 1_000, None),
+            executed: vec![Executed {
+                node: 1,
+                kind: FaultKind::FreezeLeader,
+                at_wall_ms: base + 20_000,
+                at_mono_ms: 20_000,
+                recovered_wall_ms: base + 30_000,
+                recovered_mono_ms: 30_000,
+                takeover_ms: Some(5_000),
+            }],
+            harness: chaos::Harness::default(),
+            client: ClientRecord {
+                wanted: vec![true, true],
+                live_wall_ms: Some(base + 1_000),
+                live_mono_ms: Some(1_000),
+                first_from: vec![10, 10],
+                ..ClientRecord::default()
+            },
+            log,
+            truth,
+        };
+        (inp, origins)
+    }
+
+    #[test]
+    fn missing_keys_are_broken_down_by_feed_recorder_offer_and_fault() {
+        let (inp, origins) = breakdown_inputs();
+        let r = chaos::verify(&inp);
+        assert_eq!(r.missing, 102);
+        let d = missing_detail(&inp, &origins);
+        let b = Feed::Binance.index();
+        assert_eq!(d.by_feed_and_recorder[b], [0, 100, 2]);
+        assert_eq!(d.late_from, vec![0, 100]);
+        assert_eq!(d.never_offered, 2);
+        assert_eq!(d.recv_lag_over_span, 100);
+        assert_eq!(d.recv_lag_ms.max, Some(12_000.0));
+        // Received at 37 s, within 30 s of the recovery at 30 s. The window
+        // ends 1 s after the recovery by venue time, so it holds them.
+        assert_eq!(d.faults.len(), 1);
+        assert_eq!(d.faults[0].kind, FaultKind::FreezeLeader);
+        assert_eq!(
+            (d.faults[0].during, d.faults[0].after),
+            ([0; 3], [0, 100, 0])
+        );
+        assert_eq!(d.outside_faults, [0, 0, 2]);
     }
 
     #[test]

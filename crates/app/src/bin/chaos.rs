@@ -1471,6 +1471,52 @@ fn cmd_verify_drill(o: &Opts) -> Result<i32, String> {
         a.view.holes,
         a.view.orphans,
     );
+    // Where the missing keys and the unkeyed events came from. Counts and
+    // venue type names only.
+    let d = &r.missing_detail;
+    let rec = |f: usize| {
+        let x = d.by_feed_and_recorder[f];
+        format!("{}/{}/{}", x[0], x[1], x[2])
+    };
+    let faults: Vec<String> = d
+        .faults
+        .iter()
+        .map(|f| {
+            format!(
+                "{}:{:?}@{}:during={}/{}/{}:after={}/{}/{}",
+                f.fault,
+                f.kind,
+                f.node,
+                f.during[0],
+                f.during[1],
+                f.during[2],
+                f.after[0],
+                f.after[1],
+                f.after[2]
+            )
+        })
+        .collect();
+    let unkeyed: Vec<String> = r
+        .truth
+        .unkeyed
+        .iter()
+        .map(|(l, n)| format!("{l}={}/{}", n[0], n[1]))
+        .collect();
+    println!(
+        "chaos drill missing (a only/b only/both): rtds={} binance={} clob={} late_from={:?} never_offered={} recv_lag_over_span={} recv_lag_max_ms={} outside_faults={}/{}/{} faults=[{}] unkeyed(a/b)=[{}]",
+        rec(0),
+        rec(1),
+        rec(2),
+        d.late_from,
+        d.never_offered,
+        d.recv_lag_over_span,
+        d.recv_lag_ms.max.map_or("-".into(), |v| format!("{v:.0}")),
+        d.outside_faults[0],
+        d.outside_faults[1],
+        d.outside_faults[2],
+        faults.join(" "),
+        unkeyed.join(" "),
+    );
     Ok(r.exit_code())
 }
 
