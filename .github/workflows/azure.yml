@@ -8,7 +8,7 @@ name: Azure
 #   ha-infra-*    create or update the network and the two VMs
 #   ha-deploy-*   build the node for both architectures, install it and the
 #                 drill tools, check it
-#   ha-drill-*    the live drill: ha-drill-rehearsal runs 4 faults, any
+#   ha-drill-*    the live drill: ha-drill-rehearsal* runs 4 faults, any
 #                 other ha-drill-* tag 20 (docs/HA_DRILL.md)
 #   ha-start-*    start both VMs
 #   ha-stop-*     deallocate both VMs
@@ -289,11 +289,10 @@ jobs:
         run: |
           # The plan is seeded with the run id. A rehearsal is three kills
           # and one leader freeze; a full drill fourteen and six.
-          if [ "$GITHUB_REF_NAME" = ha-drill-rehearsal ]; then
-            faults=4 freezes=1
-          else
-            faults=20 freezes=6
-          fi
+          case "$GITHUB_REF_NAME" in
+            ha-drill-rehearsal*) faults=4 freezes=1 ;;
+            *) faults=20 freezes=6 ;;
+          esac
           {
             echo "DRILL_FAULTS=$faults"
             echo "DRILL_LEADER_FREEZES=$freezes"

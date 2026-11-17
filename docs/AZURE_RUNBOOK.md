@@ -2,7 +2,7 @@
 
 How to deploy, check, pause and delete the two Poly HA nodes on Azure. The design is in [HA_BUILD_SPEC_B_C_AZURE.md](HA_BUILD_SPEC_B_C_AZURE.md), sections 4 and 7.
 
-**State on 17 November 2026: nothing is deployed.** The code is in the repository and checked in CI. No resource group, no identity, no storage account, no GitHub environment and no `ha-*` tag exists. Every step below that creates something is the owner's to run.
+**State on 18 November 2026: deployed.** The bootstrap was run from the owner's machine on 17 November, and the tags `ha-infra-3` and `ha-deploy-1` created the network and the two VMs and installed the node. No drill has run yet (section 7a). Every step below that creates something is the owner's to run.
 
 ## 1. What gets created
 
@@ -36,7 +36,7 @@ One resource group, `poly-ha`, in `eastasia`. Everything is inside it and every 
 
 Azure also keeps two deployment records, `poly-ha-bootstrap` at the subscription and `poly-ha-nodes` in the group. They hold no resource and cost nothing.
 
-What the network lets in: TCP 22 from the one address range you give, and nothing else. A deny rule at priority 4096 overrides Azure's default rules that would let the virtual network and the load balancer in. The stream (`127.0.0.1:9100`) and the health endpoints (`127.0.0.1:9101`) bind loopback on each VM and are reached through an SSH forward. Password login is off, at Azure and again in `sshd`. The storage account refuses account keys, so there is no connection string for it anywhere.
+What the network lets in: TCP 22 from the one address range you give, and nothing else (a drill adds a rule for its runner's address while it runs, section 7a). A deny rule at priority 4096 overrides Azure's default rules that would let the virtual network and the load balancer in. The stream (`127.0.0.1:9100`) and the health endpoints (`127.0.0.1:9101`) bind loopback on each VM and are reached through an SSH forward. Password login is off, at Azure and again in `sshd`. The storage account refuses account keys, so there is no connection string for it anywhere.
 
 ## 2. Monthly cost at eastasia prices
 
@@ -187,6 +187,29 @@ ops/azure/status.sh          # read-only
 ```
 
 Or by tag: `ha-stop-N` and `ha-start-N`.
+
+## 7a. Run a drill
+
+The live drill is described in [HA_DRILL.md](HA_DRILL.md): what it does, what it measures and what a pass means. It runs from a tag, like everything else here.
+
+```bash
+# The VMs must carry this commit's drill tools, which the deploy job installs.
+git tag ha-deploy-2 && git push origin ha-deploy-2              # wait for it to pass
+git tag ha-drill-rehearsal && git push origin ha-drill-rehearsal  # 4 faults, about 20 minutes
+# Read the run's public log and its report.json artifact. Then:
+git tag ha-drill-1 && git push origin ha-drill-1                # 20 faults, about 50 minutes
+```
+
+The drill job starts deallocated VMs, so it also works in drill-only mode. While it runs it adds one security group rule, `drill-<run id>`, that lets SSH in from the runner's address only, and a key for the user `drill` on both VMs that can only forward to the node's loopback ports. Its last step removes both, also after a failure or a cancel, and fails the run unless both are gone and both nodes run with exactly one leader. To check by hand afterwards:
+
+```bash
+az network nsg rule list -g poly-ha --nsg-name poly-ha-nsg --query "[].name" -o tsv   # no drill- name
+ops/azure/status.sh
+```
+
+If a runner was lost before its cleanup, the next drill removes any `drill-*` rule before it adds its own, the key expires four hours after it was set, and `az network nsg rule delete -g poly-ha --nsg-name poly-ha-nsg -n drill-<run id>` removes the rule at once.
+
+The recordings a drill collects stay in the archive container under `drill/<run id>/` for two days. Only `report.json` leaves the runner.
 
 ## 7. Check the bill after 72 hours
 
