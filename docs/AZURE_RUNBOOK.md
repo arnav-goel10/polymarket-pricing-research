@@ -73,14 +73,15 @@ Nothing here was done for you, because each step creates something or needs a ch
 
 1. **Register four resource providers.** On 17 November `Microsoft.Compute`, `Microsoft.Network`, `Microsoft.Storage` and `Microsoft.ManagedIdentity` were `NotRegistered` on the subscription. `Microsoft.Consumption`, `Microsoft.CostManagement`, `Microsoft.Authorization` and `Microsoft.Resources` were `Registered`.
 2. **Choose the budget email.** The address that gets a mail at 50, 80 and 100 percent of 20 a month, and when the forecast passes 100 percent. The budget only sends mail. It stops nothing.
-3. **Choose the SSH source range.** Your own public address as `/32`. The script refuses anything wider than `/24`.
+3. **Choose the SSH source range.** Your own public address as `/32`. Both ways of deploying refuse anything wider than `/24`: `deploy.sh` and the `ha-infra` job run the same check, `ops/azure/check_cidr.sh`.
 4. **Choose the SSH public key.** An `ssh-ed25519` or `ssh-rsa` public key file. It becomes the only login on both VMs.
-5. **Run the bootstrap.** It creates the group, the identities, the federated credential, the storage account, the roles and the budget. It needs Owner rights on the subscription, which the workflow's identity does not have.
-6. **Create the GitHub environment `azure`,** limit it to `ha-*` tags, and set five variables in it. Until this exists the workflow does nothing.
-7. **Push the tags** that create the VMs and install the node.
-8. **Read the bill after 72 hours** and decide always-on or drill-only.
+5. **Create the GitHub environment `azure`** and limit it to `ha-*` tags. Until it exists, and while its rules allow anything but `ha-*` tags, the workflow does nothing.
+6. **Run the bootstrap.** It creates the group, the identities, the federated credential, the storage account, the roles and the budget. It needs Owner rights on the subscription, which the workflow's identity does not have.
+7. **Set five variables** in the environment, three of them printed by the bootstrap.
+8. **Push the tags** that create the VMs and install the node.
+9. **Read the bill after 72 hours** and decide always-on or drill-only.
 
-The federated credential in step 5 is the only link between GitHub and Azure. It names this repository and the environment `azure`, so the tag limit in step 6 is what decides who can deploy. Set it before the first `ha-*` tag is pushed.
+The order of steps 5 and 6 matters. The federated credential made in step 6 is the only link between GitHub and Azure. It names this repository and the environment `azure`, so the tag limit of step 5 is what decides who can deploy. A workflow that names an environment which does not exist creates it with no limit, so the environment and its limit must be there before the credential is.
 
 ## 4. Deploy, in order
 
@@ -104,25 +105,29 @@ az network list-usages -l eastasia -o table
 ops/azure/deploy.sh --github-repo arnav-goel10/polymarket-pricing-research \
   --budget-email YOU@EXAMPLE.COM --bootstrap-only --what-if
 
-# 4. Bootstrap: group, identities, storage, roles, budget. No VM yet.
-ops/azure/deploy.sh --github-repo arnav-goel10/polymarket-pricing-research \
-  --budget-email YOU@EXAMPLE.COM --bootstrap-only --yes
-```
-
-Step 4 ends by printing `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID`. If Azure refuses the budget (a new subscription can wait up to 48 hours, and the Students offer may not allow one), run step 4 again with `--no-budget` and add the budget later by running it once more without that flag.
-
-```bash
-# 5. The GitHub environment, limited to ha-* tags
+# 4. The GitHub environment, limited to ha-* tags. Before the bootstrap, so the
+#    credential it creates never points at an environment anyone can use.
 gh api -X PUT repos/arnav-goel10/polymarket-pricing-research/environments/azure \
   -F "deployment_branch_policy[protected_branches]=false" \
   -F "deployment_branch_policy[custom_branch_policies]=true"
 gh api -X POST repos/arnav-goel10/polymarket-pricing-research/environments/azure/deployment-branch-policies \
   -f name='ha-*' -f type=tag
+# Must print exactly one line: ha-* tag
+gh api repos/arnav-goel10/polymarket-pricing-research/environments/azure/deployment-branch-policies \
+  --jq '.branch_policies[] | "\(.name) \(.type)"'
 
-# 6. Its variables. None is a secret: the ids open nothing without GitHub's own token.
-gh variable set AZURE_CLIENT_ID --env azure --body "VALUE_FROM_STEP_4"
-gh variable set AZURE_TENANT_ID --env azure --body "VALUE_FROM_STEP_4"
-gh variable set AZURE_SUBSCRIPTION_ID --env azure --body "VALUE_FROM_STEP_4"
+# 5. Bootstrap: group, identities, storage, roles, budget. No VM yet.
+ops/azure/deploy.sh --github-repo arnav-goel10/polymarket-pricing-research \
+  --budget-email YOU@EXAMPLE.COM --bootstrap-only --yes
+```
+
+Step 5 ends by printing `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID`. If Azure refuses the budget (a new subscription can wait up to 48 hours, and the Students offer may not allow one), run step 5 again with `--no-budget` and add the budget later by running it once more without that flag.
+
+```bash
+# 6. The environment's variables. None is a secret: the ids open nothing without GitHub's own token.
+gh variable set AZURE_CLIENT_ID --env azure --body "VALUE_FROM_STEP_5"
+gh variable set AZURE_TENANT_ID --env azure --body "VALUE_FROM_STEP_5"
+gh variable set AZURE_SUBSCRIPTION_ID --env azure --body "VALUE_FROM_STEP_5"
 gh variable set SSH_SOURCE_CIDR --env azure --body "A.B.C.D/32"
 gh variable set SSH_PUBLIC_KEY --env azure < ~/.ssh/id_ed25519.pub
 
@@ -138,6 +143,8 @@ ops/azure/status.sh
 ```
 
 Each tag is used once. The next deploy is `ha-deploy-2`, and so on.
+
+Every run starts with a `gate` job that reads the environment and its rules. If the environment is missing, lets any ref deploy, or has a rule that is not an `ha-*` tag, the run says so in a notice and does nothing else. The `ha-infra` job then checks `SSH_SOURCE_CIDR` before it asks Azure anything, and fails on a range wider than `/24`.
 
 The `ha-deploy` run passes only when both nodes answer `/readyz` with all three venue feeds connected, the store contract suite passes against the real account from each VM, exactly one node leads, and at least one slot has been committed.
 
@@ -168,7 +175,7 @@ On each VM the node runs as `poly-node.service` under user `poly`: `Restart=alwa
 
 ## 6. Pause and resume
 
-Every script prints what it will do and changes nothing without `--yes`. Each refuses to run on any subscription other than Azure for Students.
+Every script prints what it will do and changes nothing without `--yes`. Each refuses to run on any subscription other than Azure for Students. `ops/azure/vm_run.sh`, which the deploy job uses to run a command on a VM, has no dry run but holds to the same subscription rule.
 
 ```bash
 ops/azure/stop.sh            # the plan
@@ -187,11 +194,12 @@ Cost data is 8 to 24 hours behind use, so the first full picture is on day 3.
 ops/azure/cost.sh --days 3
 ```
 
-It prints the actual cost of the group by meter, the total and the budget. Read three things.
+It prints the actual cost of the group by meter, the total and the budget. Read four things.
 
 1. The two VM meters, `B2ats v2` and `B2pts v2`. A quantity near 72 hours each with a cost of 0 means the free hours apply. A cost near $0.94 and $0.84 means they do not.
 2. The total against section 2. Three days always-on should be about $1.30 with free hours and about $3.10 without.
 3. The `Hot LRS Data Stored` quantity. If the archive grows by more than 15 GB a day, lower `archiveRetentionDays` to 1.
+4. The `S4 LRS Disk Operations` meter. The estimate in section 2 is $0.10 to $0.50 a month, so three days should be a cent or two. This is the one number in the table with a high ceiling: a disk written at its 500 operations a second limit all month would cost about $66. More than $0.10 in three days means the node writes to disk far more often than once a second, and that needs a look before leaving it on.
 
 The same numbers are in the portal under Cost Management, Cost analysis, scope `poly-ha`, grouped by Meter. The credit that is left is at `https://www.microsoftazuresponsorships.com/Balance`.
 
@@ -203,6 +211,8 @@ Then choose. Free hours apply: leave it on. They do not: run `ops/azure/stop.sh 
 ops/azure/destroy.sh         # lists what will go
 ops/azure/destroy.sh --yes   # deletes the group, waits, then checks nothing tagged project=poly-ha is left
 ```
+
+The script deletes only a group tagged `project=poly-ha`, which the bootstrap sets. It refuses any other group, whatever `POLY_RG` names.
 
 The one command underneath is `az group delete -n poly-ha --yes`. It removes every row of the table in section 1, the archive included, and cannot be undone. The cost goes to $0. The tag `ha-destroy-N` does the same from the workflow without waiting.
 
@@ -237,4 +247,4 @@ All read-only, on 17 November 2026.
 
 Not checked, because it needs the group to exist: a what-if of `nodes.bicep`. The `ha-infra` job runs one before it creates anything. Not proven until the first deploy: that the budget is accepted on this offer, that the free VM hours bill zero, and that Binance and Polymarket accept connections from Hong Kong cloud addresses.
 
-In CI, the `azure-deploy-code` job compiles both templates, checks the compiled JSON against the promises in sections 1 and 5 (`deploy/azure/check_templates.py`), lints the scripts and the workflow, and runs every ops script against a fake `az` to show that none changes anything without `--yes`. The `azurite` job runs the Blob store against the Azurite emulator.
+In CI, the `azure-deploy-code` job compiles both templates, checks the compiled JSON against the promises in sections 1 and 5 (`deploy/azure/check_templates.py`), lints the scripts and the workflow, and runs every ops script against a fake `az` to show that none changes anything without `--yes`. The same test runs the SSH range check on good and bad ranges, and the gate against a fake `gh` for a missing, open, wrongly limited and correctly limited environment. The `azurite` job runs the Blob store against the Azurite emulator.
