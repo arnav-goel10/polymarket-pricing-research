@@ -30,8 +30,11 @@ prefix="drill/$run/n$POLY_NODE_ID"
 lo=$((from / 60000 - 1))
 hi=$((to / 60000 + 1))
 
+stage=token
 token_header
 tmpd=$(mktemp -d)
+
+stage=logs
 
 [ -f "$state/faults.jsonl" ] || : >"$state/faults.jsonl"
 put_blob "$state/faults.jsonl" "$prefix/faults.jsonl"
@@ -48,17 +51,32 @@ put_blob "$tmpd/metrics-end.txt" "$prefix/metrics-end.txt"
 
 files=0
 bytes=0
+declare -A sent=()
 shopt -s nullglob
 for f in "$data"/seg/*.prec "$data"/seg/*.prec.open; do
   name=${f##*/}
   slot=${name%%.*}
   [[ $slot =~ ^[0-9]+$ ]] || continue
   [ "$slot" -ge "$lo" ] && [ "$slot" -le "$hi" ] || continue
-  gzip -c "$f" >"$tmpd/seg.gz"
+  stage="segment $slot"
+  # The node closes a minute's file by renaming it from .prec.open to
+  # .prec, and that can happen between the listing above and here: the
+  # second rehearsal lost its collect to it on node-a.
+  if [ ! -e "$f" ] && [ -e "${f%.open}" ]; then
+    f=${f%.open}
+    name=${f##*/}
+  fi
+  [ -z "${sent[$name]:-}" ] || continue
+  # From standard input, so a file still being written is read to where it
+  # is and gzip does not stop at its size changing; the reader takes a
+  # torn last record as the end.
+  gzip -c <"$f" >"$tmpd/seg.gz" 2>/dev/null || fail "segment $slot could not be read"
   put_blob "$tmpd/seg.gz" "$prefix/seg/$name.gz"
+  sent[$name]=1
   files=$((files + 1))
   bytes=$((bytes + $(stat -c %s "$tmpd/seg.gz")))
 done
+stage=done
 
 echo "drill-collect: node $POLY_NODE_ID segments=$files gz_bytes=$bytes slots=$lo..$hi"
 echo "POLY_OK drill-collect"

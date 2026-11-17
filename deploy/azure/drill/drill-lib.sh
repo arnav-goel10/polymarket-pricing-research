@@ -12,12 +12,14 @@
 # counts.
 # shellcheck shell=bash disable=SC2034
 
-set -euo pipefail
+set -Eeuo pipefail
 
-env_file=/etc/poly/node.env
+# The paths can be moved for ops/azure/test_drill_collect.sh. The VM agent
+# starts the scripts with none of these set.
+env_file=${DRILL_ENV_FILE:-/etc/poly/node.env}
 drill_dir=/opt/poly/drill
-state_root=/var/lib/poly-drill
-data=/var/lib/poly
+state_root=${DRILL_STATE_ROOT:-/var/lib/poly-drill}
+data=${DRILL_DATA:-/var/lib/poly}
 http=http://127.0.0.1:9101
 agent_unit=poly-drill-agent
 drill_home=/home/drill
@@ -28,6 +30,12 @@ drill_home=/home/drill
 hdr=
 tmpd=
 trap '[ -z "$hdr" ] || rm -f "$hdr"; [ -z "$tmpd" ] || rm -rf "$tmpd"' EXIT
+
+# A command that fails under `set -e` says where, so the runner's log has a
+# reason even when the command's own message is not one of ours. `stage`
+# names plain steps, never a path or a value.
+stage=start
+trap 'echo "drill: ${0##*/} stopped at ${stage} (exit $?)" >&2' ERR
 
 fail() {
   echo "drill: $*" >&2

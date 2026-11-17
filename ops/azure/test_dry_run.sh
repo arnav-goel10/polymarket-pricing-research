@@ -25,6 +25,10 @@ case "$*" in
   "group delete"*) touch "$AZ_STATE/group-deleted" ;;
   "group show"*"tags.project"*) echo "${FAKE_GROUP_TAG-poly-ha}" ;;
   "vm run-command invoke"*)
+    if [ -n "${FAKE_RUN_AZ_ERROR:-}" ]; then
+      echo "$FAKE_RUN_AZ_ERROR" >&2
+      exit 1
+    fi
     if [ -n "${FAKE_RUN_OUTPUT:-}" ]; then
       echo "$FAKE_RUN_OUTPUT"
       exit 0
@@ -673,6 +677,18 @@ start "vm_run runs the drill script for a drill command" env FAKE_RUN_OUTPUT="PO
 check test "$code" = 0
 check grep -q "^vm run-command invoke -g poly-ha -n node-a .*--scripts /opt/poly/drill/drill-close.sh 12345-1 " "$AZ_LOG"
 
+start "vm_run names the reason when a VM command does not finish" env FAKE_RUN_OUTPUT=$'Enable succeeded: \n[stdout]\n\n[stderr]\ngzip: /var/lib/poly/seg/1.aa.prec.open: No such file or directory' "$here/vm_run.sh" node-a drill-collect 12345-1 1763000000000 1763000600000
+check test "$code" != 0
+check grep -q "^vm_run: drill-collect on node-a did not finish: gzip error (file missing)$" <<<"$out"
+start "vm_run passes on the drill's own reason, without addresses" env FAKE_RUN_OUTPUT=$'[stderr]\ndrill: upload of drill/1/n1/x.gz failed https://acct.example/x 10.42.0.5' "$here/vm_run.sh" node-a drill-collect 12345-1 1763000000000 1763000600000
+check grep -q "^vm_run: drill-collect on node-a did not finish: drill: upload of drill/1/n1/x.gz failed <url> <addr>$" <<<"$out"
+start "vm_run says an empty answer is a run-command limit" env FAKE_RUN_OUTPUT=$'Enable succeeded: \n[stdout]\n\n[stderr]' "$here/vm_run.sh" node-a drill-collect 12345-1 1763000000000 1763000600000
+check grep -q "did not finish: no output (run-command limit or timeout)$" <<<"$out"
+start "vm_run classes an az failure without its text" env FAKE_RUN_AZ_ERROR="ERROR: (Conflict) Run command extension execution is in progress on 10.42.0.5" "$here/vm_run.sh" node-a drill-collect 12345-1 1763000000000 1763000600000
+check test "$code" != 0
+check grep -q "^vm_run: drill-collect on node-a failed: busy: another run-command or operation on the VM$" <<<"$out"
+check test "$(grep -c 10.42.0.5 <<<"$out")" = 0
+
 # Lint: no drill script traces its commands or looks up an address.
 name="the drill scripts never trace or look up an address"
 check test -z "$(grep -nE 'set -x|set -o xtrace|hostname -I|ifconfig|ip (-[46] )?a(ddr)?( |$)|metadata/instance' \
@@ -681,6 +697,12 @@ name="the drill agent compiles"
 check python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$here/../../deploy/azure/drill/drill-agent.py"
 name="the drill agent stops promptly on SIGTERM, also holding its lock, and never leaves the node stopped"
 check python3 -I "$here/test_drill_agent.py"
+name="drill-collect survives a minute file closing under it, and every failure names its stage"
+if [ "$(uname -s)" = Linux ]; then
+  check bash "$here/test_drill_collect.sh"
+else
+  echo "skip  $name (needs Linux)"
+fi
 
 # The drill user's sshd settings, against the real sshd where there is
 # one: the file passes `sshd -t` beside the base config, the drill user
