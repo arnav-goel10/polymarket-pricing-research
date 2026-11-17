@@ -4,6 +4,9 @@
 param location string
 param tags object
 param githubRepo string
+
+@description('The repository part of the token subject GitHub presents. GitHub may add immutable ids, as OWNER@ID/REPO@ID. Empty means the same as githubRepo.')
+param githubSubjectRepo string = ''
 param githubEnvironment string
 param budgetEmail string
 param deployBudget bool
@@ -58,7 +61,7 @@ resource federation 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedI
   name: 'github-${githubEnvironment}'
   properties: {
     issuer: 'https://token.actions.githubusercontent.com'
-    subject: 'repo:${githubRepo}:environment:${githubEnvironment}'
+    subject: 'repo:${empty(githubSubjectRepo) ? githubRepo : githubSubjectRepo}:environment:${githubEnvironment}'
     audiences: [
       'api://AzureADTokenExchange'
     ]

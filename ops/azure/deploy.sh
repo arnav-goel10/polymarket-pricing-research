@@ -16,10 +16,11 @@ set -euo pipefail
 # shellcheck source=ops/azure/lib.sh
 . "$(dirname "$0")/lib.sh"
 
-repo="" email="" cidr="" key_file="" bootstrap_only=0 what_if=0 no_budget=0
+repo="" subject_repo="" email="" cidr="" key_file="" bootstrap_only=0 what_if=0 no_budget=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --github-repo) repo=${2:?}; shift 2 ;;
+    --github-subject-repo) subject_repo=${2:?}; shift 2 ;;
     --budget-email) email=${2:?}; shift 2 ;;
     --ssh-cidr) cidr=${2:?}; shift 2 ;;
     --ssh-key-file) key_file=${2:?}; shift 2 ;;
@@ -32,6 +33,8 @@ while [ $# -gt 0 ]; do
 done
 
 [[ $repo =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "--github-repo OWNER/REPO is required"
+# GitHub can present the subject with immutable ids: OWNER@ID/REPO@ID.
+[ -z "$subject_repo" ] || [[ $subject_repo =~ ^[A-Za-z0-9._-]+@[0-9]+/[A-Za-z0-9._-]+@[0-9]+$ ]] || die "--github-subject-repo must look like OWNER@ID/REPO@ID"
 [[ $email =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "--budget-email is required"
 if [ "$bootstrap_only" -eq 0 ]; then
   # The same check the ha-infra job of the workflow runs.
@@ -71,7 +74,7 @@ fi
 
 bootstrap=(az deployment sub create --name poly-ha-bootstrap --location "$LOCATION"
   --template-file "$REPO_ROOT/deploy/azure/bootstrap.bicep"
-  --parameters "location=$LOCATION" "resourceGroupName=$RG" "githubRepo=$repo"
+  --parameters "location=$LOCATION" "resourceGroupName=$RG" "githubRepo=$repo" "githubSubjectRepo=$subject_repo"
   "budgetEmail=$email" "deployBudget=$deploy_budget" --output none)
 
 say ""
@@ -86,7 +89,7 @@ if [ "$what_if" -eq 1 ]; then
   say "What Azure says the bootstrap template would change (nothing is created):"
   az deployment sub what-if --name poly-ha-bootstrap --location "$LOCATION" \
     --template-file "$REPO_ROOT/deploy/azure/bootstrap.bicep" \
-    --parameters "location=$LOCATION" "resourceGroupName=$RG" "githubRepo=$repo" \
+    --parameters "location=$LOCATION" "resourceGroupName=$RG" "githubRepo=$repo" "githubSubjectRepo=$subject_repo" \
     "budgetEmail=$email" "deployBudget=$deploy_budget" --result-format ResourceIdOnly
 fi
 run "${bootstrap[@]}"

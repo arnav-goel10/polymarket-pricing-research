@@ -25,6 +25,9 @@ param resourceGroupName string = 'poly-ha'
 @description('owner/repo of the GitHub repository whose environment may deploy.')
 param githubRepo string
 
+@description('Repository part of the GitHub token subject when it carries ids (OWNER@ID/REPO@ID). Empty means githubRepo.')
+param githubSubjectRepo string = ''
+
 @description('The GitHub environment the deploy workflow runs in.')
 param githubEnvironment string = 'azure'
 
@@ -58,6 +61,7 @@ module base 'modules/base.bicep' = {
     location: location
     tags: tags
     githubRepo: githubRepo
+    githubSubjectRepo: githubSubjectRepo
     githubEnvironment: githubEnvironment
     budgetEmail: budgetEmail
     deployBudget: deployBudget

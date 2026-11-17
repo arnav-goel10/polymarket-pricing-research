@@ -121,6 +121,8 @@ ops/azure/deploy.sh --github-repo arnav-goel10/polymarket-pricing-research \
   --budget-email YOU@EXAMPLE.COM --bootstrap-only --yes
 ```
 
+If the workflow's Azure login fails with `AADSTS700213` and the log shows a subject like `repo:OWNER@123/REPO@456:environment:azure`, GitHub is sending the subject with immutable ids. Run step 5 again with `--github-subject-repo 'OWNER@123/REPO@456'`, copied from that log line. This happened on the first deploy, 17 November 2026.
+
 Step 5 ends by printing `AZURE_CLIENT_ID`, `AZURE_TENANT_ID` and `AZURE_SUBSCRIPTION_ID`. If Azure refuses the budget (a new subscription can wait up to 48 hours, and the Students offer may not allow one), run step 5 again with `--no-budget` and add the budget later by running it once more without that flag.
 
 ```bash
