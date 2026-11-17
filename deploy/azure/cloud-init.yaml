@@ -1,0 +1,52 @@
+#cloud-config
+# First boot of a Poly HA node. It prepares the machine and installs the
+# service unit; it does not install the node binary. The deploy step does
+# that with /opt/poly/polyctl.sh, and the service stays inert until then.
+#
+# The names in double underscores are filled in by nodes.bicep.
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - jq
+write_files:
+  - path: /etc/poly/node.env
+    permissions: "0644"
+    content: |
+      POLY_NODE_ID=__NODE_ID__
+      POLY_AZURE_STORE=__STORE_URL__
+      POLY_AZURE_CLIENT_ID=__CLIENT_ID__
+      RUST_LOG=info
+  - path: /opt/poly/polyctl.sh
+    permissions: "0755"
+    encoding: b64
+    content: "__POLYCTL_B64__"
+  - path: /opt/poly/healthcheck.sh
+    permissions: "0755"
+    encoding: b64
+    content: "__HEALTHCHECK_B64__"
+  - path: /etc/systemd/system/poly-node.service
+    permissions: "0644"
+    encoding: b64
+    content: "__NODE_SERVICE_B64__"
+  - path: /etc/systemd/system/poly-health.service
+    permissions: "0644"
+    encoding: b64
+    content: "__HEALTH_SERVICE_B64__"
+  - path: /etc/systemd/system/poly-health.timer
+    permissions: "0644"
+    encoding: b64
+    content: "__HEALTH_TIMER_B64__"
+  - path: /etc/ssh/sshd_config.d/10-poly.conf
+    permissions: "0644"
+    encoding: b64
+    content: "__SSHD_B64__"
+runcmd:
+  - id -u poly >/dev/null 2>&1 || useradd --system --home-dir /var/lib/poly --shell /usr/sbin/nologin poly
+  - id -u drill >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin drill
+  - install -d -o poly -g poly -m 0750 /var/lib/poly
+  - install -d -o root -g root -m 0755 /opt/poly/releases
+  - sshd -t && systemctl try-reload-or-restart ssh
+  - systemctl daemon-reload
+  - systemctl enable poly-node.service
+  - systemctl enable --now poly-health.timer

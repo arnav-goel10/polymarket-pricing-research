@@ -1,0 +1,6 @@
+[Unit]
+Description=Poly HA node liveness check
+
+[Service]
+Type=oneshot
+ExecStart=/opt/poly/healthcheck.sh

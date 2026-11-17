@@ -1,0 +1,37 @@
+[Unit]
+Description=Poly HA node
+After=network-online.target
+Wants=network-online.target
+# Inert until a build has been installed by polyctl.sh.
+ConditionPathExists=/opt/poly/current/node
+# Never give up restarting.
+StartLimitIntervalSec=0
+
+[Service]
+User=poly
+Group=poly
+EnvironmentFile=/etc/poly/node.env
+# The stream and the health endpoints bind loopback only.
+ExecStart=/opt/poly/current/node \
+  --data /var/lib/poly \
+  --node ${POLY_NODE_ID} \
+  --listen 127.0.0.1:9100 \
+  --http 127.0.0.1:9101 \
+  --azure-store ${POLY_AZURE_STORE}
+Restart=always
+RestartSec=1
+# The VM has 1 GiB. Past this the kernel kills the node and systemd
+# restarts it, which the client rides out on the other node.
+MemoryMax=600M
+# On SIGTERM the node releases the lease within 2 s and drains.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/poly
+
+[Install]
+WantedBy=multi-user.target
