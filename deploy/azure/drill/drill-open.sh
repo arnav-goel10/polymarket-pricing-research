@@ -9,7 +9,9 @@
 # one key, limited to forwarding to the node's stream (9100), its health
 # endpoints (9101) and the drill agent (9102) on loopback, no shell, no
 # remote forward, and an expiry four hours out in case the close never
-# runs. Then it starts the drill agent and prints this VM's ed25519 host
+# runs. Before the key goes in, it installs sshd-drill.conf, a Match block
+# that holds the drill user to those TCP forwards whatever a key says,
+# checked with `sshd -t` before sshd reloads. Then it starts the drill agent and prints this VM's ed25519 host
 # key, which the runner pins. The runner keeps that output out of the log.
 #
 # It refuses to run unless the installed drill tools have the digest the
@@ -35,6 +37,41 @@ while [ $((${#b64} % 4)) -ne 0 ]; do b64="$b64="; done
 blob_len=$(printf '%s' "$b64" | base64 -d 2>/dev/null | wc -c)
 [ "$blob_len" -eq 51 ] || fail "the key is not an ed25519 public key"
 printf '%s' "$b64" | base64 -d | head -c 15 | grep -qa 'ssh-ed25519' || fail "the key is not an ed25519 public key"
+
+# What sshd lets the drill user do, before any key of this run is there.
+# The key's options cover TCP forwards only; the Match block also shuts
+# Unix socket, agent and X11 forwards and listeners (sshd-drill.conf).
+# `sshd -t` checks the whole config with the new file in it, and a file
+# that fails is taken out again before anything reloads, so a bad file can
+# never lock SSH out. The setting sshd would apply to the drill user is
+# then read back and must be exactly this.
+sshd_conf=/etc/ssh/sshd_config.d/20-poly-drill.conf
+old=
+if ! cmp -s "$drill_dir/sshd-drill.conf" "$sshd_conf"; then
+  if [ -e "$sshd_conf" ]; then
+    old=$(mktemp)
+    cp -p "$sshd_conf" "$old"
+  fi
+  install -o root -g root -m 0644 "$drill_dir/sshd-drill.conf" "$sshd_conf.new"
+  mv -f "$sshd_conf.new" "$sshd_conf"
+fi
+# sshd -t wants its privilege separation directory, which a socket
+# activated ssh.service has not made yet if no one has logged in.
+install -d -m 0755 /run/sshd
+if ! /usr/sbin/sshd -t >/dev/null 2>&1; then
+  if [ -n "$old" ]; then mv -f "$old" "$sshd_conf"; else rm -f "$sshd_conf"; fi
+  fail "sshd refused its config with the drill user's settings; sshd was not reloaded"
+fi
+[ -z "$old" ] || rm -f "$old"
+systemctl try-reload-or-restart ssh >/dev/null 2>&1 || fail "sshd did not reload"
+effective=$(/usr/sbin/sshd -T -C user=drill,host=drill,addr=127.0.0.1 2>/dev/null) ||
+  fail "sshd could not report the drill user's settings"
+for want_line in "allowtcpforwarding local" \
+  "permitopen 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102" \
+  "permitlisten none" "allowstreamlocalforwarding no" \
+  "allowagentforwarding no" "x11forwarding no"; do
+  grep -qixF -- "$want_line" <<<"$effective" || fail "sshd does not apply '$want_line' to the drill user"
+done
 
 # Local time with no zone suffix: sshd reads it in the system's own zone,
 # and the Z suffix is not understood by every OpenSSH release.

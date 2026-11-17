@@ -14,7 +14,13 @@ else but the node's stream and health ports. One line in, one line out:
 
 The agent sends SIGCONT itself, so a runner that disappears mid-freeze
 never leaves the node stopped, and it wakes any node it froze when it is
-stopped. A kill is refused while a freeze is in progress. Every action is
+stopped. A kill is refused while a freeze is in progress.
+
+SIGTERM and SIGINT only set a flag. The serving loop sees it within about
+a second (or once the command in hand is answered) and returns, and the
+SIGCONT to a frozen node is sent on the way out, after the lock is free.
+A handler that took the lock itself could interrupt the main thread while
+it holds that lock and never return. Every action is
 appended to the log as one JSON line. Nothing here reads or prints venue
 data, addresses or keys.
 
@@ -46,6 +52,10 @@ class Agent:
         self.args = args
         self.lock = threading.Lock()
         self.frozen = None
+        # Plain attributes: a signal handler may set them while the main
+        # thread is anywhere, and must not wait on any lock to do it.
+        self.stopping = False
+        self.stop_why = None
 
     def log(self, ev, **kw):
         line = dict(wall_ms=wall_ms(), ev=ev, **kw)
@@ -93,6 +103,12 @@ class Agent:
                 self.cont(self.frozen)
                 self.log("thaw", on_exit=True)
 
+    def request_stop(self, why):
+        """Safe from a signal handler: takes no lock, does no I/O."""
+        if not self.stopping:
+            self.stop_why = why
+        self.stopping = True
+
     def handle(self, line):
         parts = line.split()
         if not parts:
@@ -100,6 +116,8 @@ class Agent:
         cmd = parts[0]
         if cmd == "ping":
             return "ok"
+        if self.stopping:
+            return "skip stopping"
         with self.lock:
             if cmd == "kill9" and len(parts) == 1:
                 if self.frozen is not None:
@@ -127,8 +145,14 @@ class Agent:
                         return "skip not_leader"
                 pid = self.main_pid()
                 at = wall_ms()
-                os.kill(pid, signal.SIGSTOP)
+                # Recorded before the signal, so an exit at any point after
+                # it still sends SIGCONT.
                 self.frozen = pid
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                except BaseException:
+                    self.frozen = None
+                    raise
                 self.log(cmd, at_ms=at, ms=ms)
                 threading.Thread(target=self.thaw, args=(pid, ms), daemon=True).start()
                 return "ok %d" % at
@@ -145,7 +169,7 @@ def serve(agent, listen, stop_at):
     srv.listen(8)
     srv.settimeout(1.0)
     agent.log("start")
-    while stop_at is None or time.time() < stop_at:
+    while not agent.stopping and (stop_at is None or time.time() < stop_at):
         try:
             conn, _ = srv.accept()
         except socket.timeout:
@@ -166,7 +190,8 @@ def serve(agent, listen, stop_at):
                 conn.sendall((answer + "\n").encode())
             except OSError:
                 pass
-    agent.log("stop", why="max_seconds")
+    srv.close()
+    agent.log("stop", why=agent.stop_why or "max_seconds")
 
 
 def main():
@@ -181,9 +206,7 @@ def main():
     agent = Agent(args)
 
     def stop(_sig, _frame):
-        agent.wake_all()
-        agent.log("stop", why="signal")
-        sys.exit(0)
+        agent.request_stop("signal")
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)

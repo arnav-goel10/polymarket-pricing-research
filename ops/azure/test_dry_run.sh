@@ -78,13 +78,28 @@ case "$*" in
   "network nsg rule delete"*)
     name=${a##*-n }
     name=${name%% *}
+    echo x >>"$AZ_STATE/deletes"
+    # The first FAKE_RULE_DELETE_FAILS deletes fail, as Azure's can while
+    # the group is being updated.
+    if [ "$(wc -l <"$AZ_STATE/deletes")" -le "${FAKE_RULE_DELETE_FAILS:-0}" ]; then
+      echo "(AnotherOperationInProgress) fake" >&2
+      exit 1
+    fi
     [ "${FAKE_RULE_STUCK:-0}" = 1 ] || rm -f "$AZ_STATE/rule.$name"
     ;;
-  "network nsg rule list"*"length("*)
-    find "$AZ_STATE" -maxdepth 1 -name 'rule.drill-*' | wc -l | tr -d ' '
-    ;;
   "network nsg rule list"*)
+    echo x >>"$AZ_STATE/lists"
+    if [ "$(wc -l <"$AZ_STATE/lists")" -le "${FAKE_RULE_LIST_FAILS:-0}" ]; then
+      echo "(AnotherOperationInProgress) fake" >&2
+      exit 1
+    fi
     for f in "$AZ_STATE"/rule.*; do [ -e "$f" ] && echo "${f##*/rule.}"; done
+    true
+    ;;
+  "vm show -d"*powerState*)
+    case "$*" in *"-n node-a "*) p=${FAKE_POWER_A:-VM running} ;; *) p=${FAKE_POWER_B:-VM running} ;; esac
+    [ "$p" = fail ] && exit 1
+    echo "$p"
     ;;
   "storage account list"*) echo polyhafakeaccount7 ;;
   "storage blob download-batch"*)
@@ -414,7 +429,8 @@ drill_case() {
   : >"$AZ_LOG"
   all="$tmp/all.out"
   : >"$all"
-  export DRILL_DIR="$tmp/drill" DRILL_OUT="$tmp/report" DRILL_RUN=12345-1
+  rm -f "$tmp/power"
+  export DRILL_DIR="$tmp/drill" DRILL_OUT="$tmp/report" DRILL_POWER="$tmp/power" DRILL_RUN=12345-1
   export GITHUB_STEP_SUMMARY="$tmp/summary.md"
   : >"$GITHUB_STEP_SUMMARY"
 }
@@ -448,6 +464,12 @@ rules_left() {
 
 drill_case "a whole drill"
 touch "$AZ_STATE/rule.drill-999-1"
+drill_step "$here/drill.sh" start
+name="drill start records both VMs' power states and starts both"
+check test "$code" = 0
+check grep -qx "node-a VM running" "$DRILL_POWER"
+check grep -q "^vm start -g poly-ha -n node-a" "$AZ_LOG"
+check grep -q "^vm start -g poly-ha -n node-b" "$AZ_LOG"
 drill_step env DRILL_RUN=12345-1 "$here/drill.sh" ready
 check test "$code" = 0
 drill_step "$here/drill.sh" open
@@ -486,6 +508,11 @@ check test ! -e "$tmp/drill"
 check test -s "$tmp/report/report.json"
 name="drill close ends the forwards"
 check test -z "$(pgrep -f "UserKnownHostsFile=$tmp/drill/known_hosts" || true)"
+drill_step "$here/drill.sh" restore
+name="drill restore leaves VMs that were running running"
+check test "$code" = 0
+check test "$(grep -c '^vm deallocate' "$AZ_LOG")" = 0
+check test ! -e "$DRILL_POWER"
 name="no address, key or account name reaches the log"
 check no_leak
 for v in "${secrets[@]}"; do
@@ -514,6 +541,77 @@ name="close fails loudly when the rule is still there"
 check test "$code" != 0
 check grep -q "::error::a drill SSH rule is still in the security group" "$all"
 check test -e "$AZ_STATE/closed-node-b"
+
+name="close tried the delete again before failing"
+check test "$(wc -l <"$AZ_STATE/deletes" | tr -d ' ')" = 5
+
+drill_case "a rule delete that fails twice"
+drill_step "$here/drill.sh" open
+rm -f "$AZ_STATE/deletes" "$AZ_STATE/lists"
+drill_step env FAKE_RULE_DELETE_FAILS=2 "$here/drill.sh" close
+name="close retries the rule delete and passes once it goes"
+check test "$code" = 0
+check test "$(rules_left)" = 0
+check test "$(wc -l <"$AZ_STATE/deletes" | tr -d ' ')" = 3
+check grep -q "no drill rule left in the security group" "$all"
+
+drill_case "a rule list that fails"
+drill_step "$here/drill.sh" open
+rm -f "$AZ_STATE/deletes" "$AZ_STATE/lists"
+drill_step env FAKE_RULE_LIST_FAILS=2 "$here/drill.sh" close
+name="close retries a failed rule list and still removes the rule"
+check test "$code" = 0
+check test "$(rules_left)" = 0
+
+drill_case "a rule list that never answers"
+drill_step "$here/drill.sh" open
+rm -f "$AZ_STATE/deletes" "$AZ_STATE/lists"
+drill_step env FAKE_RULE_LIST_FAILS=99 "$here/drill.sh" close
+name="close fails loudly when the rules can never be listed"
+check test "$code" != 0
+check grep -q "::error::the security group's rules could not be listed" "$all"
+
+drill_case "a rule an earlier run left, found at close"
+drill_step "$here/drill.sh" open
+touch "$AZ_STATE/rule.drill-777-1"
+drill_step "$here/drill.sh" close
+name="close removes every drill rule, not only its own"
+check test "$code" = 0
+check test "$(rules_left)" = 0
+
+drill_case "VMs found deallocated"
+drill_step env FAKE_POWER_A="VM deallocated" FAKE_POWER_B="VM deallocated" "$here/drill.sh" start
+drill_step "$here/drill.sh" restore
+name="restore deallocates both VMs again when both were deallocated"
+check test "$code" = 0
+check grep -q "^vm deallocate -g poly-ha -n node-a" "$AZ_LOG"
+check grep -q "^vm deallocate -g poly-ha -n node-b" "$AZ_LOG"
+
+drill_case "one VM found deallocated"
+drill_step env FAKE_POWER_A="VM running" FAKE_POWER_B="VM deallocated" "$here/drill.sh" start
+drill_step "$here/drill.sh" restore
+name="restore deallocates only the VM that was deallocated"
+check test "$code" = 0
+check test "$(grep -c '^vm deallocate' "$AZ_LOG")" = 1
+check grep -q "^vm deallocate -g poly-ha -n node-b" "$AZ_LOG"
+
+drill_case "a VM whose state could not be read"
+drill_step env FAKE_POWER_A=fail FAKE_POWER_B="VM deallocated" "$here/drill.sh" start
+name="start still starts both when a state cannot be read"
+check test "$code" = 0
+check grep -qx "node-a unknown" "$DRILL_POWER"
+check grep -q "^vm start -g poly-ha -n node-a" "$AZ_LOG"
+drill_step "$here/drill.sh" restore
+name="restore leaves a VM of unknown state running, with a warning"
+check test "$code" = 0
+check grep -q "::warning::node-a" "$all"
+check test "$(grep -c '^vm deallocate' "$AZ_LOG")" = 1
+
+drill_case "restore with nothing recorded"
+drill_step "$here/drill.sh" restore
+name="restore after a job that never started a VM changes nothing"
+check test "$code" = 0
+check no_change
 
 drill_case "a VM whose close does not finish"
 drill_step "$here/drill.sh" open
@@ -579,6 +677,40 @@ check test -z "$(grep -nE 'set -x|set -o xtrace|hostname -I|ifconfig|ip (-[46] )
   "$here/drill.sh" "$here/vm_tools.sh" "$here/../../deploy/azure/drill/"* || true)"
 name="the drill agent compiles"
 check python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$here/../../deploy/azure/drill/drill-agent.py"
+name="the drill agent stops promptly on SIGTERM, also holding its lock, and never leaves the node stopped"
+check python3 -I "$here/test_drill_agent.py"
+
+# The drill user's sshd settings, against the real sshd where there is
+# one: the file passes `sshd -t` beside the base config, the drill user
+# gets TCP forwards to the three loopback ports and nothing else, and the
+# Match block does not leak into settings read after it.
+sshd_bin=$(command -v sshd || echo /usr/sbin/sshd)
+if [ -x "$sshd_bin" ]; then
+  sd="$tmp/sshd"
+  mkdir -p "$sd/d"
+  # The real ssh-keygen: the one first on PATH here is the drill's fake.
+  /usr/bin/ssh-keygen -q -t ed25519 -N '' -f "$sd/hk" >/dev/null 2>&1 || true
+  cp "$here/../../deploy/azure/vm/sshd-poly.conf" "$sd/d/10-poly.conf"
+  cp "$here/../../deploy/azure/drill/sshd-drill.conf" "$sd/d/20-poly-drill.conf"
+  printf 'Include %s/d/*.conf\nHostKey %s/hk\nX11Forwarding yes\nAllowStreamLocalForwarding yes\nSubsystem sftp internal-sftp\n' "$sd" "$sd" >"$sd/main"
+  name="sshd accepts the drill user's settings"
+  check "$sshd_bin" -t -f "$sd/main"
+  drill_eff=$("$sshd_bin" -T -f "$sd/main" -C user=drill,host=drill,addr=127.0.0.1 2>&1 || true)
+  poly_eff=$("$sshd_bin" -T -f "$sd/main" -C user=poly,host=poly,addr=127.0.0.1 2>&1 || true)
+  for want_line in "allowtcpforwarding local" \
+    "permitopen 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102" \
+    "permitlisten none" "allowstreamlocalforwarding no" \
+    "allowagentforwarding no" "x11forwarding no"; do
+    name="sshd applies '$want_line' to the drill user"
+    check grep -qixF -- "$want_line" <<<"$drill_eff"
+  done
+  name="the drill Match block ends with its file"
+  check grep -qixF "allowstreamlocalforwarding yes" <<<"$poly_eff"
+  name="drill-open checks the same settings this test does"
+  check grep -qF '"permitopen 127.0.0.1:9100 127.0.0.1:9101 127.0.0.1:9102"' "$here/../../deploy/azure/drill/drill-open.sh"
+else
+  echo "skip  sshd checks: no sshd here"
+fi
 
 if [ "$fails" -gt 0 ]; then
   echo "$fails checks failed"

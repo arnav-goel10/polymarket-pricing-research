@@ -204,6 +204,9 @@ jobs:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      # One sign-in is enough here: the only storage call is the next step,
+      # and the management token from the sign-in outlives this job's 45
+      # minutes. The drill job, which runs longer, signs in again.
       - name: Upload both builds to releases/<sha>/
         run: |
           account=$(az storage account list -g "$RG" --query "[0].name" -o tsv)
@@ -263,13 +266,20 @@ jobs:
   # both nodes' recordings and lease logs collected under drill/<run>/ in
   # the archive and judged with their union as truth. The cleanup step runs
   # whatever happened before it, also on a cancel, and fails the job unless
-  # the rule and the key are gone and both nodes run with one leader.
-  # Only report.json (counts and timings) leaves the runner.
+  # the rule and the key are gone and both nodes run with one leader. Then
+  # a VM the drill found deallocated is deallocated again. Only
+  # report.json (counts and timings) leaves the runner.
+  #
+  # The sign-in is repeated before collect and before close. GitHub's token
+  # behind it lasts minutes, and az asks Azure for a token per scope when it
+  # first needs one, so a storage token first wanted an hour in would fail.
+  # The run and collect steps have their own time limits, so the cleanup
+  # starts as an ordinary step with time left in the job.
   drill:
     needs: gate
     if: needs.gate.outputs.ready == 'true' && needs.gate.outputs.action == 'drill'
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 170
     environment: azure
     permissions:
       id-token: write
@@ -311,21 +321,42 @@ jobs:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      - name: Start the VMs if they are deallocated, and wait for one leader
+      - name: Record how the VMs are, start them, and wait for one leader
+        timeout-minutes: 20
         run: |
-          for n in node-a node-b; do
-            az vm start -g "$RG" -n "$n" --output none
-          done
+          ops/azure/drill.sh start
           ops/azure/drill.sh ready
       - name: Open, a key for this run and an SSH rule for this runner only
+        timeout-minutes: 15
         run: ops/azure/drill.sh open
       - name: Drive the faults
+        # 4 faults 90 s apart take about 8 minutes, 20 about 35.
+        timeout-minutes: ${{ startsWith(github.ref_name, 'ha-drill-rehearsal') && 15 || 45 }}
         run: ops/azure/drill.sh run
+      - name: Sign in again for collect
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Collect both nodes' recordings and judge
+        timeout-minutes: 20
         run: ops/azure/drill.sh collect
+      - name: Sign in again for close
+        if: always()
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Close, rule and key removed, both nodes healthy
         if: always()
+        timeout-minutes: 35
         run: ops/azure/drill.sh close
+      - name: Put the VMs back as the drill found them
+        if: always()
+        timeout-minutes: 20
+        run: ops/azure/drill.sh restore
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The live drill, from the runner's side (spec 4.7, docs/HA_DRILL.md). The
-# `drill` job of .github/workflows/azure.yml runs these four steps in order,
-# the last one always, also after a failure or a cancel (`ready` comes
-# first, and `close` runs it again at its end):
+# `drill` job of .github/workflows/azure.yml runs these steps in order,
+# `close` and `restore` always, also after a failure or a cancel:
 #
+#   ops/azure/drill.sh start     record each VM's power state, start the
+#                                ones that are not running
 #   ops/azure/drill.sh ready     both nodes running and ready, one leader
 #   ops/azure/drill.sh open      per-run key on both VMs, an SSH rule for
 #                                this runner's address, SSH forwards up
@@ -12,6 +13,8 @@
 #                                down to the runner, chaos verify-drill
 #   ops/azure/drill.sh close     forwards down, rule removed, key removed,
 #                                both nodes running with one leader
+#   ops/azure/drill.sh restore   deallocate again each VM `start` found
+#                                deallocated, and no other
 #
 # Settings, from the environment:
 #   DRILL_RUN       run id, plain characters (the workflow's run id and attempt)
@@ -22,7 +25,10 @@
 #   CHAOS           the chaos binary (default target/release/chaos)
 #   DRILL_FAULTS, DRILL_LEADER_FREEZES, DRILL_SEED, DRILL_GAP_MS,
 #   DRILL_FREEZE_MS chaos drill's plan
+#   DRILL_POWER     where `start` records the VMs' power states for
+#                   `restore` (default $RUNNER_TEMP/drill-power)
 #   DRILL_HEALTH_TRIES, DRILL_SLEEP   how long `close` waits for health
+#   DRILL_RULE_TRIES                  how often `close` tries the rule delete
 #
 # The workflow's log is public. Every address (the runner's, the VMs'),
 # the run's key, the VMs' host keys and the storage account name are
@@ -45,6 +51,7 @@ run=${DRILL_RUN:?DRILL_RUN is required}
 [[ $run =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "DRILL_RUN must be plain characters"
 dir=${DRILL_DIR:-${RUNNER_TEMP:-/tmp}/drill}
 out=${DRILL_OUT:-${RUNNER_TEMP:-/tmp}/drill-report}
+power=${DRILL_POWER:-${RUNNER_TEMP:-/tmp}/drill-power}
 chaos=${CHAOS:-target/release/chaos}
 nsg=poly-ha-nsg
 rule="drill-$run"
@@ -300,16 +307,7 @@ step_close() {
   done
   pkill -f "UserKnownHostsFile=$dir/known_hosts" >/dev/null 2>&1 || true
 
-  az network nsg rule delete -g "$RG" --nsg-name "$nsg" -n "$rule" --output none 2>>"$dir/az.err" || true
-  local left
-  left=$(az network nsg rule list -g "$RG" --nsg-name "$nsg" \
-    --query "length([?starts_with(name, 'drill-')])" -o tsv 2>>"$dir/az.err" || echo unknown)
-  if [ "$left" = 0 ]; then
-    say "no drill rule left in the security group"
-  else
-    echo "::error::a drill SSH rule is still in the security group ($left)"
-    fail=1
-  fi
+  remove_drill_rules || fail=1
 
   for n in a b; do
     if "$here/vm_run.sh" "node-$n" drill-close "$run" >"$dir/close-$n.out" 2>&1; then
@@ -325,6 +323,41 @@ step_close() {
 
   rm -rf "$dir"
   return "$fail"
+}
+
+drill_rule_names() {
+  az network nsg rule list -g "$RG" --nsg-name "$nsg" \
+    --query "[?starts_with(name, 'drill-')].name" -o tsv 2>>"$dir/az.err"
+}
+
+# Delete every drill-* rule, this run's and any an earlier run left, and
+# list again, a few times with a pause, since a delete or a list can fail
+# for a moment while the security group is being updated. Fails unless a
+# last list answers and names none.
+remove_drill_rules() {
+  local tries=${DRILL_RULE_TRIES:-5} i names r
+  for i in $(seq 1 "$tries"); do
+    if names=$(drill_rule_names); then
+      if [ -z "$names" ]; then
+        say "no drill rule left in the security group"
+        return 0
+      fi
+      for r in $names; do
+        az network nsg rule delete -g "$RG" --nsg-name "$nsg" -n "$r" --output none 2>>"$dir/az.err" || true
+      done
+    fi
+    [ "$i" = "$tries" ] || sleep "$sleep_s"
+  done
+  if ! names=$(drill_rule_names); then
+    echo "::error::the security group's rules could not be listed after $tries tries: a drill SSH rule may still be there"
+    return 1
+  fi
+  if [ -z "$names" ]; then
+    say "no drill rule left in the security group"
+    return 0
+  fi
+  echo "::error::a drill SSH rule is still in the security group after $tries tries ($(wc -w <<<"$names" | tr -d ' ') left)"
+  return 1
 }
 
 # Wait until both nodes run and are ready with exactly one leader, through
@@ -361,11 +394,70 @@ step_ready() {
   wait_healthy "before the drill"
 }
 
+power_state() {
+  az vm show -d -g "$RG" -n "$1" --query powerState -o tsv 2>/dev/null | tr -d '\r' || true
+}
+
+# Record each VM's power state before anything else, then start the ones
+# that are not running. The record lives outside DRILL_DIR, which `close`
+# deletes, so `restore` reads it after `close`.
+step_start() {
+  require_subscription
+  mkdir -p "$(dirname "$power")"
+  local n state tmp="$power.new"
+  : >"$tmp"
+  for n in node-a node-b; do
+    state=$(power_state "$n")
+    printf '%s %s\n' "$n" "${state:-unknown}" >>"$tmp"
+    say "$n was ${state:-in an unknown state} before the drill"
+  done
+  mv -f "$tmp" "$power"
+  for n in node-a node-b; do
+    az vm start -g "$RG" -n "$n" --output none
+  done
+}
+
+# Put the VMs back as `start` found them: deallocate a VM that was
+# deallocated, leave every other one running. A VM whose state was not
+# read is left running, with a warning, since stopping a VM that was
+# serving would be worse than paying for one more hour.
+step_restore() {
+  require_subscription
+  if [ ! -f "$power" ]; then
+    say "no power states were recorded, so no VM was started by this drill"
+    return 0
+  fi
+  local n state fail=0
+  while read -r n state; do
+    case "$n" in node-a | node-b) ;; *) continue ;; esac
+    case "$state" in
+      "VM deallocated")
+        if az vm deallocate -g "$RG" -n "$n" --output none; then
+          say "$n deallocated again, as it was before the drill"
+        else
+          echo "::error::$n was deallocated before the drill and could not be deallocated again: it is still running and costs money"
+          fail=1
+        fi
+        ;;
+      unknown)
+        echo "::warning::$n's state before the drill is not known, so it was left running"
+        ;;
+      *)
+        say "$n left running, as it was before the drill ($state)"
+        ;;
+    esac
+  done <"$power"
+  [ "$fail" = 1 ] || rm -f "$power"
+  return "$fail"
+}
+
 case "$step" in
+  start) step_start ;;
   ready) step_ready ;;
   open) step_open ;;
   run) step_run ;;
   collect) step_collect ;;
   close) step_close ;;
-  *) die "usage: drill.sh ready|open|run|collect|close" ;;
+  restore) step_restore ;;
+  *) die "usage: drill.sh start|ready|open|run|collect|close|restore" ;;
 esac
